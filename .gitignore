@@ -1,0 +1,20 @@
+.DS_Store
+*.log
+*.pid
+node_modules/
+
+# Local emulator/runtime artifacts
+**/*-user/
+**/source/
+**/tools/patched-playback/
+**/tools/*.dmg
+
+# Generated datasets and frame dumps
+**/data/*.csv
+**/data/*.json
+**/data/*.jsonl
+**/frames/
+**/game-frames/
+**/logs/
+**/images/
+**/backups/

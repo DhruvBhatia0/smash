@@ -1,0 +1,18 @@
+{
+  "name": "frame-game-state-data",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Prototype extraction of Slippi replay frames into game-state and controller-input data.",
+  "scripts": {
+    "extract": "/Users/dhruv/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node scripts/extract-slp.mjs",
+    "inspect": "/Users/dhruv/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node scripts/inspect-slp.mjs",
+    "align": "/Users/dhruv/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node scripts/align-rendered-frames.mjs",
+    "attach:images": "/Users/dhruv/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node scripts/attach-frame-images.mjs",
+    "prepare:playback-build": "scripts/prepare-playback-build.sh",
+    "render": "scripts/render-replay-debug.sh"
+  },
+  "dependencies": {
+    "@slippi/slippi-js": "^9.1.2"
+  }
+}

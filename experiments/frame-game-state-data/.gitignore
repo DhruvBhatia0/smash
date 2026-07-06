@@ -1,0 +1,15 @@
+node_modules/
+data/*.jsonl
+data/*.csv
+data/*.json
+frames/
+game-frames/
+logs/
+*-user/
+source/
+images/
+backups/
+tools/patched-playback/
+tools/*.dmg
+*.log
+*.pid

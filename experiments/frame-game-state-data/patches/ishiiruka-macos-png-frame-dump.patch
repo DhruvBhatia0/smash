@@ -1,0 +1,15 @@
+diff --git a/Source/Core/VideoCommon/RenderBase.cpp b/Source/Core/VideoCommon/RenderBase.cpp
+index d65243a..54968fb 100644
+--- a/Source/Core/VideoCommon/RenderBase.cpp
++++ b/Source/Core/VideoCommon/RenderBase.cpp
+@@ -888,10 +888,8 @@ bool Renderer::IsFrameDumping()
+ 	if (m_screenshot_request.IsSet())
+ 		return true;
+ 
+-#if defined(HAVE_LIBAV) || defined(_WIN32)
+ 	if (SConfig::GetInstance().m_DumpFrames)
+ 		return true;
+-#endif
+ 
+ 	ShutdownFrameDumping();
+ 	return false;
