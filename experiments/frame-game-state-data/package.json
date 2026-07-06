@@ -9,6 +9,7 @@
     "inspect": "/Users/dhruv/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node scripts/inspect-slp.mjs",
     "align": "/Users/dhruv/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node scripts/align-rendered-frames.mjs",
     "attach:images": "/Users/dhruv/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node scripts/attach-frame-images.mjs",
+    "ingest:slp": "/Users/dhruv/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node scripts/ingest-slp-downloads.mjs",
     "prepare:playback-build": "scripts/prepare-playback-build.sh",
     "render": "scripts/render-replay-debug.sh"
   },

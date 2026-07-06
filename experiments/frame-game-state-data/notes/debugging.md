@@ -48,9 +48,9 @@ The first patched source build dumped PNGs but booted to Online Play. The binary
 
 Useful local logs:
 
-- Render wrapper log, generated after `npm run render`:
+- Render wrapper log, generated after `pnpm render`:
   `/Users/dhruv/code/smash/experiments/frame-game-state-data/logs/render-replay-debug.log`
-- Dolphin log, generated after `npm run render`:
+- Dolphin log, generated after `pnpm render`:
   `/Users/dhruv/code/smash/experiments/frame-game-state-data/playback-debug-user/Logs/dolphin.log`
 
 The render wrapper requires both PNG output and `[CURRENT_FRAME]` log entries. PNGs alone are not success because the wrong app/resources can dump menu frames.
@@ -72,23 +72,46 @@ The verified capture-test run produced:
 - 2050 image-backed state rows, two players per frame.
 - 479 trailing raw dump frames dropped because they are post-window `Waiting for game` frames.
 
-The raw `frames/` dump is generated and was removed during cleanup. Re-running `npm run render` recreates it, and `npm run align` recreates the aligned set.
+The raw `frames/` dump is generated and was removed during cleanup. Re-running `pnpm render` recreates it, and `pnpm align` recreates the aligned set.
 
 ## Commands
 
 From `/Users/dhruv/code/smash/experiments/frame-game-state-data`:
 
 ```bash
-npm run render
-npm run align
-npm run attach:images
+/Users/dhruv/.cache/codex-runtimes/codex-primary-runtime/dependencies/bin/pnpm render
+/Users/dhruv/.cache/codex-runtimes/codex-primary-runtime/dependencies/bin/pnpm align
+/Users/dhruv/.cache/codex-runtimes/codex-primary-runtime/dependencies/bin/pnpm attach:images
 ```
 
 If rebuilding the patched app from source, clone Ishiiruka under `source/Ishiiruka`, apply `patches/ishiiruka-macos-png-frame-dump.patch`, build the Playback target, then run:
 
 ```bash
-npm run prepare:playback-build
+/Users/dhruv/.cache/codex-runtimes/codex-primary-runtime/dependencies/bin/pnpm prepare:playback-build
 ```
 
 The Melee ISO currently used by the render script is:
 `/Users/dhruv/Downloads/Super Smash Bros. Melee (USA) (En,Ja) (v1.02).iso`
+
+## Replay Download and Metadata Ingestion
+
+The batch ingestion path is class-based:
+
+- `DownloadManifest` loads and validates replay URL manifests.
+- `ReplayDownloadJob` normalizes ids, filenames, output paths, and optional hashes.
+- `ConcurrentDownloader` downloads with a fixed worker pool and `.part` files.
+- `SlpMetadataExtractor` extracts game, player, winner, and skill-signal metadata.
+- `ReplayIngestionPipeline` coordinates download, metadata extraction, and aggregate index writing.
+
+Run it with:
+
+```bash
+/Users/dhruv/.cache/codex-runtimes/codex-primary-runtime/dependencies/bin/pnpm ingest:slp -- --manifest download-manifests/slippi-js-samples.json --concurrency 4
+```
+
+Generated output:
+
+- Downloaded `.slp` files: `replays/downloaded/`
+- Metadata JSON and index: `metadata/replays/`
+
+True player rank/MMR is not normally available in `.slp` files. The metadata stores `skillSignals` from replay stats, including inputs per minute, conversions, damage per opening, neutral-win ratio, action counts, and final stocks when available.

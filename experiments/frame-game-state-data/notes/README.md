@@ -21,9 +21,22 @@ Run state extraction again from this folder:
 Render with the compact patched Playback Dolphin bundle, align frames, and attach image paths:
 
 ```bash
-npm run render
-npm run align
-npm run attach:images
+/Users/dhruv/.cache/codex-runtimes/codex-primary-runtime/dependencies/bin/pnpm render
+/Users/dhruv/.cache/codex-runtimes/codex-primary-runtime/dependencies/bin/pnpm align
+/Users/dhruv/.cache/codex-runtimes/codex-primary-runtime/dependencies/bin/pnpm attach:images
 ```
 
-Only run `npm run prepare:playback-build` when `source/Ishiiruka` has been cloned and rebuilt locally; the cleaned folder does not keep the full source tree.
+Only run `pnpm prepare:playback-build` when `source/Ishiiruka` has been cloned and rebuilt locally; the cleaned folder does not keep the full source tree.
+
+Download replay batches and extract replay-level metadata:
+
+```bash
+/Users/dhruv/.cache/codex-runtimes/codex-primary-runtime/dependencies/bin/pnpm ingest:slp -- --manifest download-manifests/slippi-js-samples.json --concurrency 4
+```
+
+The ingestion output is generated and gitignored:
+
+- Downloaded replays: `replays/downloaded/`
+- Per-replay metadata and aggregate index: `metadata/replays/`
+
+Metadata includes stage/map, players, display names/connect codes when present, inferred winner/placements when final stocks are available, and replay-derived skill signals. True player rank/MMR is not normally present in `.slp` files, so `skillSignals.rank` is intentionally `null`.

@@ -1,0 +1,28 @@
+{
+  "defaults": {
+    "source": "project-slippi/slippi-js public fixture replays",
+    "outputDir": "replays/downloaded/slippi-js-samples"
+  },
+  "replays": [
+    {
+      "id": "realtime-test",
+      "fileName": "realtimeTest.slp",
+      "url": "https://raw.githubusercontent.com/project-slippi/slippi-js/master/slp/realtimeTest.slp"
+    },
+    {
+      "id": "display-name-connect-code",
+      "fileName": "displayNameAndConnectCodeInGameStart.slp",
+      "url": "https://raw.githubusercontent.com/project-slippi/slippi-js/master/slp/displayNameAndConnectCodeInGameStart.slp"
+    },
+    {
+      "id": "doubles",
+      "fileName": "doubles.slp",
+      "url": "https://raw.githubusercontent.com/project-slippi/slippi-js/master/slp/doubles.slp"
+    },
+    {
+      "id": "fountain-platforms",
+      "fileName": "FodPlatforms.slp",
+      "url": "https://raw.githubusercontent.com/project-slippi/slippi-js/master/slp/FodPlatforms.slp"
+    }
+  ]
+}

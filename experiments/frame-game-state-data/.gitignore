@@ -4,6 +4,8 @@ data/*.csv
 data/*.json
 frames/
 game-frames/
+metadata/
+replays/downloaded/
 logs/
 *-user/
 source/
