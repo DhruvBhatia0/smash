@@ -1,21 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="/Users/dhruv/code/smash/experiments/frame-game-state-data"
+ROOT="${ROOT:-/Users/dhruv/code/smash/experiments/frame-game-state-data}"
 PATCHED_PLAYBACK_APP="$ROOT/tools/patched-playback/Slippi Dolphin.app/Contents/MacOS/Slippi Dolphin"
 if [[ -z "${PLAYBACK_APP:-}" && -x "$PATCHED_PLAYBACK_APP" ]]; then
   PLAYBACK_APP="$PATCHED_PLAYBACK_APP"
 else
   PLAYBACK_APP="${PLAYBACK_APP:-/Applications/Slippi Playback Dolphin.app/Contents/MacOS/Slippi Dolphin}"
 fi
-ISO="/Users/dhruv/Downloads/Super Smash Bros. Melee (USA) (En,Ja) (v1.02).iso"
+ISO="${ISO:-/Users/dhruv/Downloads/Super Smash Bros. Melee (USA) (En,Ja) (v1.02).iso}"
 REPLAY_JSON="${1:-$ROOT/replay-playback.capture-test.json}"
 REPLAY_NAME="$(basename "${REPLAY_JSON%.*}")"
 USER_DIR="${USER_DIR:-$ROOT/playback-debug-user}"
 FRAME_OUTPUT_DIR="${FRAME_OUTPUT_DIR:-$ROOT/frames/$REPLAY_NAME}"
-LOG_DIR="$ROOT/logs"
-RUN_LOG="$LOG_DIR/render-replay-debug.log"
+LOG_DIR="${LOG_DIR:-$ROOT/logs}"
+RUN_LOG="${RUN_LOG:-$LOG_DIR/render-replay-debug.log}"
+PID_FILE="${PID_FILE:-$LOG_DIR/render-replay-debug.pid}"
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-90}"
+KILL_EXISTING_DOLPHIN="${KILL_EXISTING_DOLPHIN:-1}"
 
 mkdir -p "$LOG_DIR"
 
@@ -44,10 +46,12 @@ if [[ ! -f "$PLAYBACK_CODES_INI" ]] || ! grep -q '\$Required: Slippi Playback' "
   exit 1
 fi
 
-pkill -f "/Applications/Slippi Dolphin.app/Contents/MacOS/Slippi Dolphin" 2>/dev/null || true
-pkill -f "/Applications/Slippi Playback Dolphin.app/Contents/MacOS/Slippi Dolphin" 2>/dev/null || true
-pkill -f "$PLAYBACK_APP" 2>/dev/null || true
-sleep 1
+if [[ "$KILL_EXISTING_DOLPHIN" == "1" ]]; then
+  pkill -f "/Applications/Slippi Dolphin.app/Contents/MacOS/Slippi Dolphin" 2>/dev/null || true
+  pkill -f "/Applications/Slippi Playback Dolphin.app/Contents/MacOS/Slippi Dolphin" 2>/dev/null || true
+  pkill -f "$PLAYBACK_APP" 2>/dev/null || true
+  sleep 1
+fi
 
 rm -rf "$USER_DIR"
 mkdir -p "$USER_DIR/Config" "$USER_DIR/Dump/Frames" "$USER_DIR/Dump/Audio" "$USER_DIR/ScreenShots"
@@ -188,7 +192,7 @@ set +e
   > "$RUN_LOG" 2>&1 &
 pid=$!
 
-echo "$pid" > "$LOG_DIR/render-replay-debug.pid"
+echo "$pid" > "$PID_FILE"
 
 deadline=$((SECONDS + TIMEOUT_SECONDS))
 timed_out=false

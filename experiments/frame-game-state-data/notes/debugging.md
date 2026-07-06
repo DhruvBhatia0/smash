@@ -115,3 +115,27 @@ Generated output:
 - Metadata JSON and index: `metadata/replays/`
 
 True player rank/MMR is not normally available in `.slp` files. The metadata stores `skillSignals` from replay stats, including inputs per minute, conversions, damage per opening, neutral-win ratio, action counts, and final stocks when available.
+
+## Corpus Frame Queue
+
+`scripts/process-frame-queue.py` runs the dataset queue:
+
+- `SlpCorpusProducer` is the single producer thread. It discovers `.slp` files and blocks on `queue.put` when the bounded queue is full.
+- `FrameProcessingConsumer` creates its runtime in `__init__`, then consumes replay jobs until it receives a stop sentinel.
+- `FrameJobProcessor` extracts structured state, invokes the runtime, aligns rendered frames, and attaches image paths back to frame-state rows.
+- Runtime choices are `plan`, `local-macos`, `docker`, and `runpod`.
+- `RunPodCpuEmulatorRuntime` creates CPU Pods through the RunPod REST API. The RunPod API key is read from `RUNPOD_API_KEY`; it should not be written into manifests.
+- `DockerEmulatorRuntime` requires Docker Desktop to be running and a renderer image that implements `/opt/slippi-renderer/render-replay.sh`.
+
+Decision note: RunPod is the first scalable runtime to pursue. Docker is installed locally, but the Docker daemon was not reachable during this setup, and the only renderer proven to emit screenshots is the patched macOS Playback Dolphin app. A Docker path is still useful later because the same Linux renderer image can be used locally and on RunPod.
+
+Validation commands run:
+
+```bash
+python3 -m py_compile scripts/process-frame-queue.py scripts/clean-up-runpod-cpu-pods.py scripts/frame_queue/*.py
+python3 scripts/process-frame-queue.py --runtime plan --consumers 2 --queue-size 1 --max-jobs 2 --run-id test-plan-queue replays/downloaded/slippi-js-samples
+python3 scripts/process-frame-queue.py --runtime docker --dry-run --plan-only --docker-image slippi-renderer:local --consumers 2 --queue-size 1 --max-jobs 2 --run-id test-docker-plan replays/downloaded/slippi-js-samples
+python3 scripts/process-frame-queue.py --runtime runpod --dry-run --plan-only --runpod-image slippi-renderer:runpod --consumers 2 --queue-size 1 --max-jobs 2 --run-id test-runpod-plan replays/downloaded/slippi-js-samples
+python3 scripts/process-frame-queue.py --runtime local-macos --consumers 1 --queue-size 1 --max-jobs 1 --start-frame -123 --end-frame 10 --timeout-seconds 45 --run-id test-local-render replays/realtimeTest.slp
+python3 scripts/clean-up-runpod-cpu-pods.py
+```

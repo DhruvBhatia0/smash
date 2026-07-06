@@ -40,3 +40,45 @@ The ingestion output is generated and gitignored:
 - Per-replay metadata and aggregate index: `metadata/replays/`
 
 Metadata includes stage/map, players, display names/connect codes when present, inferred winner/placements when final stocks are available, and replay-derived skill signals. True player rank/MMR is not normally present in `.slp` files, so `skillSignals.rank` is intentionally `null`.
+
+## Frame Queue Processing
+
+The corpus processing path is class-based and uses a single producer thread with `queue.Queue(maxsize=1000)` by default. The producer discovers `.slp` files and blocks on `put` when the queue is full. Consumer threads provision a runtime during initialization, then render jobs and save state rows, raw frame dumps, aligned frames, image-backed rows, and per-job results under `processed-frame-queues/`.
+
+Safe planning run:
+
+```bash
+python3 scripts/process-frame-queue.py --runtime plan --consumers 2 --queue-size 1000 replays/downloaded
+```
+
+Local integration run with the patched macOS Playback Dolphin app:
+
+```bash
+python3 scripts/process-frame-queue.py --runtime local-macos --consumers 1 --start-frame -123 --end-frame 900 replays/realtimeTest.slp
+```
+
+RunPod is the first scalable runtime target. Docker is wired behind the same runtime interface, but local Docker is only useful after a Linux renderer image exists with `/opt/slippi-renderer/render-replay.sh`; the currently verified renderer is a patched macOS app. RunPod also needs that renderer image plus an explicit remote ISO strategy before real pod processing should be enabled.
+
+RunPod planning run:
+
+```bash
+python3 scripts/process-frame-queue.py --runtime runpod --dry-run --plan-only --runpod-image slippi-renderer:runpod --consumers 2 replays/downloaded
+```
+
+Cleanup dry run:
+
+```bash
+python3 scripts/clean-up-runpod-cpu-pods.py
+```
+
+Delete this experiment's CPU worker Pods:
+
+```bash
+python3 scripts/clean-up-runpod-cpu-pods.py --confirm
+```
+
+Delete all CPU Pods in the account:
+
+```bash
+python3 scripts/clean-up-runpod-cpu-pods.py --all-cpu --confirm
+```
