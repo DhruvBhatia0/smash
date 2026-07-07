@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .commands import CommandRunner
+from .hf_storage import ProcessedFramePublisher
 from .jobs import FrameRenderJob, QueueStop, write_json
 from .result_store import FrameQueueResultStore
 from .runtimes import EmulatorRuntime, RuntimeFactory
@@ -171,6 +172,7 @@ class FrameProcessingConsumer(threading.Thread):
             align_frames=args.align_frames,
             attach_images=args.attach_images,
         )
+        self.publisher = ProcessedFramePublisher.from_args(args)
 
     def run(self) -> None:
         try:
@@ -189,6 +191,28 @@ class FrameProcessingConsumer(threading.Thread):
         try:
             result = self.processor.process(job)
             result["consumerId"] = self.consumer_id
+            if self.publisher is not None:
+                try:
+                    self.result_store.write_result_files(job=job, result=result)
+                    upload_result = self.publisher.publish_job(job)
+                    result["processedOutputUpload"] = upload_result
+                    if upload_result.get("status") in {"uploaded", "planned"}:
+                        self.result_store.write_result_files(job=job, result=result)
+                        result_upload = self.publisher.publish_job_result(job)
+                        result["processedOutputUpload"]["resultJson"] = result_upload
+                        cleanup = self.publisher.cleanup_job(job)
+                        if cleanup.get("status") != "skipped":
+                            result["processedOutputUpload"]["localCleanup"] = cleanup
+                except Exception as error:
+                    result["processedOutputUpload"] = {
+                        "status": "failed",
+                        "error": {
+                            "type": type(error).__name__,
+                            "message": str(error),
+                        },
+                    }
+                    if result.get("status") == "processed":
+                        result["status"] = "processed-upload-failed"
         except Exception as error:
             result = {
                 "status": "failed",

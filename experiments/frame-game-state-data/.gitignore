@@ -8,6 +8,8 @@ frames/
 game-frames/
 metadata/
 replays/downloaded/
+hf-downloads/
+hf-staging/
 processed-frame-queues/
 logs/
 *-user/

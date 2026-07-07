@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .consumer import FrameProcessingConsumer
+from .hf_storage import ProcessedFramePublisher
 from .jobs import FrameRenderJob, QueueStop
 from .producer import SlpCorpusProducer
 from .result_store import FrameQueueResultStore
@@ -19,15 +20,19 @@ class FrameQueueRunResult:
     enqueued_count: int
     counts: dict[str, int]
     elapsed_seconds: float
+    processed_output_upload: dict[str, Any] | None = None
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "runId": self.run_id,
             "runDir": str(self.run_dir),
             "enqueuedCount": self.enqueued_count,
             "counts": self.counts,
             "elapsedSeconds": round(self.elapsed_seconds, 3),
         }
+        if self.processed_output_upload is not None:
+            payload["processedOutputUpload"] = self.processed_output_upload
+        return payload
 
 
 class FrameQueuePipeline:
@@ -48,6 +53,7 @@ class FrameQueuePipeline:
         self.queue: "queue.Queue[FrameRenderJob | QueueStop]" = queue.Queue(
             maxsize=args.queue_size
         )
+        self.publisher = ProcessedFramePublisher.from_args(args)
 
     def run(self) -> FrameQueueRunResult:
         started = time.monotonic()
@@ -118,10 +124,17 @@ class FrameQueuePipeline:
                 "elapsedSeconds": round(elapsed, 3),
             }
         )
+        run_upload = None
+        if self.publisher is not None:
+            run_upload = self.publisher.publish_run_artifacts(
+                run_id=self.run_id,
+                run_dir=self.run_dir,
+            )
         return FrameQueueRunResult(
             run_id=self.run_id,
             run_dir=self.run_dir,
             enqueued_count=producer.enqueued_count,
             counts=dict(self.result_store.counts),
             elapsed_seconds=elapsed,
+            processed_output_upload=run_upload,
         )

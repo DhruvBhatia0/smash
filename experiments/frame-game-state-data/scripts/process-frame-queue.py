@@ -125,6 +125,37 @@ def parser() -> argparse.ArgumentParser:
         help="Public key file injected into the RunPod worker authorized_keys.",
     )
     arg_parser.add_argument("--runpod-wait-timeout-seconds", type=int, default=600)
+    arg_parser.add_argument(
+        "--upload-processed-to-hf",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Upload each processed job directory to a Hugging Face dataset as it finishes.",
+    )
+    arg_parser.add_argument(
+        "--hf-processed-repo",
+        default=os.environ.get("SMASH_HF_PROCESSED_REPO", ""),
+        help="Target Hugging Face dataset repo for processed frame output.",
+    )
+    arg_parser.add_argument(
+        "--hf-processed-prefix",
+        default=os.environ.get("SMASH_HF_PROCESSED_PREFIX", "processed/frame-queues"),
+    )
+    arg_parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN", ""))
+    arg_parser.add_argument("--hf-private", action=argparse.BooleanOptionalAction, default=True)
+    arg_parser.add_argument("--hf-create-repo", action=argparse.BooleanOptionalAction, default=True)
+    arg_parser.add_argument("--hf-dry-run", action=argparse.BooleanOptionalAction, default=False)
+    arg_parser.add_argument(
+        "--hf-include-raw-frames",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include raw PNG frame dumps in processed job uploads.",
+    )
+    arg_parser.add_argument(
+        "--delete-local-after-hf-upload",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Delete bulky per-job output directories after successful HF upload.",
+    )
     return arg_parser
 
 
@@ -138,6 +169,7 @@ def main(argv: list[str]) -> int:
     if args.plan_only or args.dry_run:
         args.plan_only = True
         args.dry_run = True
+        args.hf_dry_run = True
     if args.runtime == "local-macos" and args.consumers > 1 and not args.allow_parallel_local:
         raise SystemExit(
             "local-macos runtime is limited to one consumer unless --allow-parallel-local is set"
