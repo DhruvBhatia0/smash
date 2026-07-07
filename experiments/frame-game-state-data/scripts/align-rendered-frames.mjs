@@ -23,11 +23,18 @@ const outputDir = path.resolve(
   process.argv[3] ?? path.join("game-frames", commandId),
 );
 
-const runLogPath = renderManifest.logs?.run
-  ? path.resolve(renderManifest.logs.run)
-  : path.join(sourceDir, "render-replay-debug.log");
-if (!fs.existsSync(runLogPath)) {
-  throw new Error(`Missing render log: ${runLogPath}`);
+const candidateRunLogPaths = [
+  path.join(sourceDir, "render-replay.log"),
+  path.join(sourceDir, "render-replay-debug.log"),
+  renderManifest.logs?.run ? path.resolve(renderManifest.logs.run) : null,
+].filter(Boolean);
+const runLogPath = candidateRunLogPaths.find((candidate) =>
+  fs.existsSync(candidate),
+);
+if (!runLogPath) {
+  throw new Error(
+    `Missing render log. Checked: ${candidateRunLogPaths.join(", ")}`,
+  );
 }
 
 const currentFrames = fs

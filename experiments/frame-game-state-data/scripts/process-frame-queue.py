@@ -17,12 +17,18 @@ DEFAULT_NODE = (
     "/Users/dhruv/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node"
 )
 DEFAULT_ISO = "/Users/dhruv/Downloads/Super Smash Bros. Melee (USA) (En,Ja) (v1.02).iso"
+DEFAULT_RUNPOD_SSH_PRIVATE_KEY = Path.home() / ".ssh" / "id_ed25519"
+DEFAULT_RUNPOD_SSH_PUBLIC_KEY = Path.home() / ".ssh" / "id_ed25519.pub"
 
 
 def int_or_none(value: str) -> int | None:
     if value.lower() in {"none", "null", ""}:
         return None
     return int(value)
+
+
+def existing_path_default(path: Path) -> str:
+    return str(path) if path.exists() else ""
 
 
 def parser() -> argparse.ArgumentParser:
@@ -58,6 +64,22 @@ def parser() -> argparse.ArgumentParser:
     arg_parser.add_argument("--iso", default=DEFAULT_ISO)
     arg_parser.add_argument("--playback-app", default=None)
     arg_parser.add_argument(
+        "--video-backend",
+        default=os.environ.get("SMASH_VIDEO_BACKEND", "OGL"),
+        help="Dolphin video backend passed to the renderer image.",
+    )
+    arg_parser.add_argument(
+        "--dolphin-cpu-core",
+        type=int,
+        default=int(os.environ.get("SMASH_DOLPHIN_CPU_CORE", "1")),
+        help="Dolphin CPU core. Use 0 for interpreter when validating amd64 Docker on Apple Silicon.",
+    )
+    arg_parser.add_argument(
+        "--dolphin-audio-backend",
+        default=os.environ.get("SMASH_DOLPHIN_AUDIO_BACKEND", "Null"),
+        help="Dolphin DSP audio backend passed to the renderer image.",
+    )
+    arg_parser.add_argument(
         "--allow-parallel-local",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -74,12 +96,34 @@ def parser() -> argparse.ArgumentParser:
         "--runpod-cpu-flavor-id",
         action="append",
         default=None,
-        help="RunPod CPU flavor family. Repeatable. Defaults to cpu5c.",
+        help="RunPod CPU flavor family. Repeatable. Defaults to cpu3c.",
     )
-    arg_parser.add_argument("--runpod-container-disk-gb", type=int, default=20)
-    arg_parser.add_argument("--runpod-volume-gb", type=int, default=20)
+    arg_parser.add_argument("--runpod-vcpu-count", type=int, default=1)
+    arg_parser.add_argument("--runpod-container-disk-gb", type=int, default=10)
+    arg_parser.add_argument("--runpod-volume-gb", type=int_or_none, default=None)
     arg_parser.add_argument("--runpod-cloud-type", choices=["SECURE", "COMMUNITY"], default="SECURE")
     arg_parser.add_argument("--runpod-remote-iso", default="/workspace/iso/melee.iso")
+    arg_parser.add_argument(
+        "--runpod-ssh-private-key",
+        default=os.environ.get(
+            "RUNPOD_SSH_PRIVATE_KEY",
+            existing_path_default(DEFAULT_RUNPOD_SSH_PRIVATE_KEY),
+        ),
+        help="Private key used for SSH/rsync into RunPod workers.",
+    )
+    arg_parser.add_argument(
+        "--runpod-public-key",
+        default=os.environ.get("RUNPOD_PUBLIC_KEY", ""),
+        help="Public key text injected into the RunPod worker authorized_keys.",
+    )
+    arg_parser.add_argument(
+        "--runpod-public-key-file",
+        default=os.environ.get(
+            "RUNPOD_PUBLIC_KEY_FILE",
+            existing_path_default(DEFAULT_RUNPOD_SSH_PUBLIC_KEY),
+        ),
+        help="Public key file injected into the RunPod worker authorized_keys.",
+    )
     arg_parser.add_argument("--runpod-wait-timeout-seconds", type=int, default=600)
     return arg_parser
 
@@ -103,7 +147,11 @@ def main(argv: list[str]) -> int:
     if args.queue_size < 1:
         raise SystemExit("--queue-size must be >= 1")
     if not args.runpod_cpu_flavor_id:
-        args.runpod_cpu_flavor_id = ["cpu5c"]
+        args.runpod_cpu_flavor_id = ["cpu3c"]
+    if not args.runpod_public_key and args.runpod_public_key_file:
+        public_key_path = Path(args.runpod_public_key_file).expanduser()
+        if public_key_path.exists():
+            args.runpod_public_key = public_key_path.read_text().strip()
 
     run_id = args.run_id or time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     input_paths = [Path(value).expanduser() for value in args.inputs]

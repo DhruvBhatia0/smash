@@ -1,0 +1,17 @@
+data/
+frames/
+game-frames/
+metadata/
+node_modules/
+processed-frame-queues/
+replays/downloaded/
+scripts/__pycache__/
+scripts/frame_queue/__pycache__/
+source/
+tools/
+*-user/
+logs/
+images/
+backups/
+*.log
+*.pid

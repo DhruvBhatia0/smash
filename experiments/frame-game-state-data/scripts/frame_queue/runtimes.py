@@ -121,6 +121,10 @@ class DockerEmulatorRuntime(EmulatorRuntime):
         image: str,
         iso_path: str | None,
         renderer_command: str,
+        timeout_seconds: int,
+        video_backend: str,
+        dolphin_cpu_core: int,
+        dolphin_audio_backend: str,
         dry_run: bool,
     ):
         self.root_dir = root_dir
@@ -129,6 +133,10 @@ class DockerEmulatorRuntime(EmulatorRuntime):
         self.image = image
         self.iso_path = iso_path
         self.renderer_command = renderer_command
+        self.timeout_seconds = timeout_seconds
+        self.video_backend = video_backend
+        self.dolphin_cpu_core = dolphin_cpu_core
+        self.dolphin_audio_backend = dolphin_audio_backend
         self.dry_run = dry_run
         self.container_name = f"smash-frame-worker-{run_id}-{consumer_id}"
         self.runner = CommandRunner(cwd=root_dir)
@@ -153,12 +161,16 @@ class DockerEmulatorRuntime(EmulatorRuntime):
             "--rm",
             "--name",
             self.container_name,
+            "--entrypoint",
+            "/bin/bash",
+            "--cpus",
+            "1",
             "-v",
             f"{self.root_dir}:/workspace",
         ]
         if self.iso_path:
             command.extend(["-v", f"{Path(self.iso_path).resolve()}:/iso/melee.iso:ro"])
-        command.extend([self.image, "sleep", "infinity"])
+        command.extend([self.image, "-lc", "sleep infinity"])
         self.runner.run(command, check=True)
         self.started = True
 
@@ -178,6 +190,14 @@ class DockerEmulatorRuntime(EmulatorRuntime):
             container_playback,
             "--output-dir",
             container_raw,
+            "--timeout-seconds",
+            str(self.timeout_seconds),
+            "--video-backend",
+            self.video_backend,
+            "--cpu-core",
+            str(self.dolphin_cpu_core),
+            "--audio-backend",
+            self.dolphin_audio_backend,
         ]
         if self.iso_path:
             command.extend(["--iso", "/iso/melee.iso"])
@@ -209,6 +229,14 @@ class DockerEmulatorRuntime(EmulatorRuntime):
             container_playback,
             "--output-dir",
             container_raw,
+            "--timeout-seconds",
+            str(self.timeout_seconds),
+            "--video-backend",
+            self.video_backend,
+            "--cpu-core",
+            str(self.dolphin_cpu_core),
+            "--audio-backend",
+            self.dolphin_audio_backend,
         ]
         if self.iso_path:
             command.extend(["--iso", "/iso/melee.iso"])
@@ -218,6 +246,12 @@ class DockerEmulatorRuntime(EmulatorRuntime):
             "containerName": self.container_name,
             "image": self.image,
             "command": command,
+            "renderer": {
+                "timeoutSeconds": self.timeout_seconds,
+                "videoBackend": self.video_backend,
+                "dolphinCpuCore": self.dolphin_cpu_core,
+                "audioBackend": self.dolphin_audio_backend,
+            },
             "rawFrameDir": str(job.raw_frame_dir),
         }
         write_json(job.job_dir / "docker-render-plan.json", plan)
@@ -287,7 +321,8 @@ class RunPodRestClient:
         image: str,
         cpu_flavor_ids: list[str],
         container_disk_gb: int,
-        volume_gb: int,
+        volume_gb: int | None,
+        vcpu_count: int,
         cloud_type: str,
         ports: list[str],
         env: dict[str, str],
@@ -299,13 +334,16 @@ class RunPodRestClient:
             "cloudType": cloud_type,
             "cpuFlavorIds": cpu_flavor_ids,
             "cpuFlavorPriority": "availability",
+            "vcpuCount": vcpu_count,
             "containerDiskInGb": container_disk_gb,
-            "volumeInGb": volume_gb,
-            "volumeMountPath": "/workspace",
             "ports": ports,
-            "dockerStartCmd": ["sleep", "infinity"],
+            "dockerEntrypoint": ["/bin/bash", "-lc"],
+            "dockerStartCmd": ["/opt/slippi-renderer/start-runpod-worker.sh"],
             "env": env,
         }
+        if volume_gb is not None:
+            payload["volumeInGb"] = volume_gb
+            payload["volumeMountPath"] = "/workspace"
         result = self.request("POST", "/pods", payload=payload)
         if not isinstance(result, dict):
             raise RuntimeProvisioningError("Unexpected RunPod create pod response")
@@ -325,11 +363,19 @@ class RunPodCpuEmulatorRuntime(EmulatorRuntime):
         api_key: str,
         cpu_flavor_ids: list[str],
         container_disk_gb: int,
-        volume_gb: int,
+        volume_gb: int | None,
+        vcpu_count: int,
         cloud_type: str,
         renderer_command: str,
         remote_iso_path: str,
+        local_iso_path: str | None,
+        ssh_private_key_path: str,
+        public_key: str,
         dry_run: bool,
+        render_timeout_seconds: int,
+        video_backend: str,
+        dolphin_cpu_core: int,
+        dolphin_audio_backend: str,
         wait_timeout_seconds: int,
     ):
         self.run_id = run_id
@@ -338,10 +384,18 @@ class RunPodCpuEmulatorRuntime(EmulatorRuntime):
         self.cpu_flavor_ids = cpu_flavor_ids
         self.container_disk_gb = container_disk_gb
         self.volume_gb = volume_gb
+        self.vcpu_count = vcpu_count
         self.cloud_type = cloud_type
         self.renderer_command = renderer_command
         self.remote_iso_path = remote_iso_path
+        self.local_iso_path = local_iso_path
+        self.ssh_private_key_path = ssh_private_key_path
+        self.public_key = public_key
         self.dry_run = dry_run
+        self.render_timeout_seconds = render_timeout_seconds
+        self.video_backend = video_backend
+        self.dolphin_cpu_core = dolphin_cpu_core
+        self.dolphin_audio_backend = dolphin_audio_backend
         self.wait_timeout_seconds = wait_timeout_seconds
         self.pod_name = f"smash-frame-worker-{run_id}-{consumer_id}"
         self.client = RunPodRestClient(api_key=api_key)
@@ -355,6 +409,11 @@ class RunPodCpuEmulatorRuntime(EmulatorRuntime):
                 "name": self.pod_name,
                 "computeType": "CPU",
                 "imageName": self.image,
+                "cpuFlavorIds": self.cpu_flavor_ids,
+                "vcpuCount": self.vcpu_count,
+                "volumeInGb": self.volume_gb,
+                "sshPrivateKeyPath": self.ssh_private_key_path,
+                "publicKeyProvided": bool(self.public_key),
             }
             return
         if not self.image:
@@ -365,9 +424,17 @@ class RunPodCpuEmulatorRuntime(EmulatorRuntime):
             cpu_flavor_ids=self.cpu_flavor_ids,
             container_disk_gb=self.container_disk_gb,
             volume_gb=self.volume_gb,
+            vcpu_count=self.vcpu_count,
             cloud_type=self.cloud_type,
             ports=["22/tcp"],
-            env={"SMASH_FRAME_QUEUE_RUN_ID": self.run_id},
+            env={
+                key: value
+                for key, value in {
+                    "SMASH_FRAME_QUEUE_RUN_ID": self.run_id,
+                    "PUBLIC_KEY": self.public_key,
+                }.items()
+                if value
+            },
         )
 
     def render(self, job: FrameRenderJob) -> dict[str, Any]:
@@ -377,6 +444,7 @@ class RunPodCpuEmulatorRuntime(EmulatorRuntime):
         remote_slp = f"{remote_job_dir}/input.slp"
         remote_playback = f"{remote_job_dir}/playback.json"
         remote_raw = f"{remote_job_dir}/raw-frames"
+        remote_iso_dir = str(Path(self.remote_iso_path).parent)
         write_json(job.remote_playback_json_path, job.playback_config(remote_slp))
 
         remote_command = [
@@ -387,6 +455,14 @@ class RunPodCpuEmulatorRuntime(EmulatorRuntime):
             remote_raw,
             "--iso",
             self.remote_iso_path,
+            "--timeout-seconds",
+            str(self.render_timeout_seconds),
+            "--video-backend",
+            self.video_backend,
+            "--cpu-core",
+            str(self.dolphin_cpu_core),
+            "--audio-backend",
+            self.dolphin_audio_backend,
         ]
 
         if self.dry_run:
@@ -400,23 +476,60 @@ class RunPodCpuEmulatorRuntime(EmulatorRuntime):
             str(ssh["port"]),
             "-o",
             "StrictHostKeyChecking=accept-new",
-            ssh_target,
         ]
+        if self.ssh_private_key_path:
+            ssh_base.extend(["-i", self.ssh_private_key_path])
+        ssh_base.extend(["-o", "BatchMode=yes", ssh_target])
+        ssh_transport = [
+            "ssh",
+            "-p",
+            str(ssh["port"]),
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+        ]
+        if self.ssh_private_key_path:
+            ssh_transport.extend(["-i", self.ssh_private_key_path])
+        ssh_transport.extend(["-o", "BatchMode=yes"])
         rsync_base = [
             "rsync",
             "-az",
             "-e",
-            f"ssh -p {ssh['port']} -o StrictHostKeyChecking=accept-new",
+            shlex.join(ssh_transport),
         ]
         runner = CommandRunner(cwd=job.root_dir)
-        runner.run(ssh_base + [f"mkdir -p {shlex.quote(remote_job_dir)}"])
+        runner.run(
+            ssh_base
+            + [f"mkdir -p {shlex.quote(remote_job_dir)} {shlex.quote(remote_iso_dir)}"]
+        )
         runner.run(rsync_base + [str(job.slp_path), f"{ssh_target}:{remote_slp}"])
         runner.run(
             rsync_base + [str(job.remote_playback_json_path), f"{ssh_target}:{remote_playback}"]
         )
-        render_result = runner.run(ssh_base + [shlex.join(remote_command)], check=True)
+        if self.local_iso_path:
+            runner.run(
+                rsync_base
+                + [str(Path(self.local_iso_path).expanduser()), f"{ssh_target}:{self.remote_iso_path}"]
+            )
+        render_result = runner.run(ssh_base + [shlex.join(remote_command)], check=False)
         job.raw_frame_dir.mkdir(parents=True, exist_ok=True)
-        runner.run(rsync_base + [f"{ssh_target}:{remote_raw}/", f"{job.raw_frame_dir}/"])
+        sync_result = runner.run(
+            rsync_base + [f"{ssh_target}:{remote_raw}/", f"{job.raw_frame_dir}/"],
+            check=False,
+        )
+        if render_result.returncode != 0:
+            raise RuntimeProvisioningError(
+                "RunPod render failed after remote execution. "
+                f"Return code: {render_result.returncode}. "
+                f"Synced remote outputs: {sync_result.returncode == 0}. "
+                f"Local raw frame dir: {job.raw_frame_dir}. "
+                f"Command: {shlex.join(remote_command)}"
+            )
+        if sync_result.returncode != 0:
+            raise RuntimeProvisioningError(
+                "RunPod render succeeded but output sync failed. "
+                f"Return code: {sync_result.returncode}. "
+                f"Local raw frame dir: {job.raw_frame_dir}"
+            )
         return {
             "runtime": "runpod",
             "status": "rendered",
@@ -441,18 +554,38 @@ class RunPodCpuEmulatorRuntime(EmulatorRuntime):
             remote_raw,
             "--iso",
             self.remote_iso_path,
+            "--timeout-seconds",
+            str(self.render_timeout_seconds),
+            "--video-backend",
+            self.video_backend,
+            "--cpu-core",
+            str(self.dolphin_cpu_core),
+            "--audio-backend",
+            self.dolphin_audio_backend,
         ]
         write_json(job.remote_playback_json_path, job.playback_config(remote_slp))
         plan = {
             "runtime": "runpod",
             "status": "planned",
             "pod": self.pod,
+            "ssh": {
+                "privateKeyPath": self.ssh_private_key_path,
+                "publicKeyProvided": bool(self.public_key),
+            },
             "remote": {
                 "jobDir": remote_job_dir,
                 "slp": remote_slp,
                 "playbackJson": remote_playback,
+                "iso": self.remote_iso_path,
+                "uploadsIso": bool(self.local_iso_path),
                 "rawFrameDir": remote_raw,
                 "command": remote_command,
+                "renderer": {
+                    "timeoutSeconds": self.render_timeout_seconds,
+                    "videoBackend": self.video_backend,
+                    "dolphinCpuCore": self.dolphin_cpu_core,
+                    "audioBackend": self.dolphin_audio_backend,
+                },
             },
             "local": {
                 "rawFrameDir": str(job.raw_frame_dir),
@@ -516,6 +649,10 @@ class RuntimeFactory:
                 image=args.docker_image,
                 iso_path=args.iso,
                 renderer_command=args.renderer_command,
+                timeout_seconds=args.timeout_seconds,
+                video_backend=args.video_backend,
+                dolphin_cpu_core=args.dolphin_cpu_core,
+                dolphin_audio_backend=args.dolphin_audio_backend,
                 dry_run=args.dry_run,
             )
         if runtime == "runpod":
@@ -527,10 +664,18 @@ class RuntimeFactory:
                 cpu_flavor_ids=args.runpod_cpu_flavor_id,
                 container_disk_gb=args.runpod_container_disk_gb,
                 volume_gb=args.runpod_volume_gb,
+                vcpu_count=args.runpod_vcpu_count,
                 cloud_type=args.runpod_cloud_type,
                 renderer_command=args.renderer_command,
                 remote_iso_path=args.runpod_remote_iso,
+                local_iso_path=args.iso,
+                ssh_private_key_path=args.runpod_ssh_private_key,
+                public_key=args.runpod_public_key,
                 dry_run=args.dry_run,
+                render_timeout_seconds=args.timeout_seconds,
+                video_backend=args.video_backend,
+                dolphin_cpu_core=args.dolphin_cpu_core,
+                dolphin_audio_backend=args.dolphin_audio_backend,
                 wait_timeout_seconds=args.runpod_wait_timeout_seconds,
             )
         raise RuntimeProvisioningError(f"Unknown runtime: {runtime}")

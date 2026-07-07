@@ -12,6 +12,8 @@
     "ingest:slp": "/Users/dhruv/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node scripts/ingest-slp-downloads.mjs",
     "queue:frames": "python3 scripts/process-frame-queue.py",
     "cleanup:runpod": "python3 scripts/clean-up-runpod-cpu-pods.py",
+    "docker:build-renderer": "docker/scripts/build-renderer-image.sh",
+    "docker:validate-renderer": "docker/scripts/validate-renderer-image.sh",
     "prepare:playback-build": "scripts/prepare-playback-build.sh",
     "render": "scripts/render-replay-debug.sh"
   },
