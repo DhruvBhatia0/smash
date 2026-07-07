@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="/Users/dhruv/code/smash/experiments/frame-game-state-data"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 SOURCE_DIR="${SOURCE_DIR:-$ROOT/source/Ishiiruka}"
 APP_BUNDLE="${APP_BUNDLE:-$SOURCE_DIR/build/Binaries/Slippi Dolphin.app}"
 RUNTIME_APP_BUNDLE="${RUNTIME_APP_BUNDLE:-$ROOT/tools/patched-playback/Slippi Dolphin.app}"

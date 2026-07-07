@@ -4,6 +4,9 @@ __pycache__/
 *.log
 *.pid
 node_modules/
+hf-downloads/
+hf-staging/
+processed-frame-queues/
 
 # Local emulator/runtime artifacts
 **/*-user/

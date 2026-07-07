@@ -6,7 +6,7 @@ Current goal: render a `.slp` replay into real Melee pixels, align those pixels 
 
 1. Use Slippi Playback Dolphin, not the Homebrew/netplay Slippi Dolphin app.
 2. Use the patched local Playback build at:
-   `/Users/dhruv/code/smash/experiments/frame-game-state-data/tools/patched-playback/Slippi Dolphin.app`
+   `/Users/dhruv/code/smash/tools/patched-playback/Slippi Dolphin.app`
 3. Verify the app bundle has `Contents/Resources/Sys/GameSettings/GALE01r2.ini` containing `$Required: Slippi Playback`.
 4. Launch Playback Dolphin with:
    - `-u <isolated user dir>`
@@ -49,20 +49,20 @@ The first patched source build dumped PNGs but booted to Online Play. The binary
 Useful local logs:
 
 - Render wrapper log, generated after `pnpm render`:
-  `/Users/dhruv/code/smash/experiments/frame-game-state-data/logs/render-replay-debug.log`
+  `/Users/dhruv/code/smash/logs/render-replay-debug.log`
 - Dolphin log, generated after `pnpm render`:
-  `/Users/dhruv/code/smash/experiments/frame-game-state-data/playback-debug-user/Logs/dolphin.log`
+  `/Users/dhruv/code/smash/playback-debug-user/Logs/dolphin.log`
 
 The render wrapper requires both PNG output and `[CURRENT_FRAME]` log entries. PNGs alone are not success because the wrong app/resources can dump menu frames.
 
 ## Current Verified Outputs
 
 - Aligned game frames:
-  `/Users/dhruv/code/smash/experiments/frame-game-state-data/game-frames/realtimeTest-capture-test`
+  `/Users/dhruv/code/smash/game-frames/realtimeTest-capture-test`
 - Frame mapping:
-  `/Users/dhruv/code/smash/experiments/frame-game-state-data/game-frames/realtimeTest-capture-test/frames.jsonl`
+  `/Users/dhruv/code/smash/game-frames/realtimeTest-capture-test/frames.jsonl`
 - State/input rows with image paths:
-  `/Users/dhruv/code/smash/experiments/frame-game-state-data/data/realtimeTest.capture-test.image-rows.jsonl`
+  `/Users/dhruv/code/smash/data/realtimeTest.capture-test.image-rows.jsonl`
 
 The verified capture-test run produced:
 
@@ -76,7 +76,7 @@ The raw `frames/` dump is generated and was removed during cleanup. Re-running `
 
 ## Commands
 
-From `/Users/dhruv/code/smash/experiments/frame-game-state-data`:
+From `/Users/dhruv/code/smash`:
 
 ```bash
 /Users/dhruv/.cache/codex-runtimes/codex-primary-runtime/dependencies/bin/pnpm render

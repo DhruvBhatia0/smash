@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${ROOT:-/Users/dhruv/code/smash/experiments/frame-game-state-data}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 PATCHED_PLAYBACK_APP="$ROOT/tools/patched-playback/Slippi Dolphin.app/Contents/MacOS/Slippi Dolphin"
 if [[ -z "${PLAYBACK_APP:-}" && -x "$PATCHED_PLAYBACK_APP" ]]; then
   PLAYBACK_APP="$PATCHED_PLAYBACK_APP"
