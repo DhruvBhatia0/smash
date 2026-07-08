@@ -209,10 +209,13 @@ class RunpodHostRunner:
             "SMASH_START_FRAME": str(self.args.start_frame),
             "SMASH_END_FRAME": str(self.args.end_frame),
             "SMASH_RENDER_TIMEOUT_SECONDS": str(self.args.render_timeout_seconds),
+            "SMASH_RENDER_OUTER_TIMEOUT_EXTRA_SECONDS": str(self.args.render_outer_timeout_extra_seconds),
             "SMASH_MAX_FRAME_UPLOADS": str(self.args.max_frame_uploads),
             "SMASH_FRAME_UPLOAD_BATCH_SIZE": str(self.args.frame_upload_batch_size),
             "SMASH_FRAME_UPLOAD_RETRIES": str(self.args.frame_upload_retries),
             "SMASH_FRAME_UPLOAD_RETRY_SECONDS": str(self.args.frame_upload_retry_seconds),
+            "SMASH_SKIP_EXISTING_PROCESSED": "1" if self.args.skip_existing_processed else "0",
+            "SMASH_MIN_PROCESSED_FILES": str(self.args.min_processed_files),
             "SMASH_RUNPOD_WAIT_SECONDS": str(self.args.wait_seconds),
             "SMASH_RUNPOD_NAME_PREFIX": self.args.worker_name_prefix,
             "SMASH_RUNPOD_VCPU_COUNT": str(self.args.worker_vcpus),
@@ -386,6 +389,7 @@ def parser() -> argparse.ArgumentParser:
     arg_parser.add_argument("--start-frame", type=int, default=-123)
     arg_parser.add_argument("--end-frame", type=int, default=10)
     arg_parser.add_argument("--render-timeout-seconds", type=int, default=25)
+    arg_parser.add_argument("--render-outer-timeout-extra-seconds", type=int, default=30)
     arg_parser.add_argument("--max-frame-uploads", type=int, default=60)
     arg_parser.add_argument("--frame-upload-batch-size", type=int, default=1)
     arg_parser.add_argument("--frame-upload-retries", type=int, default=5)
@@ -400,6 +404,8 @@ def parser() -> argparse.ArgumentParser:
     arg_parser.add_argument("--seed-download-timeout-seconds", type=int, default=60)
     arg_parser.add_argument("--seed-download-retries", type=int, default=3)
     arg_parser.add_argument("--worker-name-prefix", default="smash-core-worker")
+    arg_parser.add_argument("--skip-existing-processed", action=argparse.BooleanOptionalAction, default=False)
+    arg_parser.add_argument("--min-processed-files", type=int, default=1)
     arg_parser.add_argument("--keep-host", action=argparse.BooleanOptionalAction, default=False)
     return arg_parser
 

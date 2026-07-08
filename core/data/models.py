@@ -57,11 +57,15 @@ class SlpDownloader:
         queue: Queue[SlpSample | None],
         hf_location: HfLocation,
         desired_max: int,
+        skip_existing_processed: bool = False,
+        min_processed_files: int = 1,
     ):
         """Verify HF access and remember where raw SLP files live."""
         self.queue = queue
         self.hf_location = hf_location
         self.desired_max = desired_max
+        self.skip_existing_processed = skip_existing_processed
+        self.min_processed_files = min_processed_files
         self.hf_location.hf.create_repo(self.hf_location.repo)
         self.count = 0
         self.error: str | None = None
@@ -77,16 +81,31 @@ class SlpDownloader:
                 )
                 if path.endswith(".slp")
             ]
+            processed_ids = self._processed_ids() if self.skip_existing_processed else set()
         except Exception as error:
             self.error = str(error)
             log_event("producer_failed", error=str(error))
             return
+        if processed_ids:
+            log_event("existing_processed", count=len(processed_ids))
         for sample_id, hf_reference in enumerate(sorted(raw_files)[: self.desired_max]):
+            if sample_id in processed_ids:
+                continue
             sample = SlpSample(id=sample_id, hf_reference=hf_reference)
             self.queue.put(sample, block=True)
             self.count += 1
             log_event("added", sample=sample.id, source=sample.hf_reference)
         log_event("producer_done", count=self.count)
+
+    def _processed_ids(self) -> set[int]:
+        prefix = self.hf_location._join(self.hf_location.root, self.hf_location.framed_slp_dir)
+        counts: dict[int, int] = {}
+        for path in self.hf_location.hf.list_files(self.hf_location.repo, prefix):
+            suffix = path.removeprefix(prefix).strip("/")
+            sample_id = suffix.split("/", 1)[0]
+            if sample_id.isdigit():
+                counts[int(sample_id)] = counts.get(int(sample_id), 0) + 1
+        return {sample_id for sample_id, count in counts.items() if count >= self.min_processed_files}
 
 
 class FrameRecorder:

@@ -16,10 +16,18 @@ class DatasetRunner:
         runpod: RunpodConnector,
         desired_max: int,
         recorder_count: int,
+        skip_existing_processed: bool = False,
+        min_processed_files: int = 1,
     ):
         """Create the bounded queue and the producer/consumer objects."""
         self.queue: Queue[SlpSample | None] = Queue(maxsize=1000)
-        self.downloader = SlpDownloader(self.queue, hf_location, desired_max)
+        self.downloader = SlpDownloader(
+            self.queue,
+            hf_location,
+            desired_max,
+            skip_existing_processed=skip_existing_processed,
+            min_processed_files=min_processed_files,
+        )
         self.hf_location = hf_location
         self.runpod = runpod
         self.recorder_count = recorder_count
@@ -92,6 +100,8 @@ def build_runner() -> DatasetRunner:
         ),
         desired_max=int(os.environ.get("SMASH_SAMPLE_LIMIT", "1")),
         recorder_count=int(os.environ.get("SMASH_WORKER_COUNT", "1")),
+        skip_existing_processed=os.environ.get("SMASH_SKIP_EXISTING_PROCESSED", "") == "1",
+        min_processed_files=int(os.environ.get("SMASH_MIN_PROCESSED_FILES", "1")),
     )
 
 

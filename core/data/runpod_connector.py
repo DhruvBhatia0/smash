@@ -59,6 +59,7 @@ class RunpodConnector:
         self.public_key = self._public_key()
         self.wait_seconds = int(os.environ.get("SMASH_RUNPOD_WAIT_SECONDS", "600"))
         self.timeout_seconds = int(os.environ.get("SMASH_RENDER_TIMEOUT_SECONDS", "120"))
+        self.outer_timeout_extra_seconds = int(os.environ.get("SMASH_RENDER_OUTER_TIMEOUT_EXTRA_SECONDS", "30"))
         self.create_retries = int(os.environ.get("SMASH_RUNPOD_CREATE_RETRIES", "4"))
         self.video_backend = os.environ.get("SMASH_VIDEO_BACKEND", "OGL")
         self.dolphin_cpu_core = os.environ.get("SMASH_DOLPHIN_CPU_CORE", "1")
@@ -155,6 +156,7 @@ class RunpodConnector:
             "renderer": self.renderer,
             "iso": self.remote_iso,
             "timeoutSeconds": self.timeout_seconds,
+            "outerTimeoutSeconds": self.timeout_seconds + self.outer_timeout_extra_seconds,
             "videoBackend": self.video_backend,
             "dolphinCpuCore": self.dolphin_cpu_core,
             "audioBackend": self.audio_backend,
@@ -226,6 +228,7 @@ class RunpodConnector:
         return f"""
 import json
 import os
+import signal
 import shutil
 import subprocess
 from pathlib import Path
@@ -272,11 +275,32 @@ command = [
     "--audio-backend",
     config["audioBackend"],
 ]
-render = subprocess.run(command, text=True, capture_output=True)
-if render.returncode:
-    print(render.stdout)
-    print(render.stderr)
-    raise SystemExit(render.returncode)
+process = subprocess.Popen(
+    command,
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    start_new_session=True,
+)
+try:
+    stdout, stderr = process.communicate(timeout=config["outerTimeoutSeconds"])
+except subprocess.TimeoutExpired:
+    os.killpg(process.pid, signal.SIGTERM)
+    try:
+        stdout, stderr = process.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        stdout, stderr = process.communicate()
+    print(stdout or "")
+    print(stderr or "")
+    shutil.rmtree(work_dir, ignore_errors=True)
+    raise SystemExit(124)
+
+if process.returncode:
+    print(stdout)
+    print(stderr)
+    shutil.rmtree(work_dir, ignore_errors=True)
+    raise SystemExit(process.returncode)
 
 max_frame_uploads = config.get("maxFrameUploads")
 if max_frame_uploads:
