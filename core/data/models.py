@@ -102,6 +102,7 @@ class FrameRecorder:
         self.runpod = runpod
         self.results: list[dict] = []
         self.errors: list[dict] = []
+        self.pending_uploads: list[SlpSample] = []
         self.closed = False
         worker = self.runpod.create_instance()
         try:
@@ -120,11 +121,15 @@ class FrameRecorder:
                 sample = self.queue.get(block=True)
                 try:
                     if sample is None:
+                        self._upload_pending()
                         log_event("recorder_done", podId=self.worker.id)
                         return
                     log_event("picked", sample=sample.id, podId=self.worker.id)
                     self.results.append(self._record_one(sample))
-                    log_event("completed", sample=sample.id, podId=self.worker.id)
+                    self.pending_uploads.append(sample)
+                    log_event("rendered", sample=sample.id, podId=self.worker.id)
+                    if len(self.pending_uploads) >= self.runpod.frame_upload_batch_size:
+                        self._upload_pending()
                 except Exception as error:
                     self.errors.append(
                         {
@@ -160,3 +165,13 @@ class FrameRecorder:
             "prepare": self.prepare_result,
             "render": render,
         }
+
+    def _upload_pending(self):
+        if not self.pending_uploads:
+            return
+        samples = self.pending_uploads
+        self.pending_uploads = []
+        upload = self.runpod.upload_recorded_frames(self.worker, self.hf_location, samples)
+        log_event("uploaded_batch", podId=self.worker.id, count=len(samples), files=upload.get("files"))
+        for sample in samples:
+            log_event("completed", sample=sample.id, podId=self.worker.id)

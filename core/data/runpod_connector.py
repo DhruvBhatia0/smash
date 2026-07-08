@@ -66,6 +66,7 @@ class RunpodConnector:
         self.start_frame = self._optional_int("SMASH_START_FRAME")
         self.end_frame = self._optional_int("SMASH_END_FRAME")
         self.max_frame_uploads = self._optional_int("SMASH_MAX_FRAME_UPLOADS")
+        self.frame_upload_batch_size = max(1, int(os.environ.get("SMASH_FRAME_UPLOAD_BATCH_SIZE", "1")))
 
     def create_instance(self) -> RunpodInstance:
         """Create one CPU pod running the frame-recording image."""
@@ -156,8 +157,36 @@ class RunpodConnector:
             "dolphinCpuCore": self.dolphin_cpu_core,
             "audioBackend": self.audio_backend,
             "maxFrameUploads": self.max_frame_uploads,
+            "uploadImmediately": False,
         }
         result = self._ssh_script(instance, self._remote_record_script(payload))
+        return json.loads(result.stdout.strip().splitlines()[-1])
+
+    def upload_recorded_frames(
+        self,
+        instance: RunpodInstance,
+        hf_location: HfLocation,
+        samples: list[SlpSample],
+    ) -> dict:
+        """Upload a batch of already-rendered sample folders to HF."""
+        if not samples:
+            return {"samples": [], "files": 0}
+        payload = {
+            "token": hf_location.hf.token,
+            "repo": hf_location.repo,
+            "target": hf_location._join(hf_location.root, hf_location.framed_slp_dir),
+            "batchDir": f"/workspace/smash-core/upload-{time.time_ns()}",
+            "jobs": [
+                {
+                    "sample": sample.id,
+                    "workDir": f"/workspace/smash-core/{sample.id}",
+                    "framesDir": f"/workspace/smash-core/{sample.id}/frames",
+                    "targetName": str(sample.id),
+                }
+                for sample in samples
+            ],
+        }
+        result = self._ssh_script(instance, self._remote_upload_script(payload))
         return json.loads(result.stdout.strip().splitlines()[-1])
 
     def delete_instance(self, instance: RunpodInstance):
@@ -256,18 +285,63 @@ if max_frame_uploads:
     for path in frames[int(max_frame_uploads):]:
         path.unlink()
 
-HfApi(token=token).upload_folder(
-    repo_id=config["repo"],
-    repo_type="dataset",
-    token=token,
-    folder_path=str(frames_dir),
-    path_in_repo=config["target"],
-)
+if config.get("uploadImmediately"):
+    HfApi(token=token).upload_folder(
+        repo_id=config["repo"],
+        repo_type="dataset",
+        token=token,
+        folder_path=str(frames_dir),
+        path_in_repo=config["target"],
+    )
 print(json.dumps({{
     "podWorkDir": str(work_dir),
     "uploadedTo": config["target"],
+    "framesDir": str(frames_dir),
     "frameCount": len(list(frames_dir.glob("framedump_*.png"))),
     "files": len([path for path in frames_dir.rglob("*") if path.is_file()]),
+}}))
+""".strip()
+
+    def _remote_upload_script(self, payload: dict) -> str:
+        config_json = json.dumps(json.dumps(payload))
+        return f"""
+import json
+import shutil
+from pathlib import Path
+
+from huggingface_hub import HfApi
+
+config = json.loads({config_json})
+batch_dir = Path(config["batchDir"])
+if batch_dir.exists():
+    shutil.rmtree(batch_dir)
+batch_dir.mkdir(parents=True)
+
+uploaded = []
+for job in config["jobs"]:
+    source = Path(job["framesDir"])
+    if not source.exists():
+        raise FileNotFoundError(str(source))
+    target = batch_dir / job["targetName"]
+    shutil.copytree(source, target)
+    uploaded.append(job["sample"])
+
+file_count = len([path for path in batch_dir.rglob("*") if path.is_file()])
+HfApi(token=config["token"]).upload_folder(
+    repo_id=config["repo"],
+    repo_type="dataset",
+    token=config["token"],
+    folder_path=str(batch_dir),
+    path_in_repo=config["target"],
+)
+
+for job in config["jobs"]:
+    shutil.rmtree(job["workDir"], ignore_errors=True)
+shutil.rmtree(batch_dir, ignore_errors=True)
+print(json.dumps({{
+    "uploadedTo": config["target"],
+    "samples": uploaded,
+    "files": file_count,
 }}))
 """.strip()
 

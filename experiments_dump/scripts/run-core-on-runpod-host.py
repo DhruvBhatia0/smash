@@ -203,6 +203,7 @@ class RunpodHostRunner:
             "SMASH_END_FRAME": str(self.args.end_frame),
             "SMASH_RENDER_TIMEOUT_SECONDS": str(self.args.render_timeout_seconds),
             "SMASH_MAX_FRAME_UPLOADS": str(self.args.max_frame_uploads),
+            "SMASH_FRAME_UPLOAD_BATCH_SIZE": str(self.args.frame_upload_batch_size),
             "SMASH_RUNPOD_WAIT_SECONDS": str(self.args.wait_seconds),
             "SMASH_RUNPOD_NAME_PREFIX": self.args.worker_name_prefix,
             "SMASH_RUNPOD_VCPU_COUNT": str(self.args.worker_vcpus),
@@ -356,6 +357,7 @@ def parser() -> argparse.ArgumentParser:
     arg_parser.add_argument("--end-frame", type=int, default=10)
     arg_parser.add_argument("--render-timeout-seconds", type=int, default=25)
     arg_parser.add_argument("--max-frame-uploads", type=int, default=60)
+    arg_parser.add_argument("--frame-upload-batch-size", type=int, default=1)
     arg_parser.add_argument("--create-retries", type=int, default=4)
     arg_parser.add_argument("--seed-source-hf-repo", default="")
     arg_parser.add_argument("--seed-source-hf-prefix", default="")
