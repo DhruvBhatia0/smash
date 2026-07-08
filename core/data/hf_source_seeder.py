@@ -6,10 +6,11 @@ import os
 import shutil
 import tempfile
 import time
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import HfApi, hf_hub_url
 
 from .hf_connector import HfConnector
 from .models import HfLocation, log_event
@@ -35,6 +36,8 @@ class HfSourceSlpSeeder:
         batch_size: int = 100,
         concurrency: int = 16,
         work_dir: str = "/workspace/slp-seed",
+        download_timeout_seconds: int = 60,
+        download_retries: int = 3,
     ):
         """Mirror source HF SLP files into the target HF raw folder in bounded batches."""
         self.target = target
@@ -44,6 +47,8 @@ class HfSourceSlpSeeder:
         self.batch_size = max(1, batch_size)
         self.concurrency = max(1, concurrency)
         self.work_dir = Path(work_dir)
+        self.download_timeout_seconds = download_timeout_seconds
+        self.download_retries = download_retries
         self.source_api = HfApi(token=target.hf.token)
 
     def seed(self) -> dict:
@@ -114,14 +119,8 @@ class HfSourceSlpSeeder:
 
     def _download_one(self, job: SourceSlp, upload_dir: Path) -> dict:
         local_path = upload_dir / Path(job.target_path).name
-        downloaded = hf_hub_download(
-            repo_id=self.source_repo,
-            repo_type="dataset",
-            filename=job.source_path,
-            token=self.target.hf.token,
-            cache_dir=str(upload_dir.parent / ".cache"),
-        )
-        shutil.copyfile(downloaded, local_path)
+        url = hf_hub_url(self.source_repo, job.source_path, repo_type="dataset")
+        self._stream_download(url, local_path)
         return {
             "index": job.index,
             "sourceRepo": self.source_repo,
@@ -130,6 +129,26 @@ class HfSourceSlpSeeder:
             "targetPath": job.target_path,
             "size": job.size,
         }
+
+    def _stream_download(self, url: str, local_path: Path):
+        headers = {"user-agent": "smash-frame-data-seeder"}
+        if self.target.hf.token:
+            headers["authorization"] = f"Bearer {self.target.hf.token}"
+        for attempt in range(1, self.download_retries + 1):
+            try:
+                request = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(request, timeout=self.download_timeout_seconds) as response:
+                    with local_path.open("wb") as handle:
+                        while True:
+                            chunk = response.read(1024 * 1024)
+                            if not chunk:
+                                return
+                            handle.write(chunk)
+            except Exception:
+                local_path.unlink(missing_ok=True)
+                if attempt == self.download_retries:
+                    raise
+                time.sleep(min(30, 2**attempt))
 
     def _source_slps(self):
         index = 0
@@ -179,6 +198,8 @@ def build_seeder() -> HfSourceSlpSeeder:
         batch_size=int(os.environ.get("SMASH_SOURCE_SEED_BATCH_SIZE", "100")),
         concurrency=int(os.environ.get("SMASH_SOURCE_SEED_CONCURRENCY", "16")),
         work_dir=os.environ.get("SMASH_SOURCE_SEED_WORK_DIR", "/workspace/slp-seed"),
+        download_timeout_seconds=int(os.environ.get("SMASH_SOURCE_DOWNLOAD_TIMEOUT_SECONDS", "60")),
+        download_retries=int(os.environ.get("SMASH_SOURCE_DOWNLOAD_RETRIES", "3")),
     )
 
 

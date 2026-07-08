@@ -216,6 +216,8 @@ class RunpodHostRunner:
             "SMASH_SOURCE_SEED_CONCURRENCY": str(self.args.seed_concurrency),
             "SMASH_SOURCE_SEED_BATCH_SIZE": str(self.args.seed_batch_size),
             "SMASH_SOURCE_SEED_WORK_DIR": self.args.seed_work_dir,
+            "SMASH_SOURCE_DOWNLOAD_TIMEOUT_SECONDS": str(self.args.seed_download_timeout_seconds),
+            "SMASH_SOURCE_DOWNLOAD_RETRIES": str(self.args.seed_download_retries),
         }
         env_text = "\n".join(f"export {key}={shlex.quote(value)}" for key, value in env.items())
         self.ssh_stdin(host, "cat > /workspace/smash/.runpod_env && chmod 600 /workspace/smash/.runpod_env", env_text)
@@ -361,6 +363,8 @@ def parser() -> argparse.ArgumentParser:
     arg_parser.add_argument("--seed-concurrency", type=int, default=16)
     arg_parser.add_argument("--seed-batch-size", type=int, default=100)
     arg_parser.add_argument("--seed-work-dir", default="/workspace/slp-seed")
+    arg_parser.add_argument("--seed-download-timeout-seconds", type=int, default=60)
+    arg_parser.add_argument("--seed-download-retries", type=int, default=3)
     arg_parser.add_argument("--worker-name-prefix", default="smash-core-worker")
     arg_parser.add_argument("--keep-host", action=argparse.BooleanOptionalAction, default=False)
     return arg_parser
