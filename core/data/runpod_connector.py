@@ -67,6 +67,8 @@ class RunpodConnector:
         self.end_frame = self._optional_int("SMASH_END_FRAME")
         self.max_frame_uploads = self._optional_int("SMASH_MAX_FRAME_UPLOADS")
         self.frame_upload_batch_size = max(1, int(os.environ.get("SMASH_FRAME_UPLOAD_BATCH_SIZE", "1")))
+        self.frame_upload_retries = max(1, int(os.environ.get("SMASH_FRAME_UPLOAD_RETRIES", "5")))
+        self.frame_upload_retry_seconds = float(os.environ.get("SMASH_FRAME_UPLOAD_RETRY_SECONDS", "10"))
 
     def create_instance(self) -> RunpodInstance:
         """Create one CPU pod running the frame-recording image."""

@@ -5,7 +5,7 @@ import time
 from queue import Queue
 
 from .hf_connector import HfConnector
-from .models import FrameRecorder, HfLocation, SlpDownloader, SlpSample
+from .models import FrameRecorder, HfLocation, SlpDownloader, SlpSample, log_event
 from .runpod_connector import RunpodConnector
 
 
@@ -62,12 +62,15 @@ class DatasetRunner:
         }
 
     def _record(self, index: int):
+        recorder = None
         try:
             recorder = FrameRecorder(self.queue, self.hf_location, self.runpod)
             with self.lock:
                 self.recorders.append(recorder)
             recorder.record()
         except Exception as error:
+            event = "recorder_startup_failed" if recorder is None else "recorder_failed"
+            log_event(event, index=index, error=str(error))
             with self.lock:
                 self.startup_errors.append(
                     {"component": "FrameRecorder", "index": index, "error": str(error)}

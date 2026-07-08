@@ -81,7 +81,7 @@ class SlpDownloader:
             self.error = str(error)
             log_event("producer_failed", error=str(error))
             return
-        for sample_id, hf_reference in enumerate(raw_files[: self.desired_max]):
+        for sample_id, hf_reference in enumerate(sorted(raw_files)[: self.desired_max]):
             sample = SlpSample(id=sample_id, hf_reference=hf_reference)
             self.queue.put(sample, block=True)
             self.count += 1
@@ -103,6 +103,7 @@ class FrameRecorder:
         self.results: list[dict] = []
         self.errors: list[dict] = []
         self.pending_uploads: list[SlpSample] = []
+        self.pending_results: list[dict] = []
         self.closed = False
         worker = self.runpod.create_instance()
         try:
@@ -125,8 +126,9 @@ class FrameRecorder:
                         log_event("recorder_done", podId=self.worker.id)
                         return
                     log_event("picked", sample=sample.id, podId=self.worker.id)
-                    self.results.append(self._record_one(sample))
+                    result = self._record_one(sample)
                     self.pending_uploads.append(sample)
+                    self.pending_results.append(result)
                     log_event("rendered", sample=sample.id, podId=self.worker.id)
                     if len(self.pending_uploads) >= self.runpod.frame_upload_batch_size:
                         self._upload_pending()
@@ -169,9 +171,38 @@ class FrameRecorder:
     def _upload_pending(self):
         if not self.pending_uploads:
             return
-        samples = self.pending_uploads
+        samples = list(self.pending_uploads)
+        results = list(self.pending_results)
+        for attempt in range(1, self.runpod.frame_upload_retries + 1):
+            try:
+                upload = self.runpod.upload_recorded_frames(self.worker, self.hf_location, samples)
+                break
+            except Exception as error:
+                log_event(
+                    "upload_retry",
+                    podId=self.worker.id,
+                    count=len(samples),
+                    attempt=attempt,
+                    error=str(error),
+                )
+                if attempt == self.runpod.frame_upload_retries:
+                    for failed_sample in samples:
+                        self.errors.append(
+                            {
+                                "sample": failed_sample.id,
+                                "hfReference": failed_sample.hf_reference,
+                                "podId": self.worker.id,
+                                "error": str(error),
+                                "phase": "upload",
+                            }
+                        )
+                    self.pending_uploads = []
+                    self.pending_results = []
+                    raise
+                time.sleep(self.runpod.frame_upload_retry_seconds * attempt)
         self.pending_uploads = []
-        upload = self.runpod.upload_recorded_frames(self.worker, self.hf_location, samples)
+        self.pending_results = []
+        self.results.extend(results)
         log_event("uploaded_batch", podId=self.worker.id, count=len(samples), files=upload.get("files"))
         for sample in samples:
             log_event("completed", sample=sample.id, podId=self.worker.id)

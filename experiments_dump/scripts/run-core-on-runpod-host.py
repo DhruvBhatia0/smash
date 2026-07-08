@@ -49,7 +49,14 @@ class RunpodHostRunner:
             return self.run_remote_pipeline()
         finally:
             if not self.args.keep_host:
-                self.delete_pod(self.host.id if self.host else pod_id)
+                try:
+                    self.delete_pod(self.host.id if self.host else pod_id)
+                except RuntimeError as error:
+                    print(json.dumps({"event": "host_cleanup_failed", "error": str(error)}), flush=True)
+                try:
+                    self.delete_worker_pods()
+                except RuntimeError as error:
+                    print(json.dumps({"event": "worker_cleanup_failed", "error": str(error)}), flush=True)
 
     def create_host(self) -> str:
         name = f"smash-runner-host-{time.time_ns()}"
@@ -204,6 +211,8 @@ class RunpodHostRunner:
             "SMASH_RENDER_TIMEOUT_SECONDS": str(self.args.render_timeout_seconds),
             "SMASH_MAX_FRAME_UPLOADS": str(self.args.max_frame_uploads),
             "SMASH_FRAME_UPLOAD_BATCH_SIZE": str(self.args.frame_upload_batch_size),
+            "SMASH_FRAME_UPLOAD_RETRIES": str(self.args.frame_upload_retries),
+            "SMASH_FRAME_UPLOAD_RETRY_SECONDS": str(self.args.frame_upload_retry_seconds),
             "SMASH_RUNPOD_WAIT_SECONDS": str(self.args.wait_seconds),
             "SMASH_RUNPOD_NAME_PREFIX": self.args.worker_name_prefix,
             "SMASH_RUNPOD_VCPU_COUNT": str(self.args.worker_vcpus),
@@ -263,6 +272,27 @@ class RunpodHostRunner:
         except RuntimeError as error:
             if "HTTP 404" not in str(error):
                 raise
+
+    def delete_worker_pods(self):
+        pods = self.request("GET", "/pods")
+        if not isinstance(pods, list):
+            pods = pods.get("pods") or pods.get("data") or []
+        deleted = []
+        for pod in pods:
+            if str(pod.get("name", "")).startswith(self.args.worker_name_prefix):
+                pod_id = str(pod.get("id") or pod.get("podId"))
+                self.request("DELETE", f"/pods/{pod_id}")
+                deleted.append(pod_id)
+        print(
+            json.dumps(
+                {
+                    "event": "worker_pods_deleted",
+                    "prefix": self.args.worker_name_prefix,
+                    "count": len(deleted),
+                }
+            ),
+            flush=True,
+        )
 
     def ssh(self, host: HostPod, command: str):
         completed = subprocess.run(self.ssh_base(host) + [command], text=True, capture_output=True)
@@ -358,6 +388,8 @@ def parser() -> argparse.ArgumentParser:
     arg_parser.add_argument("--render-timeout-seconds", type=int, default=25)
     arg_parser.add_argument("--max-frame-uploads", type=int, default=60)
     arg_parser.add_argument("--frame-upload-batch-size", type=int, default=1)
+    arg_parser.add_argument("--frame-upload-retries", type=int, default=5)
+    arg_parser.add_argument("--frame-upload-retry-seconds", type=float, default=10)
     arg_parser.add_argument("--create-retries", type=int, default=4)
     arg_parser.add_argument("--seed-source-hf-repo", default="")
     arg_parser.add_argument("--seed-source-hf-prefix", default="")
