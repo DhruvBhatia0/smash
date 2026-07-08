@@ -101,19 +101,16 @@ class HfSourceSlpSeeder:
 
     def _seed_batch(self, batch: list[SourceSlp], batch_index: int):
         batch_dir = Path(tempfile.mkdtemp(prefix=f"slp-seed-{batch_index:06d}-", dir=self._work_parent()))
-        upload_dir = batch_dir / "raw"
-        manifest_path = batch_dir / f"batch-{batch_index:06d}.jsonl"
-        upload_dir.mkdir(parents=True, exist_ok=True)
+        upload_dir = batch_dir / "upload"
+        raw_dir = upload_dir / self.target.raw_slp_dir
+        manifest_path = upload_dir / "raw_slp_manifest" / f"batch-{batch_index:06d}.jsonl"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(self.concurrency, len(batch))) as pool:
-                rows = list(pool.map(lambda job: self._download_one(job, upload_dir), batch))
+                rows = list(pool.map(lambda job: self._download_one(job, raw_dir), batch))
             manifest_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
-            self.target.hf.upload_folder(self.target.repo, str(upload_dir), self.target.raw_slp_path())
-            self.target.hf.upload_file(
-                self.target.repo,
-                str(manifest_path),
-                self.target._join(self.target.root, "raw_slp_manifest", manifest_path.name),
-            )
+            self.target.hf.upload_folder(self.target.repo, str(upload_dir), self.target.root)
         finally:
             shutil.rmtree(batch_dir, ignore_errors=True)
 
