@@ -34,10 +34,19 @@ class HfConnector:
     def list_files(self, repo: str, folder: str = "") -> list[str]:
         """List files under one logical HF folder."""
         prefix = folder.strip("/")
-        files = sorted(self.api.list_repo_files(repo, repo_type="dataset", token=self.token))
         if not prefix:
-            return files
-        return [path for path in files if path == prefix or path.startswith(f"{prefix}/")]
+            return sorted(self.api.list_repo_files(repo, repo_type="dataset", token=self.token))
+        return sorted(
+            item.path
+            for item in self.api.list_repo_tree(
+                repo,
+                repo_type="dataset",
+                token=self.token,
+                path_in_repo=prefix,
+                recursive=True,
+            )
+            if getattr(item, "path", "").startswith(f"{prefix}/")
+        )
 
     def upload_file(self, repo: str, local_path: str, hf_path: str) -> str:
         """Upload one local file to one HF path."""

@@ -43,6 +43,8 @@ class RunpodHostRunner:
             self.host = self.wait_for_ssh(pod_id)
             self.bootstrap_host()
             self.sync_repo()
+            self.write_remote_env()
+            self.seed_remote_raw_slps()
             self.sync_iso()
             return self.run_remote_pipeline()
         finally:
@@ -159,6 +161,35 @@ class RunpodHostRunner:
 
     def run_remote_pipeline(self) -> int:
         host = self.require_host()
+        self.write_remote_env()
+        command = (
+            "cd /workspace/smash && "
+            "set -a && . /workspace/smash/.runpod_env && set +a && "
+            "export RUNPOD_PUBLIC_KEY=\"$(cat /root/.ssh/smash_worker_key.pub)\" && "
+            "python3 -m core.data.runner"
+        )
+        print(json.dumps({"event": "remote_runner_started", "podId": host.id}), flush=True)
+        completed = subprocess.run(self.ssh_base(host) + [command], text=True)
+        print(json.dumps({"event": "remote_runner_finished", "returncode": completed.returncode}), flush=True)
+        return completed.returncode
+
+    def seed_remote_raw_slps(self):
+        if not self.args.seed_source_hf_repo:
+            return
+        host = self.require_host()
+        command = (
+            "cd /workspace/smash && "
+            "set -a && . /workspace/smash/.runpod_env && set +a && "
+            "python3 -m core.data.hf_source_seeder"
+        )
+        print(json.dumps({"event": "remote_seed_started", "podId": host.id}), flush=True)
+        completed = subprocess.run(self.ssh_base(host) + [command], text=True)
+        print(json.dumps({"event": "remote_seed_finished", "returncode": completed.returncode}), flush=True)
+        if completed.returncode:
+            raise RuntimeError(f"remote seed failed with exit code {completed.returncode}")
+
+    def write_remote_env(self):
+        host = self.require_host()
         env = {
             "HF_TOKEN": self.hf_token,
             "RUNPOD_API_KEY": self.api_key,
@@ -179,19 +210,15 @@ class RunpodHostRunner:
             "SMASH_RUNPOD_CREATE_RETRIES": str(self.args.create_retries),
             "SMASH_MELEE_ISO": "/workspace/iso/melee.iso",
             "RUNPOD_SSH_PRIVATE_KEY": "/root/.ssh/smash_worker_key",
+            "SMASH_SOURCE_HF_REPO": self.args.seed_source_hf_repo,
+            "SMASH_SOURCE_HF_PREFIX": self.args.seed_source_hf_prefix,
+            "SMASH_SOURCE_SAMPLE_LIMIT": str(self.args.seed_count or self.args.sample_limit),
+            "SMASH_SOURCE_SEED_CONCURRENCY": str(self.args.seed_concurrency),
+            "SMASH_SOURCE_SEED_BATCH_SIZE": str(self.args.seed_batch_size),
+            "SMASH_SOURCE_SEED_WORK_DIR": self.args.seed_work_dir,
         }
         env_text = "\n".join(f"export {key}={shlex.quote(value)}" for key, value in env.items())
         self.ssh_stdin(host, "cat > /workspace/smash/.runpod_env && chmod 600 /workspace/smash/.runpod_env", env_text)
-        command = (
-            "cd /workspace/smash && "
-            "set -a && . /workspace/smash/.runpod_env && set +a && "
-            "export RUNPOD_PUBLIC_KEY=\"$(cat /root/.ssh/smash_worker_key.pub)\" && "
-            "python3 -m core.data.runner"
-        )
-        print(json.dumps({"event": "remote_runner_started", "podId": host.id}), flush=True)
-        completed = subprocess.run(self.ssh_base(host) + [command], text=True)
-        print(json.dumps({"event": "remote_runner_finished", "returncode": completed.returncode}), flush=True)
-        return completed.returncode
 
     def request(self, method: str, path: str, payload: dict | None = None):
         body = json.dumps(payload).encode() if payload is not None else None
@@ -328,6 +355,12 @@ def parser() -> argparse.ArgumentParser:
     arg_parser.add_argument("--render-timeout-seconds", type=int, default=25)
     arg_parser.add_argument("--max-frame-uploads", type=int, default=60)
     arg_parser.add_argument("--create-retries", type=int, default=4)
+    arg_parser.add_argument("--seed-source-hf-repo", default="")
+    arg_parser.add_argument("--seed-source-hf-prefix", default="")
+    arg_parser.add_argument("--seed-count", type=int, default=0)
+    arg_parser.add_argument("--seed-concurrency", type=int, default=16)
+    arg_parser.add_argument("--seed-batch-size", type=int, default=100)
+    arg_parser.add_argument("--seed-work-dir", default="/workspace/slp-seed")
     arg_parser.add_argument("--worker-name-prefix", default="smash-core-worker")
     arg_parser.add_argument("--keep-host", action=argparse.BooleanOptionalAction, default=False)
     return arg_parser
