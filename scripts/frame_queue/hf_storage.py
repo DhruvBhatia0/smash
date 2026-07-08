@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import fnmatch
+import json
 import os
 import shutil
 import threading
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
@@ -138,6 +141,7 @@ class HfStorageConfig:
     repo_type: str = "dataset"
     revision: str | None = None
     token: str | None = None
+    expected_email: str | None = None
     private: bool = True
     allow_create: bool = True
     dry_run: bool = False
@@ -151,6 +155,8 @@ class HfDatasetStore:
         self._api: Any | None = None
         self._ensure_lock = threading.Lock()
         self._ensure_result: dict[str, Any] | None = None
+        self._identity_lock = threading.Lock()
+        self._identity_result: dict[str, Any] | None = None
 
     @property
     def dry_run(self) -> bool:
@@ -168,6 +174,58 @@ class HfDatasetStore:
             self._api = HfApi(token=self.config.token)
         return self._api
 
+    def token_identity(self) -> dict[str, Any]:
+        if self.dry_run:
+            return {
+                "status": "planned",
+                "expectedEmail": self.config.expected_email,
+            }
+        with self._identity_lock:
+            if self._identity_result is not None:
+                return self._identity_result
+            token = self.config.token
+            if not token:
+                raise HfStorageError(
+                    "HF identity verification requires an explicit token. "
+                    "Set HF_TOKEN or pass --token."
+                )
+            request = urllib.request.Request(
+                "https://huggingface.co/api/whoami-v2",
+                headers={"authorization": f"Bearer {token}"},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as error:
+                raise HfStorageError(f"HF token verification failed: HTTP {error.code}") from error
+            auth = payload.get("auth") or {}
+            access_token = auth.get("accessToken") or {}
+            self._identity_result = {
+                "status": "verified",
+                "name": payload.get("name"),
+                "fullname": payload.get("fullname"),
+                "email": payload.get("email"),
+                "type": payload.get("type"),
+                "tokenDisplayName": access_token.get("displayName"),
+                "tokenRole": access_token.get("role"),
+            }
+            return self._identity_result
+
+    def verify_expected_identity(self) -> dict[str, Any]:
+        expected = (self.config.expected_email or "").strip().lower()
+        if not expected:
+            return {"status": "skipped", "reason": "no expected HF email configured"}
+        identity = self.token_identity()
+        if self.dry_run:
+            return identity
+        actual = str(identity.get("email") or "").strip().lower()
+        if actual != expected:
+            raise HfStorageError(
+                f"HF token email mismatch: expected {self.config.expected_email}, got "
+                f"{identity.get('email') or 'unknown'} for user {identity.get('name') or 'unknown'}."
+            )
+        return identity
+
     def ensure_repo(self) -> dict[str, Any]:
         if self.dry_run:
             return {
@@ -180,11 +238,13 @@ class HfDatasetStore:
         with self._ensure_lock:
             if self._ensure_result is not None:
                 return self._ensure_result
+            identity = self.verify_expected_identity()
             if not self.config.allow_create:
                 self._ensure_result = {
                     "status": "skipped",
                     "reason": "repo creation disabled",
                     "repoId": self.config.repo_id,
+                    "identity": identity,
                 }
                 return self._ensure_result
             result = self.api.create_repo(
@@ -199,6 +259,7 @@ class HfDatasetStore:
                 "repoId": self.config.repo_id,
                 "repoType": self.config.repo_type,
                 "url": str(result),
+                "identity": identity,
             }
             return self._ensure_result
 
@@ -310,6 +371,7 @@ class HfDatasetStore:
         if self.dry_run:
             return payload
 
+        self.verify_expected_identity()
         try:
             from huggingface_hub import hf_hub_download
         except ModuleNotFoundError as error:
@@ -352,6 +414,7 @@ class HfDatasetStore:
         if self.dry_run:
             return payload
 
+        self.verify_expected_identity()
         try:
             from huggingface_hub import snapshot_download
         except ModuleNotFoundError as error:
@@ -397,10 +460,13 @@ class ProcessedFramePublisher:
                 "--hf-processed-repo is required when --upload-processed-to-hf is set"
             )
         token = getattr(args, "hf_token", "") or os.environ.get("HF_TOKEN")
+        if not token:
+            token = os.environ.get("HUGGING_FACE_HUB_TOKEN")
         store = HfDatasetStore(
             HfStorageConfig(
                 repo_id=repo_id,
                 token=token,
+                expected_email=getattr(args, "hf_expected_email", ""),
                 private=getattr(args, "hf_private", True),
                 allow_create=getattr(args, "hf_create_repo", True),
                 dry_run=getattr(args, "hf_dry_run", False),

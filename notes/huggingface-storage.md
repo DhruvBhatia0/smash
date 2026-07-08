@@ -11,7 +11,15 @@ Install the Python dependency first:
 python3 -m pip install -r requirements.txt
 ```
 
-Use `HF_TOKEN` for auth. For throughput on large processed-frame uploads, set `HF_XET_HIGH_PERFORMANCE=1`.
+Use `HF_TOKEN` for auth. Set `SMASH_HF_EXPECTED_EMAIL` so real writes fail closed
+if the token points at the wrong account. For throughput on large processed-frame
+uploads, set `HF_XET_HIGH_PERFORMANCE=1`.
+
+Verify the active token:
+
+```bash
+pnpm hf:sync -- --expected-email dhruv.bhatia.j@gmail.com whoami
+```
 
 Dry-run a raw upload:
 
@@ -41,5 +49,7 @@ pnpm queue:frames -- replays/downloaded \
   --runtime runpod \
   --upload-processed-to-hf \
   --hf-processed-repo USER/DATASET \
+  --hf-expected-email dhruv.bhatia.j@gmail.com \
+  --resume-existing-run \
   --delete-local-after-hf-upload
 ```

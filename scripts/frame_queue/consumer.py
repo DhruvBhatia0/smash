@@ -188,6 +188,10 @@ class FrameProcessingConsumer(threading.Thread):
             self.runtime.close()
 
     def process_one(self, job: FrameRenderJob) -> None:
+        self.result_store.write_event(
+            "job_started",
+            {"jobId": job.job_id, "consumerId": self.consumer_id},
+        )
         try:
             result = self.processor.process(job)
             result["consumerId"] = self.consumer_id
@@ -223,3 +227,11 @@ class FrameProcessingConsumer(threading.Thread):
                 },
             }
         self.result_store.write_result(job=job, result=result)
+        self.result_store.write_event(
+            "job_finished",
+            {
+                "jobId": job.job_id,
+                "consumerId": self.consumer_id,
+                "status": result.get("status", "unknown"),
+            },
+        )

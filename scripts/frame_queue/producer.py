@@ -20,6 +20,7 @@ class SlpCorpusProducer(threading.Thread):
         end_frame: int | None,
         recursive: bool = True,
         max_jobs: int | None = None,
+        skip_job_ids: set[str] | None = None,
     ):
         super().__init__(name="slp-producer", daemon=False)
         self.input_paths = input_paths
@@ -31,7 +32,9 @@ class SlpCorpusProducer(threading.Thread):
         self.end_frame = end_frame
         self.recursive = recursive
         self.max_jobs = max_jobs
+        self.skip_job_ids = skip_job_ids or set()
         self.enqueued_count = 0
+        self.skipped_existing_count = 0
         self.error: BaseException | None = None
 
     def discover_slp_files(self) -> list[Path]:
@@ -62,6 +65,9 @@ class SlpCorpusProducer(threading.Thread):
                         start_frame=self.start_frame,
                         end_frame=self.end_frame,
                     )
+                    if job.job_id in self.skip_job_ids:
+                        self.skipped_existing_count += 1
+                        continue
                     self.output_queue.put(job, block=True)
                     self.enqueued_count += 1
             except BaseException as error:

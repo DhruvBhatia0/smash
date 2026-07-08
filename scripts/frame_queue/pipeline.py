@@ -20,6 +20,7 @@ class FrameQueueRunResult:
     enqueued_count: int
     counts: dict[str, int]
     elapsed_seconds: float
+    skipped_existing_count: int = 0
     processed_output_upload: dict[str, Any] | None = None
 
     def to_json(self) -> dict[str, Any]:
@@ -27,6 +28,7 @@ class FrameQueueRunResult:
             "runId": self.run_id,
             "runDir": str(self.run_dir),
             "enqueuedCount": self.enqueued_count,
+            "skippedExistingCount": self.skipped_existing_count,
             "counts": self.counts,
             "elapsedSeconds": round(self.elapsed_seconds, 3),
         }
@@ -57,6 +59,16 @@ class FrameQueuePipeline:
 
     def run(self) -> FrameQueueRunResult:
         started = time.monotonic()
+        resume_existing = bool(getattr(self.args, "resume_existing_run", False))
+        resume_skip_status = set(getattr(self.args, "resume_skip_status", None) or ["processed"])
+        existing_results = self.result_store.load_existing_results() if resume_existing else {}
+        skip_job_ids = {
+            job_id
+            for job_id, payload in existing_results.items()
+            if str(payload.get("status", "")) in resume_skip_status
+        }
+        if resume_existing:
+            self.result_store.seed_counts(list(existing_results.values()))
         self.result_store.initialize(
             {
                 "runId": self.run_id,
@@ -66,8 +78,21 @@ class FrameQueuePipeline:
                 "queueSize": self.args.queue_size,
                 "consumerCount": self.args.consumers,
                 "inputPaths": [str(path) for path in self.input_paths],
+                "resumeExistingRun": resume_existing,
+                "resumeSkipStatus": sorted(resume_skip_status),
+                "preexistingResultCount": len(existing_results),
+                "preexistingSkippedJobCount": len(skip_job_ids),
                 "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            }
+            },
+            reset_index=not resume_existing,
+        )
+        self.result_store.write_event(
+            "run_started",
+            {
+                "runId": self.run_id,
+                "runtime": self.args.runtime,
+                "consumerCount": self.args.consumers,
+            },
         )
 
         producer = SlpCorpusProducer(
@@ -80,6 +105,7 @@ class FrameQueuePipeline:
             end_frame=self.args.end_frame,
             recursive=self.args.recursive,
             max_jobs=self.args.max_jobs,
+            skip_job_ids=skip_job_ids,
         )
         consumers = [
             FrameProcessingConsumer(
@@ -107,12 +133,21 @@ class FrameQueuePipeline:
                 {
                     "finishedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     "enqueuedCount": producer.enqueued_count,
+                    "skippedExistingCount": producer.skipped_existing_count,
                     "elapsedSeconds": round(time.monotonic() - started, 3),
                     "producerError": {
                         "type": type(producer.error).__name__,
                         "message": str(producer.error),
                     },
                 }
+            )
+            self.result_store.write_event(
+                "run_failed",
+                {
+                    "runId": self.run_id,
+                    "enqueuedCount": producer.enqueued_count,
+                    "skippedExistingCount": producer.skipped_existing_count,
+                },
             )
             raise producer.error
 
@@ -121,8 +156,18 @@ class FrameQueuePipeline:
             {
                 "finishedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "enqueuedCount": producer.enqueued_count,
+                "skippedExistingCount": producer.skipped_existing_count,
                 "elapsedSeconds": round(elapsed, 3),
             }
+        )
+        self.result_store.write_event(
+            "run_finished",
+            {
+                "runId": self.run_id,
+                "enqueuedCount": producer.enqueued_count,
+                "skippedExistingCount": producer.skipped_existing_count,
+                "elapsedSeconds": round(elapsed, 3),
+            },
         )
         run_upload = None
         if self.publisher is not None:
@@ -136,5 +181,6 @@ class FrameQueuePipeline:
             enqueued_count=producer.enqueued_count,
             counts=dict(self.result_store.counts),
             elapsed_seconds=elapsed,
+            skipped_existing_count=producer.skipped_existing_count,
             processed_output_upload=run_upload,
         )

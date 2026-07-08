@@ -54,6 +54,18 @@ def parser() -> argparse.ArgumentParser:
     arg_parser.add_argument("--start-frame", type=int_or_none, default=-123)
     arg_parser.add_argument("--end-frame", type=int_or_none, default=900)
     arg_parser.add_argument("--recursive", action=argparse.BooleanOptionalAction, default=True)
+    arg_parser.add_argument(
+        "--resume-existing-run",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="When reusing a run id, skip jobs that already have successful result files.",
+    )
+    arg_parser.add_argument(
+        "--resume-skip-status",
+        action="append",
+        default=None,
+        help="Status to skip in --resume-existing-run mode. Repeatable. Defaults to processed.",
+    )
     arg_parser.add_argument("--plan-only", action=argparse.BooleanOptionalAction, default=False)
     arg_parser.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=False)
     arg_parser.add_argument("--extract-state", action=argparse.BooleanOptionalAction, default=True)
@@ -140,7 +152,15 @@ def parser() -> argparse.ArgumentParser:
         "--hf-processed-prefix",
         default=os.environ.get("SMASH_HF_PROCESSED_PREFIX", "processed/frame-queues"),
     )
-    arg_parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN", ""))
+    arg_parser.add_argument(
+        "--hf-token",
+        default=os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN", ""),
+    )
+    arg_parser.add_argument(
+        "--hf-expected-email",
+        default=os.environ.get("SMASH_HF_EXPECTED_EMAIL", ""),
+        help="Fail real HF operations unless the token belongs to this email.",
+    )
     arg_parser.add_argument("--hf-private", action=argparse.BooleanOptionalAction, default=True)
     arg_parser.add_argument("--hf-create-repo", action=argparse.BooleanOptionalAction, default=True)
     arg_parser.add_argument("--hf-dry-run", action=argparse.BooleanOptionalAction, default=False)

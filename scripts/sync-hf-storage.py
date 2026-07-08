@@ -329,7 +329,15 @@ class HfStorageCli:
             description="Mirror raw SLPs and processed frame outputs to Hugging Face datasets.",
         )
         parser.add_argument("--repo", default=os.environ.get("SMASH_HF_REPO", ""))
-        parser.add_argument("--token", default=os.environ.get("HF_TOKEN", ""))
+        parser.add_argument(
+            "--token",
+            default=os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN", ""),
+        )
+        parser.add_argument(
+            "--expected-email",
+            default=os.environ.get("SMASH_HF_EXPECTED_EMAIL", ""),
+            help="Fail real HF operations unless the token belongs to this email.",
+        )
         parser.add_argument("--public", action="store_true", help="Create repo as public.")
         parser.add_argument(
             "--no-create",
@@ -339,6 +347,8 @@ class HfStorageCli:
         parser.add_argument("--dry-run", action="store_true")
 
         subparsers = parser.add_subparsers(dest="command", required=True)
+
+        subparsers.add_parser("whoami")
 
         upload_slp = subparsers.add_parser("upload-slp")
         upload_slp.add_argument("inputs", nargs="+")
@@ -377,20 +387,23 @@ class HfStorageCli:
 
     def run(self) -> int:
         args = self.parser().parse_args(self.argv)
-        if not args.repo:
+        if not args.repo and args.command != "whoami":
             raise SystemExit("--repo or SMASH_HF_REPO is required")
 
         store = HfDatasetStore(
             HfStorageConfig(
-                repo_id=args.repo,
+                repo_id=args.repo or "identity-check",
                 token=args.token or None,
+                expected_email=args.expected_email or None,
                 private=not args.public,
                 allow_create=not args.no_create,
                 dry_run=args.dry_run,
             )
         )
 
-        if args.command == "upload-slp":
+        if args.command == "whoami":
+            result = store.verify_expected_identity() if args.expected_email else store.token_identity()
+        elif args.command == "upload-slp":
             uploader = HfRawSlpUploader(
                 store=store,
                 path_prefix=args.path_prefix,

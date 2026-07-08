@@ -13,6 +13,8 @@
     "hf:sync": "python3 scripts/sync-hf-storage.py",
     "queue:frames": "python3 scripts/process-frame-queue.py",
     "cleanup:runpod": "python3 scripts/clean-up-runpod-cpu-pods.py",
+    "test:python": "python3 -m unittest discover -s tests",
+    "verify:hf": "python3 scripts/sync-hf-storage.py whoami",
     "docker:build-renderer": "docker/scripts/build-renderer-image.sh",
     "docker:validate-renderer": "docker/scripts/validate-renderer-image.sh",
     "prepare:playback-build": "scripts/prepare-playback-build.sh",
