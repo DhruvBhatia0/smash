@@ -36,17 +36,22 @@ class HfConnector:
         prefix = folder.strip("/")
         if not prefix:
             return sorted(self.api.list_repo_files(repo, repo_type="dataset", token=self.token))
-        return sorted(
-            item.path
-            for item in self.api.list_repo_tree(
-                repo,
-                repo_type="dataset",
-                token=self.token,
-                path_in_repo=prefix,
-                recursive=True,
+        try:
+            return sorted(
+                item.path
+                for item in self.api.list_repo_tree(
+                    repo,
+                    repo_type="dataset",
+                    token=self.token,
+                    path_in_repo=prefix,
+                    recursive=True,
+                )
+                if getattr(item, "path", "").startswith(f"{prefix}/")
             )
-            if getattr(item, "path", "").startswith(f"{prefix}/")
-        )
+        except Exception as error:
+            if "Entry Not Found" in str(error) or "does not exist" in str(error):
+                return []
+            raise
 
     def upload_file(self, repo: str, local_path: str, hf_path: str) -> str:
         """Upload one local file to one HF path."""
