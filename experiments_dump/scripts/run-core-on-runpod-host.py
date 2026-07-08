@@ -332,6 +332,12 @@ class RunpodHostRunner:
             "StrictHostKeyChecking=accept-new",
             "-o",
             "BatchMode=yes",
+            "-o",
+            "ServerAliveInterval=30",
+            "-o",
+            "ServerAliveCountMax=10",
+            "-o",
+            "TCPKeepAlive=yes",
         ]
         if private_key.exists():
             command += ["-i", str(private_key)]
