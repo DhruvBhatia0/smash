@@ -6,6 +6,7 @@ import os
 import shutil
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -141,11 +142,25 @@ class HfSourceSlpSeeder:
                             if not chunk:
                                 return
                             handle.write(chunk)
-            except Exception:
+            except Exception as error:
                 local_path.unlink(missing_ok=True)
                 if attempt == self.download_retries:
                     raise
-                time.sleep(min(30, 2**attempt))
+                delay = self._download_retry_delay(attempt, error)
+                if isinstance(error, urllib.error.HTTPError) and error.code == 429:
+                    log_event("seed_download_rate_limited", attempt=attempt, waitSeconds=delay)
+                time.sleep(delay)
+
+    def _download_retry_delay(self, attempt: int, error: Exception) -> float:
+        if isinstance(error, urllib.error.HTTPError) and error.code == 429:
+            retry_after = error.headers.get("retry-after")
+            if retry_after:
+                try:
+                    return min(600, float(retry_after))
+                except ValueError:
+                    pass
+            return min(600, 60 * attempt)
+        return min(30, 2**attempt)
 
     def _source_slps(self):
         index = 0
