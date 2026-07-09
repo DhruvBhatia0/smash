@@ -17,7 +17,6 @@ class DatasetRunner:
         desired_max: int,
         recorder_count: int,
         skip_existing_processed: bool = False,
-        min_processed_files: int = 1,
     ):
         """Create the bounded queue and the producer/consumer objects."""
         self.queue: Queue[SlpSample | None] = Queue(maxsize=1000)
@@ -26,7 +25,6 @@ class DatasetRunner:
             hf_location,
             desired_max,
             skip_existing_processed=skip_existing_processed,
-            min_processed_files=min_processed_files,
         )
         self.hf_location = hf_location
         self.runpod = runpod
@@ -92,6 +90,7 @@ def build_runner() -> DatasetRunner:
         repo=os.environ["SMASH_HF_REPO"],
         hf=hf,
         root=os.environ.get("SMASH_HF_ROOT", ""),
+        recording_dir=os.environ.get("SMASH_HF_RECORDING_DIR", "slp_with_video"),
     )
     return DatasetRunner(
         hf_location=hf_location,
@@ -101,7 +100,6 @@ def build_runner() -> DatasetRunner:
         desired_max=int(os.environ.get("SMASH_SAMPLE_LIMIT", "1")),
         recorder_count=int(os.environ.get("SMASH_WORKER_COUNT", "1")),
         skip_existing_processed=os.environ.get("SMASH_SKIP_EXISTING_PROCESSED", "") == "1",
-        min_processed_files=int(os.environ.get("SMASH_MIN_PROCESSED_FILES", "1")),
     )
 
 

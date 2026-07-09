@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 
 _LOG_LOCK = threading.Lock()
+_VIDEO_SUFFIXES = (".avi", ".mkv", ".mp4", ".mov", ".nut")
 
 
 def log_event(event: str, **fields):
@@ -23,7 +24,7 @@ def log_event(event: str, **fields):
 
 @dataclass(frozen=True)
 class SlpSample:
-    """One replay selected for frame recording."""
+    """One replay selected for video rendering."""
 
     id: int
     hf_reference: str
@@ -37,15 +38,15 @@ class HfLocation:
     hf: HfConnector
     root: str = ""
     raw_slp_dir: str = "raw_slp"
-    framed_slp_dir: str = "slp_with_frame"
+    recording_dir: str = "slp_with_video"
 
     def raw_slp_path(self) -> str:
         """Return the folder where original SLP files live."""
         return self._join(self.root, self.raw_slp_dir)
 
-    def framed_slp_path(self, sample: SlpSample) -> str:
+    def recording_path(self, sample: SlpSample) -> str:
         """Return the output folder for one processed sample."""
-        return self._join(self.root, self.framed_slp_dir, str(sample.id))
+        return self._join(self.root, self.recording_dir, str(sample.id))
 
     def _join(self, *parts: str) -> str:
         return "/".join(part.strip("/") for part in parts if part.strip("/"))
@@ -58,14 +59,12 @@ class SlpProducer:
         hf_location: HfLocation,
         desired_max: int,
         skip_existing_processed: bool = False,
-        min_processed_files: int = 1,
     ):
         """Verify HF access and remember where raw SLP files live."""
         self.queue = queue
         self.hf_location = hf_location
         self.desired_max = desired_max
         self.skip_existing_processed = skip_existing_processed
-        self.min_processed_files = min_processed_files
         self.hf_location.hf.create_repo(self.hf_location.repo)
         self.count = 0
         self.error: str | None = None
@@ -98,14 +97,19 @@ class SlpProducer:
         log_event("producer_done", count=self.count)
 
     def _processed_ids(self) -> set[int]:
-        prefix = self.hf_location._join(self.hf_location.root, self.hf_location.framed_slp_dir)
-        counts: dict[int, int] = {}
+        prefix = self.hf_location._join(self.hf_location.root, self.hf_location.recording_dir)
+        seen: dict[int, set[str]] = {}
         for path in self.hf_location.hf.list_files(self.hf_location.repo, prefix):
             suffix = path.removeprefix(prefix).strip("/")
-            sample_id = suffix.split("/", 1)[0]
+            sample_id, _, filename = suffix.partition("/")
             if sample_id.isdigit():
-                counts[int(sample_id)] = counts.get(int(sample_id), 0) + 1
-        return {sample_id for sample_id, count in counts.items() if count >= self.min_processed_files}
+                flags = seen.setdefault(int(sample_id), set())
+                lower = filename.lower()
+                if lower.endswith(".slp"):
+                    flags.add("slp")
+                if lower.endswith(_VIDEO_SUFFIXES):
+                    flags.add("video")
+        return {sample_id for sample_id, flags in seen.items() if {"slp", "video"} <= flags}
 
 
 class FrameRecorder:
@@ -115,7 +119,7 @@ class FrameRecorder:
         hf_location: HfLocation,
         runpod: RunpodConnector,
     ):
-        """Create or attach to a CPU worker capable of running the frame-recording image."""
+        """Create a GPU worker capable of rendering replay video."""
         self.queue = queue
         self.hf_location = hf_location
         self.runpod = runpod
@@ -135,7 +139,7 @@ class FrameRecorder:
             raise
 
     def record(self):
-        """Consume queued SLP samples, record frames, and write completed outputs back to HF."""
+        """Consume queued SLP samples, render videos, and write completed outputs back to HF."""
         try:
             while True:
                 sample = self.queue.get(block=True)
@@ -149,7 +153,7 @@ class FrameRecorder:
                     self.pending_uploads.append(sample)
                     self.pending_results.append(result)
                     log_event("rendered", sample=sample.id, podId=self.worker.id)
-                    if len(self.pending_uploads) >= self.runpod.frame_upload_batch_size:
+                    if len(self.pending_uploads) >= self.runpod.upload_batch_size:
                         self._upload_pending()
                 except Exception as error:
                     self.errors.append(
@@ -172,13 +176,13 @@ class FrameRecorder:
             self.close()
 
     def close(self):
-        """Delete the owned CPU worker exactly once."""
+        """Delete the owned GPU worker exactly once."""
         if not self.closed:
             self.runpod.delete_instance(self.worker)
             self.closed = True
 
     def _record_one(self, sample: SlpSample) -> dict:
-        render = self.runpod.record_frames(self.worker, sample, self.hf_location)
+        render = self.runpod.record_video(self.worker, sample, self.hf_location)
         return {
             "sample": sample.id,
             "source": sample.hf_reference,
@@ -192,9 +196,9 @@ class FrameRecorder:
             return
         samples = list(self.pending_uploads)
         results = list(self.pending_results)
-        for attempt in range(1, self.runpod.frame_upload_retries + 1):
+        for attempt in range(1, self.runpod.upload_retries + 1):
             try:
-                upload = self.runpod.upload_recorded_frames(self.worker, self.hf_location, samples)
+                upload = self.runpod.upload_recorded_videos(self.worker, self.hf_location, samples)
                 break
             except Exception as error:
                 log_event(
@@ -204,7 +208,7 @@ class FrameRecorder:
                     attempt=attempt,
                     error=str(error),
                 )
-                if attempt == self.runpod.frame_upload_retries:
+                if attempt == self.runpod.upload_retries:
                     for failed_sample in samples:
                         self.errors.append(
                             {
@@ -218,7 +222,7 @@ class FrameRecorder:
                     self.pending_uploads = []
                     self.pending_results = []
                     raise
-                time.sleep(self.runpod.frame_upload_retry_seconds * attempt)
+                time.sleep(self.runpod.upload_retry_seconds * attempt)
         self.pending_uploads = []
         self.pending_results = []
         self.results.extend(results)
