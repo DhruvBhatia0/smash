@@ -238,7 +238,7 @@ class RunpodConnector:
             instance,
             "apt-get update && "
             "apt-get install -y --no-install-recommends python3-pip && "
-            "python3 -m pip install 'huggingface_hub[hf_xet]>=1.0.0'",
+            "python3 -m pip install 'huggingface_hub>=1.0.0'",
         )
 
     def _remote_record_script(self, payload: dict) -> str:
@@ -250,6 +250,8 @@ import shutil
 import struct
 import subprocess
 from pathlib import Path
+
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 from huggingface_hub import hf_hub_download
 
@@ -428,8 +430,11 @@ print(json.dumps(summary))
         config_json = json.dumps(json.dumps(payload))
         return f"""
 import json
+import os
 import shutil
 from pathlib import Path
+
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 from huggingface_hub import HfApi
 
