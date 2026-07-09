@@ -252,11 +252,12 @@ import shutil
 import struct
 import subprocess
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
-
-from huggingface_hub import hf_hub_download
 
 VIDEO_GLOBS = ("framedump*.avi", "framedump*.mkv", "framedump*.mp4", "framedump*.mov", "framedump*.nut")
 
@@ -347,6 +348,22 @@ def retry_hf(action, label):
             print("[hf-rate-limit]", label, "attempt", attempt, "sleep", sleep_seconds, flush=True)
             time.sleep(sleep_seconds)
 
+
+def download_hf_file(repo, filename, token, target):
+    quoted_repo = urllib.parse.quote(repo, safe="/")
+    quoted_file = urllib.parse.quote(filename.strip("/"), safe="/")
+    url = f"https://huggingface.co/datasets/{{quoted_repo}}/resolve/main/{{quoted_file}}"
+    request = urllib.request.Request(url, headers={{"Authorization": "Bearer " + token}})
+    temp = target.with_suffix(target.suffix + ".tmp")
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response, temp.open("wb") as handle:
+            shutil.copyfileobj(response, handle)
+    except urllib.error.HTTPError as error:
+        detail = error.read(1000).decode("utf-8", "replace")
+        raise RuntimeError(f"HF download failed: HTTP {{error.code}} {{error.reason}} {{detail}}") from error
+    temp.replace(target)
+    return target
+
 config = json.loads({config_json})
 token = config["token"]
 work_dir = Path(config["workDir"])
@@ -362,13 +379,7 @@ render_dir.mkdir(parents=True, exist_ok=True)
 recording_dir.mkdir(parents=True, exist_ok=True)
 
 downloaded = retry_hf(
-    lambda: hf_hub_download(
-        repo_id=config["repo"],
-        repo_type="dataset",
-        filename=config["source"],
-        token=token,
-        local_dir=str(download_dir),
-    ),
+    lambda: download_hf_file(config["repo"], config["source"], token, download_dir / Path(config["source"]).name),
     "download",
 )
 shutil.copyfile(downloaded, slp_path)
@@ -554,7 +565,8 @@ print(json.dumps({{
             capture_output=True,
         )
         if completed.returncode:
-            raise RuntimeError(completed.stderr.strip() or completed.stdout.strip())
+            output = "\n".join(part for part in [completed.stdout.strip(), completed.stderr.strip()] if part)
+            raise RuntimeError(output)
         return completed
 
     def _ssh(self, instance: RunpodInstance, command: str, check: bool = True):
