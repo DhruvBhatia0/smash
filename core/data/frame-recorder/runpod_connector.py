@@ -354,6 +354,7 @@ def download_hf_file(repo, filename, token, target):
     quoted_file = urllib.parse.quote(filename.strip("/"), safe="/")
     url = f"https://huggingface.co/datasets/{{quoted_repo}}/resolve/main/{{quoted_file}}"
     request = urllib.request.Request(url, headers={{"Authorization": "Bearer " + token}})
+    target.parent.mkdir(parents=True, exist_ok=True)
     temp = target.with_suffix(target.suffix + ".tmp")
     try:
         with urllib.request.urlopen(request, timeout=120) as response, temp.open("wb") as handle:
