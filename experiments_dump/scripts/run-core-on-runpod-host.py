@@ -33,6 +33,7 @@ class RunpodHostRunner:
         self.api_key = self._env("RUNPOD_API_KEY")
         self.hf_token = self._env("HF_TOKEN")
         self.worker_image = self._env("SMASH_RUNPOD_IMAGE")
+        self.worker_registry_auth_id = self._optional_env("SMASH_RUNPOD_CONTAINER_REGISTRY_AUTH_ID")
         self.public_key = self._public_key()
         self.base_url = "https://rest.runpod.io/v1"
         self.host: HostPod | None = None
@@ -138,19 +139,18 @@ class RunpodHostRunner:
 
     def sync_repo(self):
         host = self.require_host()
-        self.ssh(host, "mkdir -p /workspace/smash")
+        self.ssh(host, "mkdir -p /workspace/smash/core")
         self.rsync(
-            f"{ROOT}/",
+            f"{ROOT}/requirements.txt",
             host,
-            "/workspace/smash/",
+            "/workspace/smash/requirements.txt",
+        )
+        self.rsync(
+            f"{ROOT}/core/",
+            host,
+            "/workspace/smash/core/",
             extra=[
                 "--delete",
-                "--exclude",
-                ".git",
-                "--exclude",
-                ".core_runs",
-                "--exclude",
-                "experiments_dump/node_modules",
                 "--exclude",
                 "__pycache__",
             ],
@@ -173,7 +173,7 @@ class RunpodHostRunner:
             "cd /workspace/smash && "
             "set -a && . /workspace/smash/.runpod_env && set +a && "
             "export RUNPOD_PUBLIC_KEY=\"$(cat /root/.ssh/smash_worker_key.pub)\" && "
-            "python3 -m core.data.runner"
+            "python3 -m core.data.frame-recorder.runner"
         )
         print(json.dumps({"event": "remote_runner_started", "podId": host.id}), flush=True)
         completed = subprocess.run(self.ssh_base(host) + [command], text=True)
@@ -187,7 +187,7 @@ class RunpodHostRunner:
         command = (
             "cd /workspace/smash && "
             "set -a && . /workspace/smash/.runpod_env && set +a && "
-            "python3 -m core.data.hf_source_seeder"
+            "python3 -m core.data.frame-recorder.hf_source_seeder"
         )
         print(json.dumps({"event": "remote_seed_started", "podId": host.id}), flush=True)
         completed = subprocess.run(self.ssh_base(host) + [command], text=True)
@@ -204,22 +204,25 @@ class RunpodHostRunner:
             "SMASH_HF_EXPECTED_EMAIL": self.args.hf_expected_email,
             "SMASH_HF_REPO": self.args.hf_repo,
             "SMASH_HF_ROOT": self.args.hf_root,
+            "SMASH_HF_RAW_SLP_DIR": self.args.hf_raw_slp_dir,
+            "SMASH_HF_PRIVATE": "1" if self.args.hf_private else "0",
             "SMASH_SAMPLE_LIMIT": str(self.args.sample_limit),
             "SMASH_WORKER_COUNT": str(self.args.worker_count),
-            "SMASH_START_FRAME": str(self.args.start_frame),
-            "SMASH_END_FRAME": str(self.args.end_frame),
+            "SMASH_RECORDER_STARTUP_RETRY_SECONDS": str(self.args.recorder_startup_retry_seconds),
+            "SMASH_RECORDER_STARTUP_MAX_ATTEMPTS": str(self.args.recorder_startup_max_attempts),
             "SMASH_RENDER_TIMEOUT_SECONDS": str(self.args.render_timeout_seconds),
-            "SMASH_RENDER_OUTER_TIMEOUT_EXTRA_SECONDS": str(self.args.render_outer_timeout_extra_seconds),
-            "SMASH_MAX_FRAME_UPLOADS": str(self.args.max_frame_uploads),
-            "SMASH_FRAME_UPLOAD_BATCH_SIZE": str(self.args.frame_upload_batch_size),
-            "SMASH_FRAME_UPLOAD_RETRIES": str(self.args.frame_upload_retries),
-            "SMASH_FRAME_UPLOAD_RETRY_SECONDS": str(self.args.frame_upload_retry_seconds),
+            "SMASH_UPLOAD_BATCH_SIZE": str(self.args.upload_batch_size),
+            "SMASH_UPLOAD_RETRIES": str(self.args.upload_retries),
+            "SMASH_UPLOAD_RETRY_SECONDS": str(self.args.upload_retry_seconds),
             "SMASH_SKIP_EXISTING_PROCESSED": "1" if self.args.skip_existing_processed else "0",
-            "SMASH_MIN_PROCESSED_FILES": str(self.args.min_processed_files),
             "SMASH_RUNPOD_WAIT_SECONDS": str(self.args.wait_seconds),
             "SMASH_RUNPOD_NAME_PREFIX": self.args.worker_name_prefix,
-            "SMASH_RUNPOD_VCPU_COUNT": str(self.args.worker_vcpus),
+            "SMASH_RUNPOD_GPU_TYPE": self.args.worker_gpu_type,
+            "SMASH_RUNPOD_CLOUD_TYPE": self.args.worker_cloud_type,
+            "SMASH_RUNPOD_CLOUD_TYPES": self.args.worker_cloud_types,
+            "SMASH_RUNPOD_MIN_VCPU_PER_GPU": str(self.args.worker_min_vcpu_per_gpu),
             "SMASH_RUNPOD_CONTAINER_DISK_GB": str(self.args.worker_disk_gb),
+            "SMASH_RUNPOD_VOLUME_GB": str(self.args.worker_volume_gb),
             "SMASH_RUNPOD_CREATE_RETRIES": str(self.args.create_retries),
             "SMASH_MELEE_ISO": "/workspace/iso/melee.iso",
             "RUNPOD_SSH_PRIVATE_KEY": "/root/.ssh/smash_worker_key",
@@ -232,6 +235,8 @@ class RunpodHostRunner:
             "SMASH_SOURCE_DOWNLOAD_TIMEOUT_SECONDS": str(self.args.seed_download_timeout_seconds),
             "SMASH_SOURCE_DOWNLOAD_RETRIES": str(self.args.seed_download_retries),
         }
+        if self.worker_registry_auth_id:
+            env["SMASH_RUNPOD_CONTAINER_REGISTRY_AUTH_ID"] = self.worker_registry_auth_id
         env_text = "\n".join(f"export {key}={shlex.quote(value)}" for key, value in env.items())
         self.ssh_stdin(host, "cat > /workspace/smash/.runpod_env && chmod 600 /workspace/smash/.runpod_env", env_text)
 
@@ -354,6 +359,9 @@ class RunpodHostRunner:
             raise ValueError(f"{name} is required")
         return value
 
+    def _optional_env(self, name: str) -> str:
+        return os.environ.get(name) or self._zshrc_export(name)
+
     def _zshrc_export(self, name: str) -> str:
         zshrc = Path.home() / ".zshrc"
         if not zshrc.exists():
@@ -379,27 +387,30 @@ def parser() -> argparse.ArgumentParser:
     arg_parser = argparse.ArgumentParser()
     arg_parser.add_argument("--hf-repo", required=True)
     arg_parser.add_argument("--hf-root", required=True)
+    arg_parser.add_argument("--hf-raw-slp-dir", default="raw_slp")
     arg_parser.add_argument("--hf-expected-email", default="dhruv.bhatia.j@gmail.com")
     arg_parser.add_argument("--sample-limit", type=int, default=10)
     arg_parser.add_argument("--worker-count", type=int, default=2)
+    arg_parser.add_argument("--recorder-startup-retry-seconds", type=float, default=60)
+    arg_parser.add_argument("--recorder-startup-max-attempts", type=int, default=0)
     arg_parser.add_argument("--host-image", default="ubuntu:22.04")
-    arg_parser.add_argument("--host-vcpus", type=int, default=32)
+    arg_parser.add_argument("--host-vcpus", type=int, default=8)
     arg_parser.add_argument("--host-disk-gb", type=int, default=20)
-    arg_parser.add_argument("--worker-vcpus", type=int, default=2)
-    arg_parser.add_argument("--worker-disk-gb", type=int, default=10)
+    arg_parser.add_argument("--worker-gpu-type", default="NVIDIA GeForce RTX 4090")
+    arg_parser.add_argument("--worker-cloud-type", default="SECURE")
+    arg_parser.add_argument("--worker-cloud-types", default="SECURE")
+    arg_parser.add_argument("--worker-min-vcpu-per-gpu", type=int, default=6)
+    arg_parser.add_argument("--worker-disk-gb", type=int, default=60)
+    arg_parser.add_argument("--worker-volume-gb", type=int, default=30)
     arg_parser.add_argument("--cpu-flavor", action="append", default=["cpu3c"])
     arg_parser.add_argument("--cloud-type", default="COMMUNITY")
     arg_parser.add_argument("--iso", default=DEFAULT_ISO)
     arg_parser.add_argument("--ssh-private-key", default=str(Path.home() / ".ssh" / "id_ed25519"))
     arg_parser.add_argument("--wait-seconds", type=int, default=900)
-    arg_parser.add_argument("--start-frame", type=int, default=-123)
-    arg_parser.add_argument("--end-frame", type=int, default=10)
-    arg_parser.add_argument("--render-timeout-seconds", type=int, default=25)
-    arg_parser.add_argument("--render-outer-timeout-extra-seconds", type=int, default=30)
-    arg_parser.add_argument("--max-frame-uploads", type=int, default=60)
-    arg_parser.add_argument("--frame-upload-batch-size", type=int, default=1)
-    arg_parser.add_argument("--frame-upload-retries", type=int, default=5)
-    arg_parser.add_argument("--frame-upload-retry-seconds", type=float, default=10)
+    arg_parser.add_argument("--render-timeout-seconds", type=int, default=600)
+    arg_parser.add_argument("--upload-batch-size", type=int, default=10)
+    arg_parser.add_argument("--upload-retries", type=int, default=5)
+    arg_parser.add_argument("--upload-retry-seconds", type=float, default=10)
     arg_parser.add_argument("--create-retries", type=int, default=4)
     arg_parser.add_argument("--seed-source-hf-repo", default="")
     arg_parser.add_argument("--seed-source-hf-prefix", default="")
@@ -411,7 +422,7 @@ def parser() -> argparse.ArgumentParser:
     arg_parser.add_argument("--seed-download-retries", type=int, default=3)
     arg_parser.add_argument("--worker-name-prefix", default="smash-core-worker")
     arg_parser.add_argument("--skip-existing-processed", action=argparse.BooleanOptionalAction, default=False)
-    arg_parser.add_argument("--min-processed-files", type=int, default=1)
+    arg_parser.add_argument("--hf-private", action=argparse.BooleanOptionalAction, default=False)
     arg_parser.add_argument("--keep-host", action=argparse.BooleanOptionalAction, default=False)
     return arg_parser
 

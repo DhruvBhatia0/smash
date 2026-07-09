@@ -41,6 +41,11 @@ class RunpodConnector:
         self.base_url = "https://rest.runpod.io/v1"
         self.gpu_type_id = os.environ.get("SMASH_RUNPOD_GPU_TYPE", "NVIDIA GeForce RTX 4090")
         self.cloud_type = os.environ.get("SMASH_RUNPOD_CLOUD_TYPE", "SECURE")
+        self.cloud_types = [
+            cloud_type.strip()
+            for cloud_type in os.environ.get("SMASH_RUNPOD_CLOUD_TYPES", self.cloud_type).split(",")
+            if cloud_type.strip()
+        ]
         self.container_registry_auth_id = os.environ.get("SMASH_RUNPOD_CONTAINER_REGISTRY_AUTH_ID")
         self.container_disk_gb = int(os.environ.get("SMASH_RUNPOD_CONTAINER_DISK_GB", "60"))
         self.volume_gb = int(os.environ.get("SMASH_RUNPOD_VOLUME_GB", "30"))
@@ -75,18 +80,36 @@ class RunpodConnector:
         self.internal_resolution_frame_dumps = os.environ.get("SMASH_VIDEO_INTERNAL_RESOLUTION_FRAME_DUMPS", "True")
         self.efb_scale = os.environ.get("SMASH_VIDEO_EFB_SCALE", "2")
         self.bitrate_kbps = os.environ.get("SMASH_VIDEO_BITRATE_KBPS", "2500")
-        self.upload_batch_size = max(1, int(os.environ.get("SMASH_UPLOAD_BATCH_SIZE", "1")))
+        self.upload_batch_size = max(1, int(os.environ.get("SMASH_UPLOAD_BATCH_SIZE", "10")))
         self.upload_retries = max(1, int(os.environ.get("SMASH_UPLOAD_RETRIES", "5")))
         self.upload_retry_seconds = float(os.environ.get("SMASH_UPLOAD_RETRY_SECONDS", "10"))
 
     def create_instance(self) -> RunpodInstance:
         """Create one RTX 4090 pod running the video-rendering image."""
         name = f"{self.name_prefix}-{time.time_ns()}"
+        last_error = None
+        for attempt in range(1, self.create_retries + 1):
+            for cloud_type in self.cloud_types:
+                try:
+                    return self._instance(self._request("POST", "/pods", self._create_payload(name, cloud_type)))
+                except RuntimeError as error:
+                    created = self._find_instance_by_name(name)
+                    if created:
+                        return created
+                    last_error = error
+                    if not self._transient_error(error):
+                        break
+            if attempt == self.create_retries:
+                raise last_error or RuntimeError("RunPod pod creation failed")
+            time.sleep(min(30, 2**attempt))
+        raise RuntimeError("RunPod pod creation failed")
+
+    def _create_payload(self, name: str, cloud_type: str) -> dict:
         payload = {
             "name": name,
             "imageName": self.image,
             "computeType": "GPU",
-            "cloudType": self.cloud_type,
+            "cloudType": cloud_type,
             "gpuTypeIds": [self.gpu_type_id],
             "gpuTypePriority": "custom",
             "gpuCount": 1,
@@ -103,17 +126,7 @@ class RunpodConnector:
         }
         if self.container_registry_auth_id:
             payload["containerRegistryAuthId"] = self.container_registry_auth_id
-        for attempt in range(1, self.create_retries + 1):
-            try:
-                return self._instance(self._request("POST", "/pods", payload))
-            except RuntimeError as error:
-                created = self._find_instance_by_name(name)
-                if created:
-                    return created
-                if attempt == self.create_retries or not self._transient_error(error):
-                    raise
-                time.sleep(min(30, 2**attempt))
-        raise RuntimeError("RunPod pod creation failed")
+        return payload
 
     def attach_instance(self, pod_id: str) -> RunpodInstance:
         """Attach to an existing pod by id."""
@@ -472,7 +485,9 @@ if not streams:
     raise SystemExit("ffprobe found no video stream")
 
 stored_video = recording_dir / f"video{{videos[0].suffix}}"
-shutil.copyfile(videos[0], stored_video)
+shutil.move(str(videos[0]), stored_video)
+shutil.rmtree(render_dir, ignore_errors=True)
+shutil.rmtree(work_dir / "dolphin-user", ignore_errors=True)
 summary = {{
     "podWorkDir": str(work_dir),
     "uploadedTo": config["target"],
@@ -528,25 +543,47 @@ if batch_dir.exists():
 batch_dir.mkdir(parents=True)
 
 uploaded = []
-for job in config["jobs"]:
+file_count = 0
+api = HfApi(token=config["token"])
+
+if len(config["jobs"]) == 1:
+    job = config["jobs"][0]
     source = Path(job["recordingDir"])
     if not source.exists():
         raise FileNotFoundError(str(source))
-    target = batch_dir / job["targetName"]
-    shutil.copytree(source, target)
+    target = "/".join(part.strip("/") for part in [config["target"], job["targetName"]] if part.strip("/"))
+    file_count = len([path for path in source.rglob("*") if path.is_file()])
+    retry_hf(
+        lambda: api.upload_folder(
+            repo_id=config["repo"],
+            repo_type="dataset",
+            token=config["token"],
+            folder_path=str(source),
+            path_in_repo=target,
+        ),
+        "upload",
+    )
     uploaded.append(job["sample"])
+else:
+    for job in config["jobs"]:
+        source = Path(job["recordingDir"])
+        if not source.exists():
+            raise FileNotFoundError(str(source))
+        target = batch_dir / job["targetName"]
+        shutil.copytree(source, target, copy_function=os.link)
+        uploaded.append(job["sample"])
 
-file_count = len([path for path in batch_dir.rglob("*") if path.is_file()])
-retry_hf(
-    lambda: HfApi(token=config["token"]).upload_folder(
-        repo_id=config["repo"],
-        repo_type="dataset",
-        token=config["token"],
-        folder_path=str(batch_dir),
-        path_in_repo=config["target"],
-    ),
-    "upload",
-)
+    file_count = len([path for path in batch_dir.rglob("*") if path.is_file()])
+    retry_hf(
+        lambda: api.upload_folder(
+            repo_id=config["repo"],
+            repo_type="dataset",
+            token=config["token"],
+            folder_path=str(batch_dir),
+            path_in_repo=config["target"],
+        ),
+        "upload",
+    )
 
 for job in config["jobs"]:
     shutil.rmtree(job["workDir"], ignore_errors=True)

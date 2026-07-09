@@ -27,9 +27,24 @@ class HfConnector:
             "fullname": identity.get("fullname"),
         }
 
-    def create_repo(self, repo: str, private: bool = True) -> str:
-        """Create the dataset repo if it does not already exist."""
-        return str(self.api.create_repo(repo, repo_type="dataset", private=private, exist_ok=True))
+    def create_repo(self, repo: str, private: bool | None = None) -> str:
+        """Create the dataset repo if needed and keep its visibility explicit."""
+        if private is None:
+            private = os.environ.get("SMASH_HF_PRIVATE", "0") == "1"
+        result = str(self.api.create_repo(repo, repo_type="dataset", private=private, exist_ok=True))
+        self.set_repo_private(repo, private)
+        return result
+
+    def set_repo_private(self, repo: str, private: bool) -> None:
+        """Set dataset visibility for repos that already existed."""
+        self._retry(
+            lambda: self.api.update_repo_settings(
+                repo_id=repo,
+                repo_type="dataset",
+                token=self.token,
+                private=private,
+            )
+        )
 
     def list_files(self, repo: str, folder: str = "") -> list[str]:
         """List files under one logical HF folder."""

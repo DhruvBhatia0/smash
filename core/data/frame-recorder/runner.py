@@ -17,6 +17,8 @@ class DatasetRunner:
         desired_max: int,
         recorder_count: int,
         skip_existing_processed: bool = False,
+        startup_retry_seconds: float = 60,
+        startup_max_attempts: int = 0,
     ):
         """Create the bounded queue and the producer/consumer objects."""
         self.queue: Queue[SlpSample | None] = Queue(maxsize=1000)
@@ -29,6 +31,8 @@ class DatasetRunner:
         self.hf_location = hf_location
         self.runpod = runpod
         self.recorder_count = recorder_count
+        self.startup_retry_seconds = startup_retry_seconds
+        self.startup_max_attempts = startup_max_attempts
         self.recorders: list[FrameRecorder] = []
         self.startup_errors: list[dict] = []
         self.lock = threading.Lock()
@@ -68,19 +72,27 @@ class DatasetRunner:
         }
 
     def _record(self, index: int):
-        recorder = None
-        try:
-            recorder = FrameRecorder(self.queue, self.hf_location, self.runpod)
-            with self.lock:
-                self.recorders.append(recorder)
-            recorder.record()
-        except Exception as error:
-            event = "recorder_startup_failed" if recorder is None else "recorder_failed"
-            log_event(event, index=index, error=str(error))
-            with self.lock:
-                self.startup_errors.append(
-                    {"component": "FrameRecorder", "index": index, "error": str(error)}
-                )
+        attempt = 0
+        while True:
+            attempt += 1
+            recorder = None
+            try:
+                recorder = FrameRecorder(self.queue, self.hf_location, self.runpod)
+                with self.lock:
+                    self.recorders.append(recorder)
+                recorder.record()
+                return
+            except Exception as error:
+                event = "recorder_startup_failed" if recorder is None else "recorder_failed"
+                log_event(event, index=index, attempt=attempt, error=str(error))
+                exhausted = self.startup_max_attempts and attempt >= self.startup_max_attempts
+                if recorder is not None or exhausted:
+                    with self.lock:
+                        self.startup_errors.append(
+                            {"component": "FrameRecorder", "index": index, "error": str(error)}
+                        )
+                    return
+                time.sleep(self.startup_retry_seconds)
 
 
 def build_runner() -> DatasetRunner:
@@ -90,6 +102,7 @@ def build_runner() -> DatasetRunner:
         repo=os.environ["SMASH_HF_REPO"],
         hf=hf,
         root=os.environ.get("SMASH_HF_ROOT", ""),
+        raw_slp_dir=os.environ.get("SMASH_HF_RAW_SLP_DIR", "raw_slp"),
         recording_dir=os.environ.get("SMASH_HF_RECORDING_DIR", "slp_with_video"),
     )
     return DatasetRunner(
@@ -100,6 +113,8 @@ def build_runner() -> DatasetRunner:
         desired_max=int(os.environ.get("SMASH_SAMPLE_LIMIT", "1")),
         recorder_count=int(os.environ.get("SMASH_WORKER_COUNT", "1")),
         skip_existing_processed=os.environ.get("SMASH_SKIP_EXISTING_PROCESSED", "") == "1",
+        startup_retry_seconds=float(os.environ.get("SMASH_RECORDER_STARTUP_RETRY_SECONDS", "60")),
+        startup_max_attempts=int(os.environ.get("SMASH_RECORDER_STARTUP_MAX_ATTEMPTS", "0")),
     )
 
 
