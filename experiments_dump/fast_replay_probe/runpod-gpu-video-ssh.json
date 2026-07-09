@@ -1,0 +1,43 @@
+{
+  "podId": "kb1phfqvblqoqc",
+  "host": "107.150.186.62",
+  "port": 13701,
+  "pod": {
+    "consumerUserId": "user_2hkrPxavnB7WHPAy5ipxSYo0RKm",
+    "containerDiskInGb": 30,
+    "costPerHr": 1.69,
+    "createdAt": "2026-07-09 03:55:26.046 +0000 UTC",
+    "desiredStatus": "RUNNING",
+    "dockerEntrypoint": [
+      "/bin/bash",
+      "-lc"
+    ],
+    "dockerStartCmd": [
+      "/opt/slippi-renderer/start-runpod-worker.sh"
+    ],
+    "env": {
+      "PUBLIC_KEY": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHJPTfYLvf3l0oaXuCu114D46GPVWYwt8DgD7sQNhwMz dhruv@codex-runpod-2026-06-10",
+      "SMASH_FRAME_QUEUE_RUN_ID": "gpu-video-probe"
+    },
+    "gpuCount": 1,
+    "id": "kb1phfqvblqoqc",
+    "imageName": "ttl.sh/smash-slippi-renderer-ffv1-png-e6b67b13-fd1d-40da-a466-caefd79108e5:24h",
+    "lastStartedAt": "2026-07-09 03:55:26.04 +0000 UTC",
+    "lastStatusChange": "Rented by User: Thu Jul 09 2026 03:55:26 GMT+0000 (Coordinated Universal Time)",
+    "machine": {},
+    "machineId": "9ti6j8484pn1",
+    "memoryInGb": 125,
+    "name": "smash-gpu-video-probe-1783569323",
+    "ports": [
+      "22/tcp"
+    ],
+    "portMappings": {
+      "22": 13701
+    },
+    "publicIp": "107.150.186.62",
+    "templateId": "",
+    "vcpuCount": 14,
+    "volumeInGb": 20,
+    "volumeMountPath": "/workspace"
+  }
+}

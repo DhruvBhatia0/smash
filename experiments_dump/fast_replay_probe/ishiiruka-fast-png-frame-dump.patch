@@ -1,0 +1,113 @@
+diff --git a/Source/Core/VideoCommon/ImageWrite.cpp b/Source/Core/VideoCommon/ImageWrite.cpp
+index a9fc98a..cd4a5fb 100644
+--- a/Source/Core/VideoCommon/ImageWrite.cpp
++++ b/Source/Core/VideoCommon/ImageWrite.cpp
+@@ -3,6 +3,7 @@
+ // Refer to the license.txt file included.
+ 
+ #include <list>
++#include <cstdlib>
+ #include <string>
+ 
+ #include "png.h"
+@@ -79,6 +80,21 @@ bool TextureToPng(const u8* data, int row_stride, const std::string& filename, i
+ 
+ 	png_init_io(png_ptr, fp.GetHandle());
+ 
++	if (const char* level_text = std::getenv("SLIPPI_PNG_COMPRESSION_LEVEL"))
++	{
++		int level = std::atoi(level_text);
++		if (level < 0)
++			level = 0;
++		else if (level > 9)
++			level = 9;
++		png_set_compression_level(png_ptr, level);
++	}
++	if (const char* filter_none = std::getenv("SLIPPI_PNG_FILTER_NONE"))
++	{
++		if (std::string(filter_none) != "0")
++			png_set_filter(png_ptr, PNG_FILTER_TYPE_BASE, PNG_FILTER_NONE);
++	}
++
+ 	// Write header (8 bit color depth)
+ 	png_set_IHDR(png_ptr, info_ptr, width, height, 8, PNG_COLOR_TYPE_RGB_ALPHA, PNG_INTERLACE_NONE,
+ 		PNG_COMPRESSION_TYPE_BASE, PNG_FILTER_TYPE_BASE);
+diff --git a/Source/Core/VideoCommon/RenderBase.cpp b/Source/Core/VideoCommon/RenderBase.cpp
+index d65243a..c7e7dd8 100644
+--- a/Source/Core/VideoCommon/RenderBase.cpp
++++ b/Source/Core/VideoCommon/RenderBase.cpp
+@@ -45,6 +45,10 @@
+ #include "Core/NetPlayProto.h"
+ #include "Core/NetPlayClient.h"
+ #include "Core/HW/SI.h"
++#ifdef IS_PLAYBACK
++#include "Core/Slippi/SlippiPlayback.h"
++#include "Core/Slippi/SlippiReplayComm.h"
++#endif
+ 
+ #include "InputCommon/GCAdapter.h"
+ 
+@@ -75,6 +79,24 @@ static int OSDTime;
+ 
+ std::unique_ptr<Renderer> g_renderer;
+ 
++#ifdef IS_PLAYBACK
++extern std::unique_ptr<SlippiReplayComm> g_replayComm;
++extern std::unique_ptr<SlippiPlaybackStatus> g_playbackStatus;
++
++static bool ShouldDumpSlippiPlaybackImageFrame()
++{
++	if (!g_playbackStatus || !g_replayComm)
++		return false;
++	if (!g_playbackStatus->inSlippiPlayback || g_playbackStatus->isHardFFW ||
++	    g_playbackStatus->isSoftFFW)
++		return false;
++
++	const auto& watch = g_replayComm->current;
++	const int frame = g_playbackStatus->currentPlaybackFrame;
++	return watch.startFrame <= frame && frame <= watch.endFrame;
++}
++#endif
++
+ // The maximum depth that is written to the depth buffer should never exceed this value.
+ // This is necessary because we use a 2^24 divisor for all our depth values to prevent
+ // floating-point round-trip errors. However the console GPU doesn't ever write a value
+@@ -1058,6 +1080,7 @@ std::string Renderer::GetFrameDumpNextImageFileName() const
+ bool Renderer::StartFrameDumpToImage(const FrameDumpConfig& config)
+ {
+ 	m_frame_dump_image_counter = 1;
++	m_frame_dump_last_image_slippi_frame_valid = false;
+ 	if (!SConfig::GetInstance().m_DumpFramesSilent)
+ 	{
+ 		// Only check for the presence of the first image to confirm overwriting.
+@@ -1076,6 +1099,17 @@ bool Renderer::StartFrameDumpToImage(const FrameDumpConfig& config)
+ 
+ void Renderer::DumpFrameToImage(const FrameDumpConfig& config)
+ {
++#ifdef IS_PLAYBACK
++	if (!ShouldDumpSlippiPlaybackImageFrame())
++		return;
++
++	const int slippi_frame = g_playbackStatus->currentPlaybackFrame;
++	if (m_frame_dump_last_image_slippi_frame_valid &&
++	    m_frame_dump_last_image_slippi_frame == slippi_frame)
++		return;
++	m_frame_dump_last_image_slippi_frame = slippi_frame;
++	m_frame_dump_last_image_slippi_frame_valid = true;
++#endif
+ 	std::string filename = GetFrameDumpNextImageFileName();
+ 	TextureToPng(config.data, config.stride, filename, config.width, config.height, false);
+ 	m_frame_dump_image_counter++;
+diff --git a/Source/Core/VideoCommon/RenderBase.h b/Source/Core/VideoCommon/RenderBase.h
+index 35da0a1..87e6e00 100644
+--- a/Source/Core/VideoCommon/RenderBase.h
++++ b/Source/Core/VideoCommon/RenderBase.h
+@@ -210,6 +210,8 @@ private:
+ 	Common::Event m_frame_dump_done;
+ 	Common::Flag m_frame_dump_thread_running;
+ 	u32 m_frame_dump_image_counter = 0;
++	bool m_frame_dump_last_image_slippi_frame_valid = false;
++	int m_frame_dump_last_image_slippi_frame = 0;
+ 	bool m_frame_dump_frame_running = false;
+ 
+ 	struct FrameDumpConfig

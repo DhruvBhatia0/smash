@@ -1,0 +1,132 @@
+FROM ubuntu:22.04 AS builder
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG ISHIIRUKA_REF=slippi
+ARG ISHIIRUKA_REPO=https://github.com/project-slippi/Ishiiruka.git
+ARG BUILD_JOBS=8
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    cmake \
+    curl \
+    file \
+    g++ \
+    gcc \
+    git \
+    make \
+    patch \
+    pkg-config \
+    python3 \
+    wget \
+    libao-dev \
+    libasound2-dev \
+    libavcodec-dev \
+    libavformat-dev \
+    libbluetooth-dev \
+    libenet-dev \
+    libegl1-mesa-dev \
+    libgl1-mesa-dev \
+    liblzo2-dev \
+    libminiupnpc-dev \
+    libopenal-dev \
+    libpulse-dev \
+    libreadline-dev \
+    libsfml-dev \
+    libsoil-dev \
+    libsoundtouch-dev \
+    libswscale-dev \
+    libusb-1.0-0-dev \
+    portaudio19-dev \
+    zlib1g-dev \
+    libudev-dev \
+    libevdev-dev \
+    libmbedtls-dev \
+    libcurl4-openssl-dev \
+    libpng-dev \
+    libfuse2 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain stable
+
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /opt/slippi-src
+RUN git clone --branch "${ISHIIRUKA_REF}" --depth 1 "${ISHIIRUKA_REPO}" Ishiiruka
+WORKDIR /opt/slippi-src/Ishiiruka
+RUN git submodule update --init --recursive
+
+COPY fast_replay_probe/ishiiruka-headless-egl-playback.patch /tmp/ishiiruka-headless-egl-playback.patch
+RUN patch -p1 < /tmp/ishiiruka-headless-egl-playback.patch
+
+RUN mkdir -p build && cd build && \
+    cmake \
+      -DLINUX_LOCAL_DEV=true \
+      -DIS_PLAYBACK=true \
+      -DENABLE_HEADLESS=true \
+      -DENABLE_ANALYTICS=false \
+      -DCMAKE_BUILD_TYPE=Release \
+      .. && \
+    make -j"${BUILD_JOBS}" dolphin-emu-nogui
+
+RUN rm -rf build/Binaries/Sys && \
+    cp -r Data/Sys build/Binaries/Sys && \
+    rm -rf build/Binaries/Sys/GameSettings && \
+    mkdir -p build/Binaries/Sys/GameSettings && \
+    cp -r Data/PlaybackGeckoCodes/. build/Binaries/Sys/GameSettings/ && \
+    grep -q '\$Required: Slippi Playback' build/Binaries/Sys/GameSettings/GALE01r2.ini && \
+    touch build/Binaries/portable.txt
+
+FROM ubuntu:22.04 AS runtime
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    ffmpeg \
+    libao4 \
+    libasound2 \
+    libavcodec58 \
+    libavformat58 \
+    libbluetooth3 \
+    libcurl4 \
+    libegl1 \
+    libevdev2 \
+    libgl1 \
+    libopengl0 \
+    libvulkan1 \
+    liblzo2-2 \
+    libmbedtls14 \
+    libminiupnpc17 \
+    libopenal1 \
+    libpng16-16 \
+    libpulse0 \
+    libreadline8 \
+    libsfml-network2.5 \
+    libsfml-system2.5 \
+    libsoil1 \
+    libsoundtouch1 \
+    libswscale5 \
+    libusb-1.0-0 \
+    mesa-utils \
+    openssh-server \
+    python3 \
+    libportaudio2 \
+    rsync \
+    vulkan-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/slippi
+COPY --from=builder /opt/slippi-src/Ishiiruka/build/Binaries/ /opt/slippi/
+COPY --from=builder /opt/slippi-src/Ishiiruka/build/Source/Core/DolphinWX/libslippi_rust_extensions.so /opt/slippi/
+COPY fast_replay_probe/render-ffv1-replay.sh /opt/slippi-renderer/render-ffv1-replay.sh
+COPY docker/scripts/start-runpod-worker.sh /opt/slippi-renderer/start-runpod-worker.sh
+RUN chmod +x /opt/slippi-renderer/render-ffv1-replay.sh /opt/slippi-renderer/start-runpod-worker.sh && \
+    test -x /opt/slippi/dolphin-emu-nogui && \
+    grep -q '\$Required: Slippi Playback' /opt/slippi/Sys/GameSettings/GALE01r2.ini
+
+ENV SLIPPI_DOLPHIN_BIN=/opt/slippi/dolphin-emu-nogui
+ENV LD_LIBRARY_PATH=/opt/slippi
+ENV USE_XVFB=0
+
+ENTRYPOINT ["/opt/slippi-renderer/render-ffv1-replay.sh"]

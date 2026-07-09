@@ -1,0 +1,66 @@
+{
+  "replayJson": "/workspace/frame-queue/fast-probe-runpod-ffv1-png/realtimeTest-ea78d02921/playback.json",
+  "dolphinExitStatus": 0,
+  "currentFrameLogEntries": 2307,
+  "currentFrameRange": {
+    "first": -123,
+    "last": 2183
+  },
+  "timeoutSeconds": 300,
+  "videoBackend": "OGL",
+  "dolphinCpuCore": "1",
+  "audioBackend": "Null",
+  "videos": [
+    {
+      "path": "/workspace/frame-queue/fast-probe-runpod-ffv1-png/realtimeTest-ea78d02921/raw-frames/.ffv1-video/framedump0.avi",
+      "bytes": 462030564
+    }
+  ],
+  "replayConfig": {
+    "commandId": "realtimeTest-ea78d02921",
+    "endFrame": 2182,
+    "replay": "/workspace/frame-queue/fast-probe-runpod-ffv1-png/realtimeTest-ea78d02921/input.slp",
+    "startFrame": -123
+  },
+  "pipeline": "ffv1-video-then-ffmpeg-png",
+  "frameCount": 2303,
+  "pngBytes": 668561367,
+  "requestedEndFrame": 2182,
+  "completedRequestedRange": true,
+  "samples": [
+    {
+      "path": "/workspace/frame-queue/fast-probe-runpod-ffv1-png/realtimeTest-ea78d02921/raw-frames/framedump_1.png",
+      "dumpFrameNumber": 1,
+      "png": {
+        "width": 380,
+        "height": 312
+      }
+    },
+    {
+      "path": "/workspace/frame-queue/fast-probe-runpod-ffv1-png/realtimeTest-ea78d02921/raw-frames/framedump_1152.png",
+      "dumpFrameNumber": 1152,
+      "png": {
+        "width": 380,
+        "height": 312
+      }
+    },
+    {
+      "path": "/workspace/frame-queue/fast-probe-runpod-ffv1-png/realtimeTest-ea78d02921/raw-frames/framedump_2303.png",
+      "dumpFrameNumber": 2303,
+      "png": {
+        "width": 380,
+        "height": 312
+      }
+    }
+  ],
+  "logs": {
+    "run": "/workspace/frame-queue/fast-probe-runpod-ffv1-png/realtimeTest-ea78d02921/raw-frames/.ffv1-video/render-ffv1.log",
+    "dolphin": "/workspace/frame-queue/fast-probe-runpod-ffv1-png/realtimeTest-ea78d02921/raw-frames/.ffv1-video/dolphin.log"
+  },
+  "video": [
+    {
+      "path": "/workspace/frame-queue/fast-probe-runpod-ffv1-png/realtimeTest-ea78d02921/raw-frames/.ffv1-video/framedump0.avi",
+      "bytes": 462030564
+    }
+  ]
+}

@@ -5,7 +5,7 @@ import time
 from queue import Queue
 
 from .hf_connector import HfConnector
-from .models import FrameRecorder, HfLocation, SlpDownloader, SlpSample, log_event
+from .models import FrameRecorder, HfLocation, SlpProducer, SlpSample, log_event
 from .runpod_connector import RunpodConnector
 
 
@@ -21,7 +21,7 @@ class DatasetRunner:
     ):
         """Create the bounded queue and the producer/consumer objects."""
         self.queue: Queue[SlpSample | None] = Queue(maxsize=1000)
-        self.downloader = SlpDownloader(
+        self.producer = SlpProducer(
             self.queue,
             hf_location,
             desired_max,
@@ -36,9 +36,9 @@ class DatasetRunner:
         self.lock = threading.Lock()
 
     def run(self) -> dict:
-        """Run one downloader thread and N RunPod-backed recorder threads."""
+        """Run one producer thread and N RunPod-backed recorder threads."""
         started = time.monotonic()
-        producer = threading.Thread(target=self.downloader.download, name="slp-downloader")
+        producer = threading.Thread(target=self.producer.download, name="slp-producer")
         consumers = [
             threading.Thread(target=self._record, args=(index,), name=f"frame-recorder-{index}")
             for index in range(self.recorder_count)
@@ -57,10 +57,10 @@ class DatasetRunner:
         results = [result for recorder in self.recorders for result in recorder.results]
         errors = [error for recorder in self.recorders for error in recorder.errors]
         errors += self.startup_errors
-        if self.downloader.error:
-            errors.append({"component": "SlpDownloader", "error": self.downloader.error})
+        if self.producer.error:
+            errors.append({"component": "SlpProducer", "error": self.producer.error})
         return {
-            "queued": self.downloader.count,
+            "queued": self.producer.count,
             "recorders": len(self.recorders),
             "processed": len(results),
             "failed": len(errors),

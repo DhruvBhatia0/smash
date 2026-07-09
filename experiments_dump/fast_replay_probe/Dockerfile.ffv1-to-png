@@ -1,0 +1,10 @@
+FROM smash/slippi-renderer:local
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY fast_replay_probe/render-ffv1-replay.sh /opt/slippi-renderer/render-ffv1-replay.sh
+COPY fast_replay_probe/render-ffv1-to-png.sh /opt/slippi-renderer/render-ffv1-to-png.sh
+RUN chmod +x /opt/slippi-renderer/render-ffv1-replay.sh /opt/slippi-renderer/render-ffv1-to-png.sh

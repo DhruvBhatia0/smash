@@ -1,0 +1,43 @@
+{
+  "podId": "gspkptfv7p1m6n",
+  "host": "107.150.186.62",
+  "port": 13877,
+  "pod": {
+    "consumerUserId": "user_2hkrPxavnB7WHPAy5ipxSYo0RKm",
+    "containerDiskInGb": 30,
+    "costPerHr": 1.69,
+    "createdAt": "2026-07-09 04:06:09.885 +0000 UTC",
+    "desiredStatus": "RUNNING",
+    "dockerEntrypoint": [
+      "/bin/bash",
+      "-lc"
+    ],
+    "dockerStartCmd": [
+      "/opt/slippi-renderer/start-runpod-worker.sh"
+    ],
+    "env": {
+      "PUBLIC_KEY": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHJPTfYLvf3l0oaXuCu114D46GPVWYwt8DgD7sQNhwMz dhruv@codex-runpod-2026-06-10",
+      "SMASH_FRAME_QUEUE_RUN_ID": "gpu-vulkan-retest"
+    },
+    "gpuCount": 1,
+    "id": "gspkptfv7p1m6n",
+    "imageName": "ttl.sh/smash-slippi-renderer-ffv1-png-ce72e713-81e5-42d3-af30-0aa6cd9846ae:24h",
+    "lastStartedAt": "2026-07-09 04:06:09.88 +0000 UTC",
+    "lastStatusChange": "Rented by User: Thu Jul 09 2026 04:06:09 GMT+0000 (Coordinated Universal Time)",
+    "machine": {},
+    "machineId": "9ti6j8484pn1",
+    "memoryInGb": 125,
+    "name": "smash-gpu-vulkan-retest-1783569967",
+    "ports": [
+      "22/tcp"
+    ],
+    "portMappings": {
+      "22": 13877
+    },
+    "publicIp": "107.150.186.62",
+    "templateId": "",
+    "vcpuCount": 14,
+    "volumeInGb": 20,
+    "volumeMountPath": "/workspace"
+  }
+}

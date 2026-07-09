@@ -51,7 +51,7 @@ class HfLocation:
         return "/".join(part.strip("/") for part in parts if part.strip("/"))
 
 
-class SlpDownloader:
+class SlpProducer:
     def __init__(
         self,
         queue: Queue[SlpSample | None],
