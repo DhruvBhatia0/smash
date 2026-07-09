@@ -17,7 +17,7 @@ class HfConnector:
 
     def whoami(self) -> dict:
         """Return the authenticated HF user, with no token material included."""
-        identity = self.api.whoami(token=self.token)
+        identity = self.api.whoami(token=self.token, cache=True)
         email = identity.get("email")
         if self.expected_email and email != self.expected_email:
             raise ValueError(f"HF token email mismatch: expected {self.expected_email}, got {email}")

@@ -65,6 +65,7 @@ class RunpodConnector:
         self.wait_seconds = int(os.environ.get("SMASH_RUNPOD_WAIT_SECONDS", "600"))
         self.render_timeout_seconds = int(os.environ.get("SMASH_RENDER_TIMEOUT_SECONDS", "600"))
         self.create_retries = int(os.environ.get("SMASH_RUNPOD_CREATE_RETRIES", "4"))
+        self.dolphin_bin = os.environ.get("SMASH_SLIPPI_DOLPHIN_BIN", "/opt/slippi/dolphin-emu-nogui")
         self.video_backend = os.environ.get("SMASH_VIDEO_BACKEND", "OGL")
         self.dolphin_cpu_core = os.environ.get("SMASH_DOLPHIN_CPU_CORE", "1")
         self.audio_backend = os.environ.get("SMASH_DOLPHIN_AUDIO_BACKEND", "Null")
@@ -179,6 +180,7 @@ class RunpodConnector:
                 "SLIPPI_INTERNAL_RESOLUTION_FRAME_DUMPS": self.internal_resolution_frame_dumps,
                 "SLIPPI_EFB_SCALE": self.efb_scale,
                 "SLIPPI_BITRATE_KBPS": self.bitrate_kbps,
+                "SLIPPI_DOLPHIN_BIN": self.dolphin_bin,
             },
         }
         result = self._ssh_script(instance, self._remote_record_script(payload))
@@ -249,6 +251,7 @@ import os
 import shutil
 import struct
 import subprocess
+import time
 from pathlib import Path
 
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
@@ -308,6 +311,42 @@ def video_files(output_dir):
         files.extend(output_dir.glob(pattern))
     return sorted(files)
 
+
+def print_render_diagnostics(output_dir):
+    print("[render-files]")
+    for item in sorted(output_dir.glob("*")):
+        try:
+            print(item.name, item.stat().st_size)
+        except OSError as error:
+            print(item.name, str(error))
+    for path in [output_dir / "render-ffv1.log", output_dir / "dolphin.log", output_dir / "manifest.json"]:
+        if not path.exists():
+            continue
+        print("[begin]", str(path))
+        data = path.read_text(errors="replace")
+        print(data[-20000:])
+        print("[end]", str(path))
+
+
+def retry_hf(action, label):
+    for attempt in range(1, 7):
+        try:
+            return action()
+        except Exception as error:
+            messages = []
+            seen = set()
+            current = error
+            while current is not None and id(current) not in seen:
+                seen.add(id(current))
+                messages.append(str(current))
+                current = current.__cause__ or current.__context__
+            message = "\\n".join(messages)
+            if attempt == 6 or ("429" not in message and "Too Many Requests" not in message):
+                raise
+            sleep_seconds = 30 * attempt
+            print("[hf-rate-limit]", label, "attempt", attempt, "sleep", sleep_seconds, flush=True)
+            time.sleep(sleep_seconds)
+
 config = json.loads({config_json})
 token = config["token"]
 work_dir = Path(config["workDir"])
@@ -322,12 +361,15 @@ work_dir.mkdir(parents=True, exist_ok=True)
 render_dir.mkdir(parents=True, exist_ok=True)
 recording_dir.mkdir(parents=True, exist_ok=True)
 
-downloaded = hf_hub_download(
-    repo_id=config["repo"],
-    repo_type="dataset",
-    filename=config["source"],
-    token=token,
-    local_dir=str(download_dir),
+downloaded = retry_hf(
+    lambda: hf_hub_download(
+        repo_id=config["repo"],
+        repo_type="dataset",
+        filename=config["source"],
+        token=token,
+        local_dir=str(download_dir),
+    ),
+    "download",
 )
 shutil.copyfile(downloaded, slp_path)
 shutil.copyfile(slp_path, recording_dir / "input.slp")
@@ -372,13 +414,17 @@ process = subprocess.Popen(
 stdout, stderr = process.communicate()
 
 if process.returncode:
-    print(stdout)
-    print(stderr)
+    if stdout:
+        print(stdout)
+    if stderr:
+        print(stderr)
+    print_render_diagnostics(render_dir)
     shutil.rmtree(work_dir, ignore_errors=True)
-    raise SystemExit(process.returncode)
+    raise SystemExit("renderer failed with exit " + str(process.returncode))
 
 videos = video_files(render_dir)
 if not videos:
+    print_render_diagnostics(render_dir)
     shutil.rmtree(work_dir, ignore_errors=True)
     raise SystemExit("renderer completed but did not write a video")
 
@@ -391,21 +437,25 @@ probe = subprocess.run(
 )
 if probe.returncode:
     print(probe.stderr)
+    print_render_diagnostics(render_dir)
     shutil.rmtree(work_dir, ignore_errors=True)
     raise SystemExit(probe.returncode)
 ffprobe = json.loads(probe.stdout)
 
 manifest_path = render_dir / "manifest.json"
 if not manifest_path.exists():
+    print_render_diagnostics(render_dir)
     shutil.rmtree(work_dir, ignore_errors=True)
     raise SystemExit("renderer completed without a manifest")
 manifest = json.loads(manifest_path.read_text())
 current_range = manifest.get("currentFrameRange") or {{}}
 if current_range.get("last") is None or int(current_range["last"]) < last_frame:
+    print_render_diagnostics(render_dir)
     shutil.rmtree(work_dir, ignore_errors=True)
     raise SystemExit(f"render stopped before replay end: {{current_range.get('last')}} < {{last_frame}}")
 streams = [stream for stream in ffprobe.get("streams", []) if stream.get("codec_type") == "video"]
 if not streams:
+    print_render_diagnostics(render_dir)
     shutil.rmtree(work_dir, ignore_errors=True)
     raise SystemExit("ffprobe found no video stream")
 
@@ -432,11 +482,32 @@ print(json.dumps(summary))
 import json
 import os
 import shutil
+import time
 from pathlib import Path
 
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 from huggingface_hub import HfApi
+
+
+def retry_hf(action, label):
+    for attempt in range(1, 7):
+        try:
+            return action()
+        except Exception as error:
+            messages = []
+            seen = set()
+            current = error
+            while current is not None and id(current) not in seen:
+                seen.add(id(current))
+                messages.append(str(current))
+                current = current.__cause__ or current.__context__
+            message = "\\n".join(messages)
+            if attempt == 6 or ("429" not in message and "Too Many Requests" not in message):
+                raise
+            sleep_seconds = 30 * attempt
+            print("[hf-rate-limit]", label, "attempt", attempt, "sleep", sleep_seconds, flush=True)
+            time.sleep(sleep_seconds)
 
 config = json.loads({config_json})
 batch_dir = Path(config["batchDir"])
@@ -454,12 +525,15 @@ for job in config["jobs"]:
     uploaded.append(job["sample"])
 
 file_count = len([path for path in batch_dir.rglob("*") if path.is_file()])
-HfApi(token=config["token"]).upload_folder(
-    repo_id=config["repo"],
-    repo_type="dataset",
-    token=config["token"],
-    folder_path=str(batch_dir),
-    path_in_repo=config["target"],
+retry_hf(
+    lambda: HfApi(token=config["token"]).upload_folder(
+        repo_id=config["repo"],
+        repo_type="dataset",
+        token=config["token"],
+        folder_path=str(batch_dir),
+        path_in_repo=config["target"],
+    ),
+    "upload",
 )
 
 for job in config["jobs"]:
@@ -528,7 +602,7 @@ print(json.dumps({{
 
     def _rsync_base(self, instance: RunpodInstance) -> list[str]:
         ssh = self._ssh_base(instance)[:-1]
-        return ["rsync", "-a", "--partial", "--inplace", "-e", shlex.join(ssh)]
+        return ["rsync", "-a", "--no-owner", "--no-group", "--partial", "--inplace", "-e", shlex.join(ssh)]
 
     def _request(self, method: str, path: str, payload: dict | None = None):
         body = json.dumps(payload).encode() if payload is not None else None
