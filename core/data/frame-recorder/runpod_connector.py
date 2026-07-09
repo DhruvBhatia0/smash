@@ -41,6 +41,7 @@ class RunpodConnector:
         self.base_url = "https://rest.runpod.io/v1"
         self.gpu_type_id = os.environ.get("SMASH_RUNPOD_GPU_TYPE", "NVIDIA GeForce RTX 4090")
         self.cloud_type = os.environ.get("SMASH_RUNPOD_CLOUD_TYPE", "SECURE")
+        self.container_registry_auth_id = os.environ.get("SMASH_RUNPOD_CONTAINER_REGISTRY_AUTH_ID")
         self.container_disk_gb = int(os.environ.get("SMASH_RUNPOD_CONTAINER_DISK_GB", "60"))
         self.volume_gb = int(os.environ.get("SMASH_RUNPOD_VOLUME_GB", "30"))
         self.volume_mount_path = os.environ.get("SMASH_RUNPOD_VOLUME_MOUNT_PATH", "/workspace")
@@ -99,6 +100,8 @@ class RunpodConnector:
             "dockerStartCmd": ["/opt/slippi-renderer/start-runpod-worker.sh"],
             "env": {"PUBLIC_KEY": self.public_key} if self.public_key else {},
         }
+        if self.container_registry_auth_id:
+            payload["containerRegistryAuthId"] = self.container_registry_auth_id
         for attempt in range(1, self.create_retries + 1):
             try:
                 return self._instance(self._request("POST", "/pods", payload))
