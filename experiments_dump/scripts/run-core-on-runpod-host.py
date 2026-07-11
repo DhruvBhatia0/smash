@@ -186,6 +186,27 @@ class RunpodHostRunner:
     def run_remote_pipeline(self) -> int:
         host = self.require_host()
         self.write_remote_env()
+        if self.args.detach:
+            command = (
+                "cd /workspace/smash && "
+                "set -a && . /workspace/smash/.runpod_env && set +a && "
+                "export RUNPOD_PUBLIC_KEY=\"$(cat /root/.ssh/smash_worker_key.pub)\" && "
+                "nohup python3 -m core.data.frame-recorder.runner "
+                "> /workspace/smash/runner.log 2>&1 < /dev/null & echo $!"
+            )
+            pid = self.ssh(host, command).strip()
+            print(
+                json.dumps(
+                    {
+                        "event": "remote_runner_detached",
+                        "podId": host.id,
+                        "pid": pid,
+                        "log": "/workspace/smash/runner.log",
+                    }
+                ),
+                flush=True,
+            )
+            return 0
         command = (
             "cd /workspace/smash && "
             "set -a && . /workspace/smash/.runpod_env && set +a && "
@@ -453,6 +474,7 @@ def parser() -> argparse.ArgumentParser:
     arg_parser.add_argument("--skip-existing-processed", action=argparse.BooleanOptionalAction, default=False)
     arg_parser.add_argument("--hf-private", action=argparse.BooleanOptionalAction, default=False)
     arg_parser.add_argument("--keep-host", action=argparse.BooleanOptionalAction, default=False)
+    arg_parser.add_argument("--detach", action=argparse.BooleanOptionalAction, default=False)
     return arg_parser
 
 
