@@ -31,7 +31,7 @@ class RunpodHostRunner:
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.api_key = self._env("RUNPOD_API_KEY")
-        self.hf_token = self._env("HF_TOKEN")
+        self.hf_token = self._optional_env("HF_TOKEN")
         self.worker_image = self._env("SMASH_RUNPOD_IMAGE")
         self.worker_registry_auth_id = self._optional_env("SMASH_RUNPOD_CONTAINER_REGISTRY_AUTH_ID")
         self.public_key = self._public_key()
@@ -44,6 +44,7 @@ class RunpodHostRunner:
             self.host = self.wait_for_ssh(pod_id)
             self.bootstrap_host()
             self.sync_repo()
+            self.sync_storage_config()
             self.write_remote_env()
             self.seed_remote_raw_slps()
             self.sync_iso()
@@ -130,11 +131,15 @@ class RunpodHostRunner:
 
     def bootstrap_host(self):
         host = self.require_host()
-        self.ssh(
-            host,
-            "python3 -m pip install 'huggingface_hub[hf_xet]>=1.0.0' && "
-            "ssh-keygen -t ed25519 -N '' -f /root/.ssh/smash_worker_key <<<y >/dev/null 2>&1 || true",
+        commands = []
+        if self.args.storage_provider == "hf":
+            commands.append("python3 -m pip install 'huggingface_hub[hf_xet]>=1.0.0'")
+        else:
+            commands.append("apt-get update && apt-get install -y --no-install-recommends rclone zstd")
+        commands.append(
+            "ssh-keygen -t ed25519 -N '' -f /root/.ssh/smash_worker_key <<<y >/dev/null 2>&1 || true"
         )
+        self.ssh(host, " && ".join(commands))
         print(json.dumps({"event": "host_bootstrapped", "podId": host.id}), flush=True)
 
     def sync_repo(self):
@@ -156,6 +161,18 @@ class RunpodHostRunner:
             ],
         )
         print(json.dumps({"event": "repo_synced", "podId": host.id}), flush=True)
+
+    def sync_storage_config(self):
+        if self.args.storage_provider != "gdrive":
+            return
+        host = self.require_host()
+        config = Path(self.args.gdrive_config).expanduser()
+        if not config.exists():
+            raise FileNotFoundError(config)
+        self.ssh(host, "mkdir -p /root/.config/rclone")
+        self.rsync(str(config), host, "/root/.config/rclone/rclone.conf")
+        self.ssh(host, "chmod 600 /root/.config/rclone/rclone.conf")
+        print(json.dumps({"event": "gdrive_config_synced", "podId": host.id}), flush=True)
 
     def sync_iso(self):
         host = self.require_host()
@@ -198,6 +215,7 @@ class RunpodHostRunner:
     def write_remote_env(self):
         host = self.require_host()
         env = {
+            "SMASH_STORAGE_PROVIDER": self.args.storage_provider,
             "HF_TOKEN": self.hf_token,
             "RUNPOD_API_KEY": self.api_key,
             "SMASH_RUNPOD_IMAGE": self.worker_image,
@@ -206,6 +224,11 @@ class RunpodHostRunner:
             "SMASH_HF_ROOT": self.args.hf_root,
             "SMASH_HF_RAW_SLP_DIR": self.args.hf_raw_slp_dir,
             "SMASH_HF_PRIVATE": "1" if self.args.hf_private else "0",
+            "SMASH_GDRIVE_REMOTE": self.args.gdrive_remote,
+            "SMASH_GDRIVE_CONFIG": "/root/.config/rclone/rclone.conf",
+            "SMASH_GDRIVE_ROOT": self.args.gdrive_root,
+            "SMASH_GDRIVE_RAW_SLP_DIR": self.args.gdrive_raw_slp_dir,
+            "SMASH_GDRIVE_RECORDING_DIR": self.args.gdrive_recording_dir,
             "SMASH_SAMPLE_LIMIT": str(self.args.sample_limit),
             "SMASH_WORKER_COUNT": str(self.args.worker_count),
             "SMASH_RECORDER_STARTUP_RETRY_SECONDS": str(self.args.recorder_startup_retry_seconds),
@@ -385,10 +408,16 @@ class RunpodHostRunner:
 
 def parser() -> argparse.ArgumentParser:
     arg_parser = argparse.ArgumentParser()
-    arg_parser.add_argument("--hf-repo", required=True)
-    arg_parser.add_argument("--hf-root", required=True)
+    arg_parser.add_argument("--storage-provider", choices=("hf", "gdrive"), default="hf")
+    arg_parser.add_argument("--hf-repo", default="")
+    arg_parser.add_argument("--hf-root", default="")
     arg_parser.add_argument("--hf-raw-slp-dir", default="raw_slp")
     arg_parser.add_argument("--hf-expected-email", default="dhruv.bhatia.j@gmail.com")
+    arg_parser.add_argument("--gdrive-remote", default="smash-drive")
+    arg_parser.add_argument("--gdrive-config", default="~/.config/rclone/rclone.conf")
+    arg_parser.add_argument("--gdrive-root", default="")
+    arg_parser.add_argument("--gdrive-raw-slp-dir", default="")
+    arg_parser.add_argument("--gdrive-recording-dir", default="slp_with_video")
     arg_parser.add_argument("--sample-limit", type=int, default=10)
     arg_parser.add_argument("--worker-count", type=int, default=2)
     arg_parser.add_argument("--recorder-startup-retry-seconds", type=float, default=60)
@@ -408,7 +437,7 @@ def parser() -> argparse.ArgumentParser:
     arg_parser.add_argument("--ssh-private-key", default=str(Path.home() / ".ssh" / "id_ed25519"))
     arg_parser.add_argument("--wait-seconds", type=int, default=900)
     arg_parser.add_argument("--render-timeout-seconds", type=int, default=600)
-    arg_parser.add_argument("--upload-batch-size", type=int, default=10)
+    arg_parser.add_argument("--upload-batch-size", type=int, default=1)
     arg_parser.add_argument("--upload-retries", type=int, default=5)
     arg_parser.add_argument("--upload-retry-seconds", type=float, default=10)
     arg_parser.add_argument("--create-retries", type=int, default=4)

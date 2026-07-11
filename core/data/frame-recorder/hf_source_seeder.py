@@ -14,7 +14,7 @@ from pathlib import Path
 from huggingface_hub import HfApi, hf_hub_url
 
 from .hf_connector import HfConnector
-from .models import HfLocation, log_event
+from .models import StorageLocation, log_event
 
 
 @dataclass(frozen=True)
@@ -30,7 +30,7 @@ class SourceSlp:
 class HfSourceSlpSeeder:
     def __init__(
         self,
-        target: HfLocation,
+        target: StorageLocation,
         source_repo: str,
         desired_count: int,
         source_prefix: str = "",
@@ -50,15 +50,15 @@ class HfSourceSlpSeeder:
         self.work_dir = Path(work_dir)
         self.download_timeout_seconds = download_timeout_seconds
         self.download_retries = download_retries
-        self.source_api = HfApi(token=target.hf.token)
+        self.source_api = HfApi(token=target.provider.token)
 
     def seed(self) -> dict:
         """Download source SLP files to temporary batches and upload each batch to HF."""
         started = time.monotonic()
-        self.target.hf.create_repo(self.target.repo)
+        self.target.provider.create_repo(self.target.namespace)
         existing = {
             path
-            for path in self.target.hf.list_files(self.target.repo, self.target.raw_slp_path())
+            for path in self.target.provider.list_files(self.target.namespace, self.target.raw_slp_path())
             if path.endswith(".slp")
         }
         if len(existing) >= self.desired_count:
@@ -69,7 +69,7 @@ class HfSourceSlpSeeder:
         log_event(
             "seed_planned",
             sourceRepo=self.source_repo,
-            targetRepo=self.target.repo,
+            targetRepo=self.target.namespace,
             targetPrefix=self.target.raw_slp_path(),
             existing=len(existing),
             planned=len(jobs),
@@ -111,7 +111,7 @@ class HfSourceSlpSeeder:
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(self.concurrency, len(batch))) as pool:
                 rows = list(pool.map(lambda job: self._download_one(job, raw_dir), batch))
             manifest_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
-            self.target.hf.upload_folder(self.target.repo, str(upload_dir), self.target.root)
+            self.target.provider.upload_folder(self.target.namespace, str(upload_dir), self.target.root)
         finally:
             shutil.rmtree(batch_dir, ignore_errors=True)
 
@@ -123,15 +123,15 @@ class HfSourceSlpSeeder:
             "index": job.index,
             "sourceRepo": self.source_repo,
             "sourcePath": job.source_path,
-            "targetRepo": self.target.repo,
+            "targetRepo": self.target.namespace,
             "targetPath": job.target_path,
             "size": job.size,
         }
 
     def _stream_download(self, url: str, local_path: Path):
         headers = {"user-agent": "smash-frame-data-seeder"}
-        if self.target.hf.token:
-            headers["authorization"] = f"Bearer {self.target.hf.token}"
+        if self.target.provider.token:
+            headers["authorization"] = f"Bearer {self.target.provider.token}"
         for attempt in range(1, self.download_retries + 1):
             try:
                 request = urllib.request.Request(url, headers=headers)
@@ -185,7 +185,7 @@ class HfSourceSlpSeeder:
     def _summary(self, started: float, existing: int, seeded: int) -> dict:
         return {
             "sourceRepo": self.source_repo,
-            "targetRepo": self.target.repo,
+            "targetRepo": self.target.namespace,
             "targetPrefix": self.target.raw_slp_path(),
             "desired": self.desired_count,
             "existing": existing,
@@ -197,9 +197,9 @@ class HfSourceSlpSeeder:
 def build_seeder() -> HfSourceSlpSeeder:
     """Build the HF source seeder from environment."""
     hf = HfConnector(expected_email=os.environ.get("SMASH_HF_EXPECTED_EMAIL"))
-    target = HfLocation(
-        repo=os.environ["SMASH_HF_REPO"],
-        hf=hf,
+    target = StorageLocation(
+        namespace=os.environ["SMASH_HF_REPO"],
+        provider=hf,
         root=os.environ.get("SMASH_HF_ROOT", ""),
     )
     return HfSourceSlpSeeder(

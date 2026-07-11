@@ -5,15 +5,26 @@ import threading
 import time
 from dataclasses import dataclass
 from queue import Queue
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
-    from .hf_connector import HfConnector
     from .runpod_connector import RunpodConnector
 
 
 _LOG_LOCK = threading.Lock()
 _VIDEO_SUFFIXES = (".avi", ".mkv", ".mp4", ".mov", ".nut")
+
+
+class StorageProvider(Protocol):
+    kind: str
+
+    def prepare(self, namespace: str) -> None: ...
+
+    def list_files(self, namespace: str, folder: str = "") -> list[str]: ...
+
+    def list_slp_references(self, namespace: str, folder: str = "") -> list[str]: ...
+
+    def worker_config(self, namespace: str) -> dict: ...
 
 
 def log_event(event: str, **fields):
@@ -27,15 +38,15 @@ class SlpSample:
     """One replay selected for video rendering."""
 
     id: int
-    hf_reference: str
+    reference: str
 
 
 @dataclass(frozen=True)
-class HfLocation:
-    """Repo and logical folders for raw and processed replay data."""
+class StorageLocation:
+    """Provider namespace and logical folders for raw and processed replay data."""
 
-    repo: str
-    hf: HfConnector
+    namespace: str
+    provider: StorageProvider
     root: str = ""
     raw_slp_dir: str = "raw_slp"
     recording_dir: str = "slp_with_video"
@@ -56,30 +67,26 @@ class SlpProducer:
     def __init__(
         self,
         queue: Queue[SlpSample | None],
-        hf_location: HfLocation,
+        location: StorageLocation,
         desired_max: int,
         skip_existing_processed: bool = False,
     ):
-        """Verify HF access and remember where raw SLP files live."""
+        """Verify storage access and remember where raw SLP files live."""
         self.queue = queue
-        self.hf_location = hf_location
+        self.location = location
         self.desired_max = desired_max
         self.skip_existing_processed = skip_existing_processed
-        self.hf_location.hf.create_repo(self.hf_location.repo)
+        self.location.provider.prepare(self.location.namespace)
         self.count = 0
         self.error: str | None = None
 
     def download(self):
-        """Read raw SLP references from HF and blockingly place SlpSample objects on the queue."""
+        """Read SLP references and blockingly place samples on the queue."""
         try:
-            raw_files = [
-                path
-                for path in self.hf_location.hf.list_files(
-                    self.hf_location.repo,
-                    self.hf_location.raw_slp_path(),
-                )
-                if path.endswith(".slp")
-            ]
+            raw_files = self.location.provider.list_slp_references(
+                self.location.namespace,
+                self.location.raw_slp_path(),
+            )
             processed_ids = self._processed_ids() if self.skip_existing_processed else set()
         except Exception as error:
             self.error = str(error)
@@ -87,19 +94,21 @@ class SlpProducer:
             return
         if processed_ids:
             log_event("existing_processed", count=len(processed_ids))
-        for sample_id, hf_reference in enumerate(sorted(raw_files)[: self.desired_max]):
+        for sample_id, reference in enumerate(sorted(raw_files)):
             if sample_id in processed_ids:
                 continue
-            sample = SlpSample(id=sample_id, hf_reference=hf_reference)
+            sample = SlpSample(id=sample_id, reference=reference)
             self.queue.put(sample, block=True)
             self.count += 1
-            log_event("added", sample=sample.id, source=sample.hf_reference)
+            log_event("added", sample=sample.id, source=sample.reference)
+            if self.count >= self.desired_max:
+                break
         log_event("producer_done", count=self.count)
 
     def _processed_ids(self) -> set[int]:
-        prefix = self.hf_location._join(self.hf_location.root, self.hf_location.recording_dir)
+        prefix = self.location._join(self.location.root, self.location.recording_dir)
         seen: dict[int, set[str]] = {}
-        for path in self.hf_location.hf.list_files(self.hf_location.repo, prefix):
+        for path in self.location.provider.list_files(self.location.namespace, prefix):
             suffix = path.removeprefix(prefix).strip("/")
             sample_id, _, filename = suffix.partition("/")
             if sample_id.isdigit():
@@ -109,19 +118,25 @@ class SlpProducer:
                     flags.add("slp")
                 if lower.endswith(_VIDEO_SUFFIXES):
                     flags.add("video")
-        return {sample_id for sample_id, flags in seen.items() if {"slp", "video"} <= flags}
+                if lower.endswith("metadata.json"):
+                    flags.add("metadata")
+        return {
+            sample_id
+            for sample_id, flags in seen.items()
+            if {"slp", "video", "metadata"} <= flags
+        }
 
 
 class FrameRecorder:
     def __init__(
         self,
         queue: Queue[SlpSample | None],
-        hf_location: HfLocation,
+        location: StorageLocation,
         runpod: RunpodConnector,
     ):
         """Create a GPU worker capable of rendering replay video."""
         self.queue = queue
-        self.hf_location = hf_location
+        self.location = location
         self.runpod = runpod
         self.results: list[dict] = []
         self.errors: list[dict] = []
@@ -134,7 +149,7 @@ class FrameRecorder:
         worker = self.runpod.create_instance()
         try:
             self.worker = self.runpod.wait_for_ssh(worker)
-            self.prepare_result = self.runpod.prepare_instance(self.worker)
+            self.prepare_result = self.runpod.prepare_instance(self.worker, self.location)
             log_event("recorder_ready", podId=self.worker.id)
         except Exception:
             self.runpod.delete_instance(worker)
@@ -191,10 +206,10 @@ class FrameRecorder:
             self.closed = True
 
     def _record_one(self, sample: SlpSample) -> dict:
-        render = self.runpod.record_video(self.worker, sample, self.hf_location)
+        render = self.runpod.record_video(self.worker, sample, self.location)
         return {
             "sample": sample.id,
-            "source": sample.hf_reference,
+            "source": sample.reference,
             "podId": self.worker.id,
             "prepare": self.prepare_result,
             "render": render,
@@ -254,7 +269,7 @@ class FrameRecorder:
         results = [result for _, result in items]
         for attempt in range(1, self.runpod.upload_retries + 1):
             try:
-                upload = self.runpod.upload_recorded_videos(self.worker, self.hf_location, samples)
+                upload = self.runpod.upload_recorded_videos(self.worker, self.location, samples)
                 break
             except Exception as error:
                 log_event(
@@ -281,7 +296,7 @@ class FrameRecorder:
             self.errors.append(
                 {
                     "sample": getattr(sample, "id", None),
-                    "hfReference": getattr(sample, "hf_reference", None),
+                    "sourceReference": getattr(sample, "reference", None),
                     "podId": self.worker.id,
                     "error": str(error),
                     "phase": phase,

@@ -4,15 +4,15 @@ import threading
 import time
 from queue import Queue
 
-from .hf_connector import HfConnector
-from .models import FrameRecorder, HfLocation, SlpProducer, SlpSample, log_event
+from .gdrive_connector import GDriveConnector
+from .models import FrameRecorder, SlpProducer, SlpSample, StorageLocation, log_event
 from .runpod_connector import RunpodConnector
 
 
 class DatasetRunner:
     def __init__(
         self,
-        hf_location: HfLocation,
+        location: StorageLocation,
         runpod: RunpodConnector,
         desired_max: int,
         recorder_count: int,
@@ -24,11 +24,11 @@ class DatasetRunner:
         self.queue: Queue[SlpSample | None] = Queue(maxsize=1000)
         self.producer = SlpProducer(
             self.queue,
-            hf_location,
+            location,
             desired_max,
             skip_existing_processed=skip_existing_processed,
         )
-        self.hf_location = hf_location
+        self.location = location
         self.runpod = runpod
         self.recorder_count = recorder_count
         self.startup_retry_seconds = startup_retry_seconds
@@ -77,7 +77,7 @@ class DatasetRunner:
             attempt += 1
             recorder = None
             try:
-                recorder = FrameRecorder(self.queue, self.hf_location, self.runpod)
+                recorder = FrameRecorder(self.queue, self.location, self.runpod)
                 with self.lock:
                     self.recorders.append(recorder)
                 recorder.record()
@@ -97,16 +97,31 @@ class DatasetRunner:
 
 def build_runner() -> DatasetRunner:
     """Build the RunPod-backed dataset runner from environment."""
-    hf = HfConnector(expected_email=os.environ.get("SMASH_HF_EXPECTED_EMAIL"))
-    hf_location = HfLocation(
-        repo=os.environ["SMASH_HF_REPO"],
-        hf=hf,
-        root=os.environ.get("SMASH_HF_ROOT", ""),
-        raw_slp_dir=os.environ.get("SMASH_HF_RAW_SLP_DIR", "raw_slp"),
-        recording_dir=os.environ.get("SMASH_HF_RECORDING_DIR", "slp_with_video"),
-    )
+    provider_name = os.environ.get("SMASH_STORAGE_PROVIDER", "hf").lower()
+    if provider_name == "hf":
+        from .hf_connector import HfConnector
+
+        provider = HfConnector(expected_email=os.environ.get("SMASH_HF_EXPECTED_EMAIL"))
+        location = StorageLocation(
+            namespace=os.environ["SMASH_HF_REPO"],
+            provider=provider,
+            root=os.environ.get("SMASH_HF_ROOT", ""),
+            raw_slp_dir=os.environ.get("SMASH_HF_RAW_SLP_DIR", "raw_slp"),
+            recording_dir=os.environ.get("SMASH_HF_RECORDING_DIR", "slp_with_video"),
+        )
+    elif provider_name in {"gdrive", "google_drive"}:
+        provider = GDriveConnector()
+        location = StorageLocation(
+            namespace=os.environ.get("SMASH_GDRIVE_REMOTE", "smash-drive"),
+            provider=provider,
+            root=os.environ.get("SMASH_GDRIVE_ROOT", ""),
+            raw_slp_dir=os.environ.get("SMASH_GDRIVE_RAW_SLP_DIR", ""),
+            recording_dir=os.environ.get("SMASH_GDRIVE_RECORDING_DIR", "slp_with_video"),
+        )
+    else:
+        raise ValueError(f"unsupported SMASH_STORAGE_PROVIDER: {provider_name}")
     return DatasetRunner(
-        hf_location=hf_location,
+        location=location,
         runpod=RunpodConnector(
             name_prefix=os.environ.get("SMASH_RUNPOD_NAME_PREFIX", "smash-core-worker")
         ),
