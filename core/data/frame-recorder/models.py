@@ -125,8 +125,11 @@ class FrameRecorder:
         self.runpod = runpod
         self.results: list[dict] = []
         self.errors: list[dict] = []
-        self.pending_uploads: list[SlpSample] = []
-        self.pending_results: list[dict] = []
+        self.convert_queue: Queue[tuple[SlpSample, dict] | None] = Queue(maxsize=1)
+        self.upload_queue: Queue[tuple[SlpSample, dict] | None] = Queue(
+            maxsize=runpod.upload_batch_size * 2
+        )
+        self.result_lock = threading.Lock()
         self.closed = False
         worker = self.runpod.create_instance()
         try:
@@ -139,30 +142,32 @@ class FrameRecorder:
             raise
 
     def record(self):
-        """Consume queued SLP samples, render videos, and write completed outputs back to HF."""
+        """Render while separate threads encode and upload earlier samples."""
+        converter = threading.Thread(
+            target=self._convert,
+            name=f"h264-converter-{self.worker.id}",
+        )
+        uploader = threading.Thread(
+            target=self._upload,
+            name=f"video-uploader-{self.worker.id}",
+        )
+        uploader.start()
+        converter.start()
         try:
             while True:
                 sample = self.queue.get(block=True)
                 try:
                     if sample is None:
-                        self._upload_pending()
-                        log_event("recorder_done", podId=self.worker.id)
-                        return
+                        break
                     log_event("picked", sample=sample.id, podId=self.worker.id)
                     result = self._record_one(sample)
-                    self.pending_uploads.append(sample)
-                    self.pending_results.append(result)
+                    self.convert_queue.put((sample, result), block=True)
                     log_event("rendered", sample=sample.id, podId=self.worker.id)
-                    if len(self.pending_uploads) >= self.runpod.upload_batch_size:
-                        self._upload_pending()
                 except Exception as error:
-                    self.errors.append(
-                        {
-                            "sample": getattr(sample, "id", None),
-                            "hfReference": getattr(sample, "hf_reference", None),
-                            "podId": self.worker.id,
-                            "error": str(error),
-                        }
+                    self._add_error(
+                        sample,
+                        error,
+                        phase="render",
                     )
                     log_event(
                         "failed",
@@ -173,6 +178,10 @@ class FrameRecorder:
                 finally:
                     self.queue.task_done()
         finally:
+            self.convert_queue.put(None, block=True)
+            converter.join()
+            uploader.join()
+            log_event("recorder_done", podId=self.worker.id)
             self.close()
 
     def close(self):
@@ -191,11 +200,58 @@ class FrameRecorder:
             "render": render,
         }
 
-    def _upload_pending(self):
-        if not self.pending_uploads:
+    def _convert(self):
+        while True:
+            item = self.convert_queue.get(block=True)
+            try:
+                if item is None:
+                    self.upload_queue.put(None, block=True)
+                    return
+                sample, result = item
+                conversion = self.runpod.convert_recorded_video(self.worker, sample)
+                result["conversion"] = conversion
+                self.upload_queue.put(item, block=True)
+                log_event(
+                    "converted",
+                    sample=sample.id,
+                    podId=self.worker.id,
+                    inputBytes=conversion["inputBytes"],
+                    outputBytes=conversion["outputBytes"],
+                )
+            except Exception as error:
+                sample = item[0] if item is not None else None
+                self._add_error(sample, error, phase="convert")
+                self.runpod.discard_recorded_videos(self.worker, [sample] if sample else [])
+                log_event(
+                    "failed",
+                    sample=getattr(sample, "id", None),
+                    podId=self.worker.id,
+                    phase="convert",
+                    error=str(error),
+                )
+            finally:
+                self.convert_queue.task_done()
+
+    def _upload(self):
+        pending: list[tuple[SlpSample, dict]] = []
+        while True:
+            item = self.upload_queue.get(block=True)
+            try:
+                if item is None:
+                    self._upload_batch(pending)
+                    return
+                pending.append(item)
+                if len(pending) >= self.runpod.upload_batch_size:
+                    self._upload_batch(pending)
+                    pending = []
+            finally:
+                self.upload_queue.task_done()
+
+    def _upload_batch(self, items: list[tuple[SlpSample, dict]]):
+        if not items:
             return
-        samples = list(self.pending_uploads)
-        results = list(self.pending_results)
+        samples = [sample for sample, _ in items]
+        results = [result for _, result in items]
         for attempt in range(1, self.runpod.upload_retries + 1):
             try:
                 upload = self.runpod.upload_recorded_videos(self.worker, self.hf_location, samples)
@@ -210,22 +266,24 @@ class FrameRecorder:
                 )
                 if attempt == self.runpod.upload_retries:
                     for failed_sample in samples:
-                        self.errors.append(
-                            {
-                                "sample": failed_sample.id,
-                                "hfReference": failed_sample.hf_reference,
-                                "podId": self.worker.id,
-                                "error": str(error),
-                                "phase": "upload",
-                            }
-                        )
-                    self.pending_uploads = []
-                    self.pending_results = []
-                    raise
+                        self._add_error(failed_sample, error, phase="upload")
+                    self.runpod.discard_recorded_videos(self.worker, samples)
+                    return
                 time.sleep(self.runpod.upload_retry_seconds * attempt)
-        self.pending_uploads = []
-        self.pending_results = []
-        self.results.extend(results)
+        with self.result_lock:
+            self.results.extend(results)
         log_event("uploaded_batch", podId=self.worker.id, count=len(samples), files=upload.get("files"))
         for sample in samples:
             log_event("completed", sample=sample.id, podId=self.worker.id)
+
+    def _add_error(self, sample: SlpSample | None, error: Exception, phase: str):
+        with self.result_lock:
+            self.errors.append(
+                {
+                    "sample": getattr(sample, "id", None),
+                    "hfReference": getattr(sample, "hf_reference", None),
+                    "podId": self.worker.id,
+                    "error": str(error),
+                    "phase": phase,
+                }
+            )

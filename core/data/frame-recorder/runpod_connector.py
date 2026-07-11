@@ -48,7 +48,7 @@ class RunpodConnector:
         ]
         self.container_registry_auth_id = os.environ.get("SMASH_RUNPOD_CONTAINER_REGISTRY_AUTH_ID")
         self.container_disk_gb = int(os.environ.get("SMASH_RUNPOD_CONTAINER_DISK_GB", "60"))
-        self.volume_gb = int(os.environ.get("SMASH_RUNPOD_VOLUME_GB", "30"))
+        self.volume_gb = int(os.environ.get("SMASH_RUNPOD_VOLUME_GB", "100"))
         self.volume_mount_path = os.environ.get("SMASH_RUNPOD_VOLUME_MOUNT_PATH", "/workspace")
         self.min_vcpu_per_gpu = int(os.environ.get("SMASH_RUNPOD_MIN_VCPU_PER_GPU", "6"))
         self.min_ram_per_gpu = int(os.environ.get("SMASH_RUNPOD_MIN_RAM_PER_GPU", "16"))
@@ -80,6 +80,7 @@ class RunpodConnector:
         self.internal_resolution_frame_dumps = os.environ.get("SMASH_VIDEO_INTERNAL_RESOLUTION_FRAME_DUMPS", "True")
         self.efb_scale = os.environ.get("SMASH_VIDEO_EFB_SCALE", "2")
         self.bitrate_kbps = os.environ.get("SMASH_VIDEO_BITRATE_KBPS", "2500")
+        self.h264_cq = os.environ.get("SMASH_H264_CQ", "18")
         self.upload_batch_size = max(1, int(os.environ.get("SMASH_UPLOAD_BATCH_SIZE", "10")))
         self.upload_retries = max(1, int(os.environ.get("SMASH_UPLOAD_RETRIES", "5")))
         self.upload_retry_seconds = float(os.environ.get("SMASH_UPLOAD_RETRY_SECONDS", "10"))
@@ -138,6 +139,8 @@ class RunpodConnector:
         while time.monotonic() < deadline:
             pod = self._request("GET", f"/pods/{instance.id}")
             ready = self._instance(pod)
+            if ready.status in {"EXITED", "TERMINATED"}:
+                raise RuntimeError(f"RunPod pod {instance.id} stopped during initialization")
             if ready.ssh_host and ready.ssh_port:
                 try:
                     self._ssh(ready, "true")
@@ -225,6 +228,21 @@ class RunpodConnector:
         }
         result = self._ssh_script(instance, self._remote_upload_script(payload))
         return json.loads(result.stdout.strip().splitlines()[-1])
+
+    def convert_recorded_video(self, instance: RunpodInstance, sample: SlpSample) -> dict:
+        """Convert one completed raw recording to frame-complete H.264 on NVENC."""
+        payload = {
+            "recordingDir": f"/workspace/smash-core/{sample.id}/recording",
+            "cq": self.h264_cq,
+        }
+        result = self._ssh_script(instance, self._remote_convert_script(payload))
+        return json.loads(result.stdout.strip().splitlines()[-1])
+
+    def discard_recorded_videos(self, instance: RunpodInstance, samples: list[SlpSample]):
+        """Best-effort cleanup for recordings that cannot be uploaded."""
+        paths = [f"/workspace/smash-core/{sample.id}" for sample in samples]
+        if paths:
+            self._ssh(instance, "rm -rf " + " ".join(map(shlex.quote, paths)), check=False)
 
     def delete_instance(self, instance: RunpodInstance):
         """Delete one GPU pod."""
@@ -546,44 +564,48 @@ uploaded = []
 file_count = 0
 api = HfApi(token=config["token"])
 
-if len(config["jobs"]) == 1:
-    job = config["jobs"][0]
-    source = Path(job["recordingDir"])
-    if not source.exists():
-        raise FileNotFoundError(str(source))
-    target = "/".join(part.strip("/") for part in [config["target"], job["targetName"]] if part.strip("/"))
-    file_count = len([path for path in source.rglob("*") if path.is_file()])
-    retry_hf(
-        lambda: api.upload_folder(
-            repo_id=config["repo"],
-            repo_type="dataset",
-            token=config["token"],
-            folder_path=str(source),
-            path_in_repo=target,
-        ),
-        "upload",
-    )
-    uploaded.append(job["sample"])
-else:
-    for job in config["jobs"]:
+try:
+    if len(config["jobs"]) == 1:
+        job = config["jobs"][0]
         source = Path(job["recordingDir"])
         if not source.exists():
             raise FileNotFoundError(str(source))
-        target = batch_dir / job["targetName"]
-        shutil.copytree(source, target, copy_function=os.link)
+        target = "/".join(part.strip("/") for part in [config["target"], job["targetName"]] if part.strip("/"))
+        file_count = len([path for path in source.rglob("*") if path.is_file()])
+        retry_hf(
+            lambda: api.upload_folder(
+                repo_id=config["repo"],
+                repo_type="dataset",
+                token=config["token"],
+                folder_path=str(source),
+                path_in_repo=target,
+            ),
+            "upload",
+        )
         uploaded.append(job["sample"])
+    else:
+        for job in config["jobs"]:
+            source = Path(job["recordingDir"])
+            if not source.exists():
+                raise FileNotFoundError(str(source))
+            target = batch_dir / job["targetName"]
+            shutil.copytree(source, target, copy_function=os.link)
+            uploaded.append(job["sample"])
 
-    file_count = len([path for path in batch_dir.rglob("*") if path.is_file()])
-    retry_hf(
-        lambda: api.upload_folder(
-            repo_id=config["repo"],
-            repo_type="dataset",
-            token=config["token"],
-            folder_path=str(batch_dir),
-            path_in_repo=config["target"],
-        ),
-        "upload",
-    )
+        file_count = len([path for path in batch_dir.rglob("*") if path.is_file()])
+        retry_hf(
+            lambda: api.upload_folder(
+                repo_id=config["repo"],
+                repo_type="dataset",
+                token=config["token"],
+                folder_path=str(batch_dir),
+                path_in_repo=config["target"],
+            ),
+            "upload",
+        )
+except Exception:
+    shutil.rmtree(batch_dir, ignore_errors=True)
+    raise
 
 for job in config["jobs"]:
     shutil.rmtree(job["workDir"], ignore_errors=True)
@@ -592,6 +614,127 @@ print(json.dumps({{
     "uploadedTo": config["target"],
     "samples": uploaded,
     "files": file_count,
+}}))
+""".strip()
+
+    def _remote_convert_script(self, payload: dict) -> str:
+        config_json = json.dumps(json.dumps(payload))
+        return f"""
+import json
+import os
+import subprocess
+from pathlib import Path
+
+
+def probe(path):
+    completed = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-count_frames",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,nb_read_frames,avg_frame_rate,width,height",
+            "-of",
+            "json",
+            str(path),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode:
+        raise RuntimeError(completed.stderr.strip())
+    stream = json.loads(completed.stdout)["streams"][0]
+    frames = stream.get("nb_read_frames")
+    if not frames or frames == "N/A":
+        raise RuntimeError(f"ffprobe could not count frames in {{path}}")
+    stream["frames"] = int(frames)
+    return stream
+
+
+config = json.loads({config_json})
+recording_dir = Path(config["recordingDir"])
+sources = [
+    path
+    for path in recording_dir.glob("video.*")
+    if path.suffix.lower() in {{".avi", ".mkv", ".mov", ".nut"}}
+]
+if len(sources) != 1:
+    raise RuntimeError(f"expected one raw video in {{recording_dir}}, found {{len(sources)}}")
+
+source = sources[0]
+target = recording_dir / "video.mp4"
+temporary = recording_dir / "video.partial.mp4"
+temporary.unlink(missing_ok=True)
+source_probe = probe(source)
+command = [
+    "ffmpeg",
+    "-y",
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-i",
+    str(source),
+    "-map",
+    "0:v:0",
+    "-an",
+    "-vsync",
+    "0",
+    "-c:v",
+    "h264_nvenc",
+    "-preset",
+    "p5",
+    "-tune",
+    "hq",
+    "-rc",
+    "vbr",
+    "-cq",
+    str(config["cq"]),
+    "-b:v",
+    "0",
+    "-g",
+    "120",
+    "-bf",
+    "3",
+    "-pix_fmt",
+    "yuv420p",
+    "-movflags",
+    "+faststart",
+    str(temporary),
+]
+completed = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+if completed.returncode:
+    temporary.unlink(missing_ok=True)
+    raise RuntimeError(completed.stderr.strip())
+
+output_probe = probe(temporary)
+input_bytes = source.stat().st_size
+output_bytes = temporary.stat().st_size
+if output_probe["codec_name"] != "h264":
+    raise RuntimeError(f"expected h264 output, got {{output_probe['codec_name']}}")
+if output_probe["frames"] != source_probe["frames"]:
+    raise RuntimeError(
+        f"frame count changed: {{source_probe['frames']}} -> {{output_probe['frames']}}"
+    )
+if output_bytes >= input_bytes:
+    raise RuntimeError(f"compressed video is not smaller: {{input_bytes}} -> {{output_bytes}}")
+
+os.replace(temporary, target)
+source.unlink()
+print(json.dumps({{
+    "video": str(target),
+    "codec": output_probe["codec_name"],
+    "frames": output_probe["frames"],
+    "frameRate": output_probe["avg_frame_rate"],
+    "width": output_probe["width"],
+    "height": output_probe["height"],
+    "inputBytes": input_bytes,
+    "outputBytes": output_bytes,
+    "ratio": round(input_bytes / output_bytes, 3),
 }}))
 """.strip()
 
