@@ -7,6 +7,8 @@ from huggingface_hub import HfApi, hf_hub_download
 
 
 class HfConnector:
+    kind = "hf"
+
     def __init__(self, token: str | None = None, expected_email: str | None = None):
         """Verify HF access and fail if the token belongs to the wrong account."""
         self.token = token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
@@ -34,6 +36,20 @@ class HfConnector:
         result = str(self.api.create_repo(repo, repo_type="dataset", private=private, exist_ok=True))
         self.set_repo_private(repo, private)
         return result
+
+    def prepare(self, namespace: str) -> None:
+        """Ensure the target dataset exists."""
+        self.create_repo(namespace)
+
+    def list_slp_references(self, namespace: str, folder: str = "") -> list[str]:
+        """Return loose SLP paths from one dataset folder."""
+        return [path for path in self.list_files(namespace, folder) if path.lower().endswith(".slp")]
+
+    def worker_config(self, namespace: str) -> dict:
+        """Return the minimal pod-side HF configuration."""
+        if not self.token:
+            raise ValueError("HF_TOKEN is required for pod-side download/upload")
+        return {"kind": self.kind, "repo": namespace, "token": self.token}
 
     def set_repo_private(self, repo: str, private: bool) -> None:
         """Set dataset visibility for repos that already existed."""

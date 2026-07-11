@@ -77,6 +77,13 @@ RUN rm -rf build/Binaries/Sys && \
     grep -q '\$Required: Slippi Playback' build/Binaries/Sys/GameSettings/GALE01r2.ini && \
     touch build/Binaries/portable.txt
 
+FROM node:22-bookworm-slim AS metadata
+
+WORKDIR /opt/slippi-renderer
+COPY package.json pnpm-lock.yaml ./
+RUN corepack enable && pnpm install --prod --frozen-lockfile
+COPY docker/slippi-renderer/extract-slp-metadata.mjs ./
+
 FROM ubuntu:22.04 AS runtime
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -111,17 +118,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     mesa-utils \
     openssh-server \
     python3 \
+    rclone \
     libportaudio2 \
     rsync \
     vulkan-tools \
+    zstd \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/slippi
 COPY --from=builder /opt/slippi-src/Ishiiruka/build/Binaries/ /opt/slippi/
 COPY --from=builder /opt/slippi-src/Ishiiruka/build/Source/Core/DolphinWX/libslippi_rust_extensions.so /opt/slippi/
+COPY --from=metadata /usr/local/bin/node /usr/local/bin/node
+COPY --from=metadata /opt/slippi-renderer /opt/slippi-renderer
 COPY fast_replay_probe/render-ffv1-replay.sh /opt/slippi-renderer/render-ffv1-replay.sh
 COPY docker/scripts/start-runpod-worker.sh /opt/slippi-renderer/start-runpod-worker.sh
-RUN chmod +x /opt/slippi-renderer/render-ffv1-replay.sh /opt/slippi-renderer/start-runpod-worker.sh && \
+RUN chmod +x \
+      /opt/slippi-renderer/extract-slp-metadata.mjs \
+      /opt/slippi-renderer/render-ffv1-replay.sh \
+      /opt/slippi-renderer/start-runpod-worker.sh && \
     test -x /opt/slippi/dolphin-emu-nogui && \
     grep -q '\$Required: Slippi Playback' /opt/slippi/Sys/GameSettings/GALE01r2.ini
 

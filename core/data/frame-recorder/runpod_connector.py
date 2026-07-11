@@ -8,7 +8,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from .models import HfLocation, SlpSample
+from .models import SlpSample, StorageLocation
 
 
 @dataclass(frozen=True)
@@ -61,6 +61,10 @@ class RunpodConnector:
             "SMASH_RUNPOD_RENDERER_COMMAND",
             "/opt/slippi-renderer/render-ffv1-replay.sh",
         )
+        self.metadata_extractor = os.environ.get(
+            "SMASH_SLP_METADATA_EXTRACTOR",
+            "/opt/slippi-renderer/extract-slp-metadata.mjs",
+        )
         self._reject_partial_recording_env()
         self.ssh_private_key = os.environ.get(
             "RUNPOD_SSH_PRIVATE_KEY",
@@ -81,7 +85,7 @@ class RunpodConnector:
         self.efb_scale = os.environ.get("SMASH_VIDEO_EFB_SCALE", "2")
         self.bitrate_kbps = os.environ.get("SMASH_VIDEO_BITRATE_KBPS", "2500")
         self.h264_cq = os.environ.get("SMASH_H264_CQ", "18")
-        self.upload_batch_size = max(1, int(os.environ.get("SMASH_UPLOAD_BATCH_SIZE", "10")))
+        self.upload_batch_size = max(1, int(os.environ.get("SMASH_UPLOAD_BATCH_SIZE", "1")))
         self.upload_retries = max(1, int(os.environ.get("SMASH_UPLOAD_RETRIES", "5")))
         self.upload_retry_seconds = float(os.environ.get("SMASH_UPLOAD_RETRY_SECONDS", "10"))
 
@@ -150,9 +154,20 @@ class RunpodConnector:
             time.sleep(5)
         raise TimeoutError(f"RunPod pod {instance.id} did not expose SSH")
 
-    def prepare_instance(self, instance: RunpodInstance):
-        """Prepare one worker for HF-backed video rendering."""
-        self._ensure_hf_tools(instance)
+    def prepare_instance(self, instance: RunpodInstance, location: StorageLocation):
+        """Prepare one worker for rendering and its selected storage provider."""
+        storage = location.provider.worker_config(location.namespace)
+        if storage["kind"] == "hf":
+            self._ensure_hf_tools(instance)
+        elif storage["kind"] == "gdrive":
+            self._ensure_gdrive_tools(instance)
+            config_path = Path(location.provider.config_path)
+            self._ssh(instance, "mkdir -p /root/.config/rclone")
+            self._rsync(instance, str(config_path), storage["config"])
+            self._ssh(instance, f"chmod 600 {shlex.quote(storage['config'])}")
+        else:
+            raise ValueError(f"unsupported storage provider: {storage['kind']}")
+        self._ssh(instance, f"test -x {shlex.quote(self.metadata_extractor)}")
         if not self.local_iso or not Path(self.local_iso).exists():
             raise FileNotFoundError(f"missing local ISO: {self.local_iso}")
         local_size = Path(self.local_iso).expanduser().stat().st_size
@@ -161,29 +176,27 @@ class RunpodConnector:
             f"stat -c%s {shlex.quote(self.remote_iso)} 2>/dev/null || true",
         ).stdout.strip()
         if remote_size == str(local_size):
-            return {"status": "exists", "remoteIso": self.remote_iso}
+            return {"status": "exists", "remoteIso": self.remote_iso, "storage": storage["kind"]}
         self._ssh(instance, f"mkdir -p {shlex.quote(str(Path(self.remote_iso).parent))}")
         self._rsync(instance, str(Path(self.local_iso).expanduser()), self.remote_iso)
-        return {"status": "uploaded", "remoteIso": self.remote_iso}
+        return {"status": "uploaded", "remoteIso": self.remote_iso, "storage": storage["kind"]}
 
     def record_video(
         self,
         instance: RunpodInstance,
         sample: SlpSample,
-        hf_location: HfLocation,
+        location: StorageLocation,
     ) -> dict:
         """Download one SLP on the pod and render the complete replay to video."""
-        if not hf_location.hf.token:
-            raise ValueError("HF_TOKEN is required for pod-side download/upload")
         remote_dir = f"/workspace/smash-core/{sample.id}"
         payload = {
-            "token": hf_location.hf.token,
-            "repo": hf_location.repo,
-            "source": sample.hf_reference,
-            "target": hf_location.recording_path(sample),
+            "storage": location.provider.worker_config(location.namespace),
+            "source": sample.reference,
+            "target": location.recording_path(sample),
             "workDir": remote_dir,
             "commandId": f"slp-{sample.id}",
             "renderer": self.renderer,
+            "metadataExtractor": self.metadata_extractor,
             "iso": self.remote_iso,
             "timeoutSeconds": self.render_timeout_seconds,
             "videoBackend": self.video_backend,
@@ -205,16 +218,15 @@ class RunpodConnector:
     def upload_recorded_videos(
         self,
         instance: RunpodInstance,
-        hf_location: HfLocation,
+        location: StorageLocation,
         samples: list[SlpSample],
     ) -> dict:
-        """Upload a batch of already-rendered sample video folders to HF."""
+        """Upload a batch of completed recording folders to storage."""
         if not samples:
             return {"samples": [], "files": 0}
         payload = {
-            "token": hf_location.hf.token,
-            "repo": hf_location.repo,
-            "target": hf_location._join(hf_location.root, hf_location.recording_dir),
+            "storage": location.provider.worker_config(location.namespace),
+            "target": location._join(location.root, location.recording_dir),
             "batchDir": f"/workspace/smash-core/upload-{time.time_ns()}",
             "jobs": [
                 {
@@ -274,9 +286,21 @@ class RunpodConnector:
             "python3 -m pip install 'huggingface_hub>=1.0.0'",
         )
 
+    def _ensure_gdrive_tools(self, instance: RunpodInstance):
+        check = self._ssh(instance, "command -v rclone && command -v zstd", check=False)
+        if check.returncode == 0:
+            return
+        self._ssh(
+            instance,
+            "apt-get update && "
+            "apt-get install -y --no-install-recommends ca-certificates curl unzip zstd && "
+            "curl -fsSL https://rclone.org/install.sh | bash",
+        )
+
     def _remote_record_script(self, payload: dict) -> str:
         config_json = json.dumps(json.dumps(payload))
         return f"""
+import hashlib
 import json
 import os
 import shutil
@@ -396,8 +420,70 @@ def download_hf_file(repo, filename, token, target):
     temp.replace(target)
     return target
 
+
+def download_drive_file(storage, filename, target):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    remote = storage["remote"].rstrip(":") + ":" + filename.strip("/")
+    command = [
+        "rclone",
+        "copyto",
+        remote,
+        str(target),
+        "--config",
+        storage["config"],
+        "--multi-thread-streams",
+        "16",
+        "--retries",
+        "10",
+        "--low-level-retries",
+        "20",
+    ]
+    completed = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if completed.returncode:
+        raise RuntimeError(completed.stderr.strip() or completed.stdout.strip())
+    return target
+
+
+def download_storage_file(storage, filename, target):
+    if storage["kind"] == "hf":
+        return retry_hf(
+            lambda: download_hf_file(storage["repo"], filename, storage["token"], target),
+            "download",
+        )
+    if storage["kind"] == "gdrive":
+        return download_drive_file(storage, filename, target)
+    raise ValueError("unsupported storage provider: " + storage["kind"])
+
+
+def materialize_slp(storage, reference, work_dir):
+    archive, separator, member = reference.partition("::")
+    if not separator:
+        return download_storage_file(storage, reference, work_dir / "download" / Path(reference).name)
+    member_path = Path(member)
+    if member_path.is_absolute() or ".." in member_path.parts or not member.lower().endswith(".slp"):
+        raise ValueError("invalid SLP archive member: " + member)
+    cache_dir = Path("/workspace/smash-core/source-cache")
+    cache_name = hashlib.sha1(archive.encode()).hexdigest()[:12] + "-" + Path(archive).name
+    cached_archive = cache_dir / cache_name
+    if not cached_archive.exists():
+        download_storage_file(storage, archive, cached_archive)
+    target = work_dir / "download" / member_path.name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    with temporary.open("wb") as output:
+        completed = subprocess.run(
+            ["tar", "--zstd", "-xOf", str(cached_archive), member],
+            stdout=output,
+            stderr=subprocess.PIPE,
+        )
+    if completed.returncode:
+        temporary.unlink(missing_ok=True)
+        raise RuntimeError(completed.stderr.decode(errors="replace").strip())
+    temporary.replace(target)
+    return target
+
 config = json.loads({config_json})
-token = config["token"]
+storage = config["storage"]
 work_dir = Path(config["workDir"])
 download_dir = work_dir / "download"
 render_dir = work_dir / "render"
@@ -410,12 +496,26 @@ work_dir.mkdir(parents=True, exist_ok=True)
 render_dir.mkdir(parents=True, exist_ok=True)
 recording_dir.mkdir(parents=True, exist_ok=True)
 
-downloaded = retry_hf(
-    lambda: download_hf_file(config["repo"], config["source"], token, download_dir / Path(config["source"]).name),
-    "download",
-)
+downloaded = materialize_slp(storage, config["source"], work_dir)
 shutil.copyfile(downloaded, slp_path)
 shutil.copyfile(slp_path, recording_dir / "input.slp")
+
+metadata_path = recording_dir / "metadata.json"
+metadata = subprocess.run(
+    [
+        config["metadataExtractor"],
+        str(slp_path),
+        str(metadata_path),
+        config["source"],
+        storage["kind"],
+    ],
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+)
+if metadata.returncode or not metadata_path.exists():
+    raise RuntimeError(metadata.stderr.strip() or metadata.stdout.strip() or "metadata extraction failed")
+json.loads(metadata_path.read_text())
 
 first_frame, last_frame = slp_frame_range(slp_path)
 playback = {{
@@ -527,13 +627,11 @@ print(json.dumps(summary))
 import json
 import os
 import shutil
+import subprocess
 import time
 from pathlib import Path
 
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
-
-from huggingface_hub import HfApi
-
 
 def retry_hf(action, label):
     for attempt in range(1, 7):
@@ -554,7 +652,54 @@ def retry_hf(action, label):
             print("[hf-rate-limit]", label, "attempt", attempt, "sleep", sleep_seconds, flush=True)
             time.sleep(sleep_seconds)
 
+
+def upload_folder(storage, source, target):
+    if storage["kind"] == "hf":
+        from huggingface_hub import HfApi
+
+        api = HfApi(token=storage["token"])
+        return retry_hf(
+            lambda: api.upload_folder(
+                repo_id=storage["repo"],
+                repo_type="dataset",
+                token=storage["token"],
+                folder_path=str(source),
+                path_in_repo=target,
+            ),
+            "upload",
+        )
+    if storage["kind"] == "gdrive":
+        remote = storage["remote"].rstrip(":") + ":" + target.strip("/")
+        completed = subprocess.run(
+            [
+                "rclone",
+                "copy",
+                str(source),
+                remote,
+                "--config",
+                storage["config"],
+                "--transfers",
+                "3",
+                "--checkers",
+                "6",
+                "--drive-chunk-size",
+                "128M",
+                "--retries",
+                "10",
+                "--low-level-retries",
+                "20",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if completed.returncode:
+            raise RuntimeError(completed.stderr.strip() or completed.stdout.strip())
+        return
+    raise ValueError("unsupported storage provider: " + storage["kind"])
+
 config = json.loads({config_json})
+storage = config["storage"]
 batch_dir = Path(config["batchDir"])
 if batch_dir.exists():
     shutil.rmtree(batch_dir)
@@ -562,7 +707,6 @@ batch_dir.mkdir(parents=True)
 
 uploaded = []
 file_count = 0
-api = HfApi(token=config["token"])
 
 try:
     if len(config["jobs"]) == 1:
@@ -572,16 +716,7 @@ try:
             raise FileNotFoundError(str(source))
         target = "/".join(part.strip("/") for part in [config["target"], job["targetName"]] if part.strip("/"))
         file_count = len([path for path in source.rglob("*") if path.is_file()])
-        retry_hf(
-            lambda: api.upload_folder(
-                repo_id=config["repo"],
-                repo_type="dataset",
-                token=config["token"],
-                folder_path=str(source),
-                path_in_repo=target,
-            ),
-            "upload",
-        )
+        upload_folder(storage, source, target)
         uploaded.append(job["sample"])
     else:
         for job in config["jobs"]:
@@ -593,16 +728,7 @@ try:
             uploaded.append(job["sample"])
 
         file_count = len([path for path in batch_dir.rglob("*") if path.is_file()])
-        retry_hf(
-            lambda: api.upload_folder(
-                repo_id=config["repo"],
-                repo_type="dataset",
-                token=config["token"],
-                folder_path=str(batch_dir),
-                path_in_repo=config["target"],
-            ),
-            "upload",
-        )
+        upload_folder(storage, batch_dir, config["target"])
 except Exception:
     shutil.rmtree(batch_dir, ignore_errors=True)
     raise
@@ -725,8 +851,9 @@ if output_bytes >= input_bytes:
 
 os.replace(temporary, target)
 source.unlink()
-print(json.dumps({{
+result = {{
     "video": str(target),
+    "container": "mp4",
     "codec": output_probe["codec_name"],
     "frames": output_probe["frames"],
     "frameRate": output_probe["avg_frame_rate"],
@@ -735,7 +862,15 @@ print(json.dumps({{
     "inputBytes": input_bytes,
     "outputBytes": output_bytes,
     "ratio": round(input_bytes / output_bytes, 3),
-}}))
+}}
+metadata_path = recording_dir / "metadata.json"
+metadata = json.loads(metadata_path.read_text())
+video_metadata = dict(result)
+video_metadata["file"] = target.name
+video_metadata.pop("video")
+metadata["video"] = video_metadata
+metadata_path.write_text(json.dumps(metadata, indent=2) + "\\n")
+print(json.dumps(result))
 """.strip()
 
     def _ssh_script(self, instance: RunpodInstance, script: str):
