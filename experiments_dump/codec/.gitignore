@@ -1,0 +1,5 @@
+__pycache__/
+.torch-cache/
+checkpoints/
+dinov3/
+outputs/

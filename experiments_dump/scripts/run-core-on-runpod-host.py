@@ -401,7 +401,7 @@ def parser() -> argparse.ArgumentParser:
     arg_parser.add_argument("--worker-cloud-types", default="SECURE")
     arg_parser.add_argument("--worker-min-vcpu-per-gpu", type=int, default=6)
     arg_parser.add_argument("--worker-disk-gb", type=int, default=60)
-    arg_parser.add_argument("--worker-volume-gb", type=int, default=30)
+    arg_parser.add_argument("--worker-volume-gb", type=int, default=100)
     arg_parser.add_argument("--cpu-flavor", action="append", default=["cpu3c"])
     arg_parser.add_argument("--cloud-type", default="COMMUNITY")
     arg_parser.add_argument("--iso", default=DEFAULT_ISO)
