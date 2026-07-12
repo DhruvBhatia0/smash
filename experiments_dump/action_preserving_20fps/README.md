@@ -135,6 +135,8 @@ output streams had the same SHA-256 (`17e7ce51...3485c1`).
 - `binning.test.mjs`: synthetic pulse/order/endpoint/error tests.
 - `video.test.sh`: synthetic non-grid-tail frame-count and decoded-pixel hash test.
 - `SCHEMA.md`: precise JSONL contract and training guidance.
+- `ONLINE_60HZ_INPUT_20HZ_MODEL.md`: online controller polling, action-token alignment, and latency
+  contract.
 - `realtime-playable-summary.json`: small reproducible result record; large generated JSONL files
   are ignored under `runs/`.
 
