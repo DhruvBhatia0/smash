@@ -1,0 +1,154 @@
+diff --git a/Source/Core/VideoBackends/OGL/Render.cpp b/Source/Core/VideoBackends/OGL/Render.cpp
+index e6c3715..ce36de6 100644
+--- a/Source/Core/VideoBackends/OGL/Render.cpp
++++ b/Source/Core/VideoBackends/OGL/Render.cpp
+@@ -5,6 +5,7 @@
+ #include <algorithm>
+ #include <cinttypes>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstdio>
+ #include <memory>
+ #include <string>
+@@ -21,6 +22,7 @@
+ #include "Common/StringUtil.h"
+ 
+ #include "Core/Core.h"
++#include "Core/ConfigManager.h"
+ 
+ #include "VideoBackends/OGL/BoundingBox.h"
+ #include "VideoBackends/OGL/FramebufferManager.h"
+@@ -66,6 +68,16 @@ static u32 s_blendMode;
+ 
+ static bool s_vsync;
+ 
++static bool IsDumpOnlyModeEnabled()
++{
++#ifdef IS_PLAYBACK
++	const char* value = std::getenv("SLIPPI_DUMP_ONLY");
++	return value && value[0] != '\0' && value[0] != '0';
++#else
++	return false;
++#endif
++}
++
+ // EFB cache related
+ static const u32 EFB_CACHE_RECT_SIZE = 64;  // Cache 64x64 blocks.
+ static const u32 EFB_CACHE_WIDTH =
+@@ -1430,19 +1442,26 @@ void Renderer::SwapImpl(u32 xfbAddr, u32 fbWidth, u32 fbStride, u32 fbHeight,
+ 	// Flip top and bottom for some reason; TODO: Fix the code to suck less?
+ 	std::swap(flipped_trc.top, flipped_trc.bottom);
+ 
+-	// Copy the framebuffer to screen.	
++	const bool dump_only = IsDumpOnlyModeEnabled() && SConfig::GetInstance().m_DumpFrames &&
++		g_ActiveConfig.bInternalResolutionFrameDumps;
++
++	// In offline dump-only mode the window is not an output. Render the final image exactly once
++	// into the existing dump FBO below instead of first drawing it to the default framebuffer.
+ 	const TargetSize dst_size = {m_backbuffer_width, m_backbuffer_height};
+-	DrawFrame(flipped_trc, rc, xfbAddr, xfbSourceList, xfbCount, 0, dst_size, fbWidth, fbStride, fbHeight, Gamma);
++	if (!dump_only)
++		DrawFrame(flipped_trc, rc, xfbAddr, xfbSourceList, xfbCount, 0, dst_size, fbWidth,
++			fbStride, fbHeight, Gamma);
+ 
+ 	// The FlushFrameDump call here is necessary even after frame dumping is stopped.
+ 	// If left out, screenshots are "one frame" behind, as an extra frame is dumped and buffered.
+ 	FlushFrameDump();
+-	if (IsFrameDumping())
++	const bool frame_dumping = IsFrameDumping();
++	if (frame_dumping)
+ 	{
+ 		// Currently, we only use the off-screen buffer as a frame dump source if full-resolution
+ 		// frame dumping is enabled, saving the need for an extra copy. In the future, this could
+ 		// be extended to be used for surfaceless contexts as well.
+-		bool use_offscreen_buffer = g_ActiveConfig.bInternalResolutionFrameDumps;
++		bool use_offscreen_buffer = dump_only || g_ActiveConfig.bInternalResolutionFrameDumps;
+ 		if (use_offscreen_buffer)
+ 		{
+ 			// DumpFrameUsingFBO resets GL_FRAMEBUFFER, so change back to the window for drawing OSD.
+@@ -1526,18 +1545,21 @@ void Renderer::SwapImpl(u32 xfbAddr, u32 fbWidth, u32 fbStride, u32 fbHeight,
+ 		}
+ 	}
+ 
+-	// ---------------------------------------------------------------------
+-	glEnable(GL_BLEND);
+-	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++	if (!dump_only)
++	{
++		// ---------------------------------------------------------------------
++		glEnable(GL_BLEND);
++		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+ 
+-	// Reset viewport for drawing text
+-	glViewport(0, 0, GLInterface->GetBackBufferWidth(), GLInterface->GetBackBufferHeight());
++		// Reset viewport for drawing text
++		glViewport(0, 0, GLInterface->GetBackBufferWidth(), GLInterface->GetBackBufferHeight());
+ 
+-	DrawDebugText();
++		DrawDebugText();
+ 
+-	// Do our OSD callbacks
+-	OSD::DoCallbacks(OSD::CallbackType::OnFrame);
+-	OSD::DrawMessages();
++		// Do our OSD callbacks
++		OSD::DoCallbacks(OSD::CallbackType::OnFrame);
++		OSD::DrawMessages();
++	}
+ 
+ #ifdef ANDROID
+ 	if (s_surface_needs_change.IsSet())
+@@ -1550,12 +1572,21 @@ void Renderer::SwapImpl(u32 xfbAddr, u32 fbWidth, u32 fbStride, u32 fbHeight,
+ 	}
+ #endif
+ 
+-	// Copy the rendered frame to the real window
+-	GLInterface->Swap();
++	if (dump_only)
++	{
++		// Swap normally submits the GL command stream. A surfaceless dump has no window swap, so
++		// explicitly submit the FBO render/readback without waiting for it to finish.
++		glFlush();
++	}
++	else
++	{
++		// Copy the rendered frame to the real window
++		GLInterface->Swap();
+ 
+-	// Clear framebuffer
+-	glClearColor(0, 0, 0, 0);
+-	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
++		// Clear framebuffer
++		glClearColor(0, 0, 0, 0);
++		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
++	}
+ 
+ 	if (s_vsync != g_ActiveConfig.IsVSync())
+ 	{
+diff --git a/Source/Core/VideoBackends/OGL/main.cpp b/Source/Core/VideoBackends/OGL/main.cpp
+index 6a19b60..c39bb95 100644
+--- a/Source/Core/VideoBackends/OGL/main.cpp
++++ b/Source/Core/VideoBackends/OGL/main.cpp
+@@ -34,6 +34,7 @@ Make AA apply instantly during gameplay if possible
+ 
+ */
+ 
++#include <algorithm>
+ #include <memory>
+ #include <string>
+ #include <vector>
+@@ -146,6 +147,15 @@ bool VideoBackend::Initialize(void* window_handle)
+ 	if (!GLInterface->Create(window_handle))
+ 		return false;
+ 
++#if defined(USE_EGL) && defined(USE_HEADLESS)
++	// A surfaceless EGL context has no native window from which to discover dimensions. Keep the
++	// logical backbuffer explicit so fractional EFB scaling and dump-only output use the configured
++	// offline frame size instead of falling back to the renderer's 16x16 safety clamp.
++	const SConfig& config = SConfig::GetInstance();
++	GLInterface->SetBackBufferDimensions(std::max(config.iRenderWindowWidth, 16),
++		std::max(config.iRenderWindowHeight, 16));
++#endif
++
+ 	return true;
+ }
+ 

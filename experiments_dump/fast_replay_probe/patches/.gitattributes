@@ -1,0 +1,2 @@
+*.patch whitespace=-trailing-space,-space-before-tab
+**/*.patch whitespace=-trailing-space,-space-before-tab

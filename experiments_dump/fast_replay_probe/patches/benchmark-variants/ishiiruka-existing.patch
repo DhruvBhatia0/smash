@@ -1,0 +1,883 @@
+diff --git a/Source/Core/Core/CMakeLists.txt b/Source/Core/Core/CMakeLists.txt
+index f77ac48..2b209e0 100644
+--- a/Source/Core/Core/CMakeLists.txt
++++ b/Source/Core/Core/CMakeLists.txt
+@@ -198,11 +198,14 @@ set(SRCS	ActionReplay.cpp
+ 			Slippi/SlippiReplayComm.cpp
+ 			Slippi/SlippiSavestate.cpp
+ 			Slippi/SlippiSpectate.cpp
+-			Slippi/SlippiTimer.cpp
+ 			Slippi/SlippiUser.cpp
+ 			Slippi/SlippiDirectCodes.cpp
+ 			)
+ 
++if(NOT ENABLE_HEADLESS)
++	set(SRCS ${SRCS} Slippi/SlippiTimer.cpp)
++endif()
++
+ if(_M_X86)
+ 	set(SRCS ${SRCS}
+ 			PowerPC/Jit64IL/IR_X86.cpp
+@@ -271,7 +274,9 @@ if(LIBUSB_FOUND)
+ 					   	IPC_HLE/WII_IPC_HLE_Device_usb_bt_real.cpp)
+ endif(LIBUSB_FOUND)
+ 
+-set(LIBS ${LIBS} videovulkan)
++if(NOT ENABLE_HEADLESS)
++	set(LIBS ${LIBS} videovulkan)
++endif()
+ 
+ set(LIBS ${LIBS} ${MBEDTLS_LIBRARIES})
+ 
+diff --git a/Source/Core/Core/HW/EXI_DeviceSlippi.cpp b/Source/Core/Core/HW/EXI_DeviceSlippi.cpp
+index 4e39919..8f6468d 100644
+--- a/Source/Core/Core/HW/EXI_DeviceSlippi.cpp
++++ b/Source/Core/Core/HW/EXI_DeviceSlippi.cpp
+@@ -37,9 +37,11 @@
+ // #include "Core/PatchEngine.h"
+ #include "Core/PowerPC/PowerPC.h"
+ 
+-// Not clean but idk a better way atm
++// Not clean but idk a better way atm. Headless playback has no wx frame.
++#ifndef USE_HEADLESS
+ #include "DolphinWX/Frame.h"
+ #include "DolphinWX/Main.h"
++#endif
+ 
+ // The Rust library that houses a "shadow" EXI Device that we can call into.
+ #include "SlippiRustExtensions.h"
+@@ -2995,7 +2997,9 @@ void CEXISlippi::handleLogInRequest()
+ 	bool logInRes = user->AttemptLogin();
+ 	if (!logInRes)
+ 	{
++#ifndef USE_HEADLESS
+ 		main_frame->LowerRenderWindow();
++#endif
+ 		user->OpenLogInPage();
+ 		user->ListenForLogIn();
+ 	}
+@@ -3009,7 +3013,7 @@ void CEXISlippi::handleLogOutRequest()
+ void CEXISlippi::handleUpdateAppRequest()
+ {
+ 	bool isUpdating = user->UpdateApp();
+-#ifdef _WIN32
++#if defined(_WIN32) && !defined(USE_HEADLESS)
+ 	if (isUpdating)
+ 	{
+ 		main_frame->LowerRenderWindow();
+diff --git a/Source/Core/DolphinWX/CMakeLists.txt b/Source/Core/DolphinWX/CMakeLists.txt
+index 90f9a87..d1c636b 100644
+--- a/Source/Core/DolphinWX/CMakeLists.txt
++++ b/Source/Core/DolphinWX/CMakeLists.txt
+@@ -79,7 +79,7 @@ set(GUI_SRCS
+ 	WXInputBase.cpp
+ 	WxUtils.cpp)
+ 
+-set(NOGUI_SRCS Main.cpp MainNoGUI.cpp)
++set(NOGUI_SRCS MainNoGUI.cpp)
+ 
+ if(USE_X11)
+ 	set(GUI_SRCS ${GUI_SRCS} X11Utils.cpp)
+@@ -140,7 +140,7 @@ if(wxWidgets_FOUND)
+ 	# (This doesn't feel perfect here, but truth be told I can't think offhand of
+ 	# a better location for it at the moment.)
+ 	set(RUST_FEATURES "")
+-	if(DIS_PLAYBACK)
++	if(IS_PLAYBACK)
+ 		set(RUST_FEATURES "playback")
+ 	endif()
+ 
+@@ -252,10 +252,23 @@ if(wxWidgets_FOUND)
+ endif()
+ 
+ # Only build -nogui binaries when ENABLE_HEADLESS is on
+-if(USE_X11 AND ENABLE_HEADLESS)
++if(ENABLE_HEADLESS)
+ 	set(DOLPHIN_NOGUI_EXE ${DOLPHIN_EXE_BASE}-nogui)
++	set(NOGUI_LIBS ${LIBS})
++	if(${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
++		list(APPEND NOGUI_LIBS dl)
++	endif()
+ 	add_executable(${DOLPHIN_NOGUI_EXE} ${SRCS} ${NOGUI_SRCS})
+-	target_link_libraries(${DOLPHIN_NOGUI_EXE} ${LIBS} ${WXLIBS})
++	target_link_libraries(${DOLPHIN_NOGUI_EXE} ${NOGUI_LIBS})
++
++	if(NOT TARGET slippi_rust_extensions)
++		set(RUST_FEATURES "")
++		if(IS_PLAYBACK)
++			set(RUST_FEATURES "playback")
++		endif()
++		corrosion_import_crate(MANIFEST_PATH ${CMAKE_SOURCE_DIR}/Externals/SlippiRustExtensions/Cargo.toml ${RUST_FEATURES})
++	endif()
++	target_link_libraries(${DOLPHIN_NOGUI_EXE} slippi_rust_extensions)
+ 	set(CPACK_PACKAGE_EXECUTABLES ${CPACK_PACKAGE_EXECUTABLES} ${DOLPHIN_NOGUI_EXE})
+ 	install(TARGETS ${DOLPHIN_NOGUI_EXE} RUNTIME DESTINATION ${bindir})
+ endif()
+diff --git a/Source/Core/DolphinWX/MainNoGUI.cpp b/Source/Core/DolphinWX/MainNoGUI.cpp
+index bb86bde..180e92d 100644
+--- a/Source/Core/DolphinWX/MainNoGUI.cpp
++++ b/Source/Core/DolphinWX/MainNoGUI.cpp
+@@ -8,6 +8,7 @@
+ #include <getopt.h>
+ #include <signal.h>
+ #include <string>
++#include <strings.h>
+ #include <thread>
+ #include <unistd.h>
+ 
+@@ -63,6 +64,9 @@ public:
+ 	{
+ 		while (s_running.IsSet())
+ 		{
++			if (s_shutdown_requested.TestAndClear())
++				s_running.Clear();
++
+ 			Core::HostDispatchJobs();
+ 			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+ 		}
+@@ -375,36 +379,94 @@ static Platform* GetPlatform()
+ 
+ int main(int argc, char* argv[])
+ {
+-	int ch, help = 0;
+-	struct option longopts[] = { { "exec", no_argument, nullptr, 'e' },
++	int ch, help = 0, show_version = 0;
++	std::string boot_path;
++	std::string user_path;
++	std::string video_backend;
++	std::string slippi_input;
++	std::string output_directory;
++	std::string output_filename_base;
++	std::string audio_emulation;
++	bool hide_seekbar = false;
++	bool enable_cout = false;
++	struct option longopts[] = {
++	{ "exec", required_argument, nullptr, 'e' },
+ 	{ "help", no_argument, nullptr, 'h' },
+-	{ "version", no_argument, nullptr, 'v' },
++	{ "version", no_argument, nullptr, 1000 },
++	{ "video_backend", required_argument, nullptr, 'v' },
++	{ "user", required_argument, nullptr, 'u' },
++	{ "slippi-input", required_argument, nullptr, 'i' },
++	{ "hide-seekbar", no_argument, nullptr, 1001 },
++	{ "cout", no_argument, nullptr, 1002 },
++	{ "batch", no_argument, nullptr, 'b' },
++	{ "output-directory", required_argument, nullptr, 1003 },
++	{ "output-filename-base", required_argument, nullptr, 'o' },
++	{ "audio_emulation", required_argument, nullptr, 'a' },
+ 	{ nullptr, 0, nullptr, 0 } };
+ 
+-	while ((ch = getopt_long(argc, argv, "eh?v", longopts, 0)) != -1)
++	while ((ch = getopt_long(argc, argv, "e:h?v:u:i:bo:a:", longopts, 0)) != -1)
+ 	{
+ 		switch (ch)
+ 		{
+ 		case 'e':
++			boot_path = optarg;
+ 			break;
+ 		case 'h':
+ 		case '?':
+ 			help = 1;
+ 			break;
+ 		case 'v':
+-			fprintf(stderr, "%s\n", scm_rev_str.c_str());
+-			return 1;
++			video_backend = optarg;
++			break;
++		case 'u':
++			user_path = optarg;
++			break;
++		case 'i':
++			slippi_input = optarg;
++			break;
++		case 'b':
++			break;
++		case 'o':
++			output_filename_base = optarg;
++			break;
++		case 'a':
++			audio_emulation = optarg;
++			break;
++		case 1000:
++			show_version = 1;
++			break;
++		case 1001:
++			hide_seekbar = true;
++			break;
++		case 1002:
++			enable_cout = true;
++			break;
++		case 1003:
++			output_directory = optarg;
++			break;
+ 		}
+ 	}
+ 
+-	if (help == 1 || argc == optind)
++	if (show_version == 1)
++	{
++		fprintf(stderr, "%s\n", scm_rev_str.c_str());
++		return 1;
++	}
++
++	if (boot_path.empty() && argc > optind)
++		boot_path = argv[optind];
++
++	if (help == 1 || boot_path.empty())
+ 	{
+ 		fprintf(stderr, "%s\n\n", scm_rev_str.c_str());
+ 		fprintf(stderr, "A multi-platform GameCube/Wii emulator\n\n");
+-		fprintf(stderr, "Usage: %s [-e <file>] [-h] [-v]\n", argv[0]);
++		fprintf(stderr, "Usage: %s [-e <file>] [-u <user-dir>] [-i <slippi-json>] [-v <video-backend>] [-h]\n", argv[0]);
+ 		fprintf(stderr, "  -e, --exec     Load the specified file\n");
++		fprintf(stderr, "  -u, --user     User folder path\n");
++		fprintf(stderr, "  -i, --slippi-input  Path to Slippi replay config file\n");
++		fprintf(stderr, "  -v, --video_backend Specify a video backend\n");
+ 		fprintf(stderr, "  -h, --help     Show this help message\n");
+-		fprintf(stderr, "  -v, --version  Print version and exit\n");
++		fprintf(stderr, "  --version      Print version and exit\n");
+ 		return 1;
+ 	}
+ 
+@@ -415,9 +477,39 @@ int main(int argc, char* argv[])
+ 		return 1;
+ 	}
+ 
+-	UICommon::SetUserDirectory("");  // Auto-detect user folder
++	UICommon::SetUserDirectory(user_path);
++	UICommon::CreateDirectories();
+ 	UICommon::Init();
+ 
++	if (!video_backend.empty())
++		SConfig::GetInstance().m_strVideoBackend = video_backend;
++
++	if (!slippi_input.empty())
++		SConfig::GetInstance().m_strSlippiInput = slippi_input;
++	else
++		SConfig::GetInstance().m_strSlippiInput = "Slippi/playback.txt";
++
++	if (hide_seekbar)
++		SConfig::GetInstance().m_CLIHideSeekbar = true;
++
++	if (enable_cout)
++		SConfig::GetInstance().m_coutEnabled = true;
++
++	if (!output_directory.empty())
++	{
++		if (output_directory.back() != '/' && output_directory.back() != '\\')
++			output_directory += "/";
++		SConfig::GetInstance().m_strOutputDirectory = output_directory;
++	}
++
++	if (!output_filename_base.empty())
++		SConfig::GetInstance().m_strOutputFilenameBase = output_filename_base;
++
++	if (!audio_emulation.empty())
++		SConfig::GetInstance().bDSPHLE = !strcasecmp(audio_emulation.c_str(), "HLE");
++
++	VideoBackendBase::ActivateBackend(SConfig::GetInstance().m_strVideoBackend);
++
+ 	Core::SetOnStoppedCallback([]() { s_running.Clear(); });
+ 	platform->Init();
+ 
+@@ -431,9 +523,9 @@ int main(int argc, char* argv[])
+ 
+ 	DolphinAnalytics::Instance()->ReportDolphinStart("nogui");
+ 
+-	if (!BootManager::BootCore(argv[optind]))
++	if (!BootManager::BootCore(boot_path))
+ 	{
+-		fprintf(stderr, "Could not boot %s\n", argv[optind]);
++		fprintf(stderr, "Could not boot %s\n", boot_path.c_str());
+ 		return 1;
+ 	}
+ 
+diff --git a/Source/Core/VideoBackends/CMakeLists.txt b/Source/Core/VideoBackends/CMakeLists.txt
+index 778bbf6..2839f02 100644
+--- a/Source/Core/VideoBackends/CMakeLists.txt
++++ b/Source/Core/VideoBackends/CMakeLists.txt
+@@ -1,5 +1,8 @@
+ add_subdirectory(OGL)
+ add_subdirectory(Software)
+-add_subdirectory(Vulkan)
++
++if(NOT ENABLE_HEADLESS)
++	add_subdirectory(Vulkan)
++endif()
+ 
+ # TODO: Add other backends here!
+diff --git a/Source/Core/VideoBackends/D3D12/Render.cpp b/Source/Core/VideoBackends/D3D12/Render.cpp
+index cf549d4..74650bf 100644
+--- a/Source/Core/VideoBackends/D3D12/Render.cpp
++++ b/Source/Core/VideoBackends/D3D12/Render.cpp
+@@ -1478,7 +1478,6 @@ void  Renderer::DumpFrame(const EFBRectangle& source_rc, u32 xfb_addr,
+ 	AVIDump::Frame state = AVIDump::FetchState(ticks);
+ 	DumpFrameData(reinterpret_cast<const u8*>(screenshot_texture_map), box_width, box_height,
+ 		dst_location.PlacedFootprint.Footprint.RowPitch, state);
+-	FinishFrameData();
+ 
+ 	D3D12_RANGE write_range = {};
+ 	m_frame_dump_buffer->Unmap(0, &write_range);
+diff --git a/Source/Core/VideoBackends/DX11/Render.cpp b/Source/Core/VideoBackends/DX11/Render.cpp
+index 37cc7f3..856255d 100644
+--- a/Source/Core/VideoBackends/DX11/Render.cpp
++++ b/Source/Core/VideoBackends/DX11/Render.cpp
+@@ -1296,7 +1296,6 @@ void Renderer::DumpFrame(const EFBRectangle& source_rc, u32 xfb_addr,
+ 	AVIDump::Frame state = AVIDump::FetchState(ticks);
+ 	DumpFrameData(reinterpret_cast<const u8*>(map.pData), box_width, box_height,
+ 		map.RowPitch, state);
+-	FinishFrameData();
+ 	D3D::context->Unmap(m_frame_dump_staging_texture.get(), 0);
+ }
+ 
+diff --git a/Source/Core/VideoBackends/DX9/Render.cpp b/Source/Core/VideoBackends/DX9/Render.cpp
+index 687a0ee..c3f1fa2 100644
+--- a/Source/Core/VideoBackends/DX9/Render.cpp
++++ b/Source/Core/VideoBackends/DX9/Render.cpp
+@@ -643,7 +643,6 @@ void Renderer::SwapImpl(u32 xfbAddr, u32 fbWidth, u32 fbStride, u32 fbHeight, co
+ 			AVIDump::Frame state = AVIDump::FetchState(ticks);
+ 			DumpFrameData(reinterpret_cast<const u8*>(rect.pBits), source_width, source_height,
+ 				rect.Pitch, state, false, true);
+-			FinishFrameData();
+ 
+ 			m_screen_shoot_mem_surface->UnlockRect();
+ 		}
+diff --git a/Source/Core/VideoBackends/OGL/Render.cpp b/Source/Core/VideoBackends/OGL/Render.cpp
+index 7ab0230..e6c3715 100644
+--- a/Source/Core/VideoBackends/OGL/Render.cpp
++++ b/Source/Core/VideoBackends/OGL/Render.cpp
+@@ -1715,7 +1715,6 @@ void Renderer::FlushFrameDump()
+ 	if (!m_last_frame_exported)
+ 		return;
+ 
+-	FinishFrameData();
+ 	glBindBuffer(GL_PIXEL_PACK_BUFFER, m_frame_dumping_pbo[0]);
+ 	m_frame_pbo_is_mapped[0] = true;
+ 	void* data = glMapBufferRange(
+diff --git a/Source/Core/VideoBackends/OGL/main.cpp b/Source/Core/VideoBackends/OGL/main.cpp
+index dd32407..6a19b60 100644
+--- a/Source/Core/VideoBackends/OGL/main.cpp
++++ b/Source/Core/VideoBackends/OGL/main.cpp
+@@ -133,8 +133,10 @@ void VideoBackend::InitBackendInfo()
+ 
+ bool VideoBackend::Initialize(void* window_handle)
+ {
++#if !(defined(USE_EGL) && defined(USE_HEADLESS))
+ 	if (window_handle == nullptr)
+ 		return false;
++#endif
+ 
+ 	InitializeShared();
+ 	InitBackendInfo();
+diff --git a/Source/Core/VideoBackends/Vulkan/Renderer.cpp b/Source/Core/VideoBackends/Vulkan/Renderer.cpp
+index d3b6b91..9acc084 100644
+--- a/Source/Core/VideoBackends/Vulkan/Renderer.cpp
++++ b/Source/Core/VideoBackends/Vulkan/Renderer.cpp
+@@ -867,10 +867,6 @@ void Renderer::WriteFrameDumpImage(size_t index)
+ 
+ StagingTexture2D* Renderer::PrepareFrameDumpImage(u32 width, u32 height, u64 ticks)
+ {
+-	// Ensure the last frame that was sent to the frame dump has completed encoding before we send
+-	// the next image to it.
+-	FinishFrameData();
+-
+ 	// If the last image hasn't been written to the frame dump yet, write it now.
+ 	// This is necessary so that the worker thread is no more than one frame behind, and the pointer
+ 	// (which is actually the buffer) is safe for us to re-use next time.
+diff --git a/Source/Core/VideoCommon/AVIDump.cpp b/Source/Core/VideoCommon/AVIDump.cpp
+index 50592fe..02823ee 100644
+--- a/Source/Core/VideoCommon/AVIDump.cpp
++++ b/Source/Core/VideoCommon/AVIDump.cpp
+@@ -13,6 +13,7 @@ extern "C" {
+ #include <libavcodec/avcodec.h>
+ #include <libavformat/avformat.h>
+ #include <libavutil/mathematics.h>
++#include <libavutil/opt.h>
+ #include <libswscale/swscale.h>
+ }
+ 
+@@ -26,9 +27,6 @@ extern "C" {
+ #include "Core/HW/VideoInterface.h"  //for TargetRefreshRate
+ #include "Core/Movie.h"
+ 
+-#include "Core/Slippi/SlippiReplayComm.h"
+-#include "Core/Slippi/SlippiPlayback.h"
+-
+ #include "VideoCommon/AVIDump.h"
+ #include "VideoCommon/OnScreenDisplay.h"
+ #include "VideoCommon/VideoConfig.h"
+@@ -39,9 +37,6 @@ extern "C" {
+ #define av_frame_free avcodec_free_frame
+ #endif
+ 
+-extern std::unique_ptr<SlippiReplayComm> g_replayComm;
+-extern std::unique_ptr<SlippiPlaybackStatus> g_playbackStatus;
+-
+ static AVFormatContext* s_format_context = nullptr;
+ static AVStream* s_stream = nullptr;
+ static AVCodecContext* s_codec_context = nullptr;
+@@ -86,13 +81,6 @@ static bool AVStreamCopyContext(AVStream* stream, AVCodecContext* codec_context)
+ 
+ bool AVIDump::Start(int w, int h, bool fromBGRA)
+ {
+-#ifdef IS_PLAYBACK
+-	if (!g_playbackStatus || !g_playbackStatus->inSlippiPlayback ||
+-	    (g_playbackStatus->isHardFFW || g_playbackStatus->isSoftFFW) ||
+-	    g_replayComm->current.startFrame >= g_playbackStatus->currentPlaybackFrame ||
+-	    g_replayComm->current.endFrame <= g_playbackStatus->currentPlaybackFrame)
+-		return false;
+-#endif
+ 	s_pix_fmt = fromBGRA ? AV_PIX_FMT_BGRA : AV_PIX_FMT_RGBA;
+ 
+ 	s_width = w;
+@@ -177,20 +165,30 @@ bool AVIDump::CreateVideoFile()
+ 	const std::string& codec_name = g_Config.bUseFFV1 ? "ffv1" : g_Config.sDumpCodec;
+ 
+ 	AVCodecID codec_id = output_format->video_codec;
++	const AVCodec* codec = nullptr;
+ 
+ 	if (!codec_name.empty())
+ 	{
+-		const AVCodecDescriptor* codec_desc = avcodec_descriptor_get_by_name(codec_name.c_str());
+-		if (codec_desc)
+-			codec_id = codec_desc->id;
++		codec = avcodec_find_encoder_by_name(codec_name.c_str());
++		if (codec)
++		{
++			codec_id = codec->id;
++			NOTICE_LOG(VIDEO, "Using encoder %s", codec->name);
++		}
+ 		else
+-			WARN_LOG(VIDEO, "Invalid codec %s", codec_name.c_str());
++		{
++			const AVCodecDescriptor* codec_desc = avcodec_descriptor_get_by_name(codec_name.c_str());
++			if (codec_desc)
++				codec_id = codec_desc->id;
++			else
++				WARN_LOG(VIDEO, "Invalid codec %s", codec_name.c_str());
++		}
+ 	}
+ 
+-	const AVCodec* codec = nullptr;
++	if (!codec)
++		codec = avcodec_find_encoder(codec_id);
+ 
+-	if (!(codec = avcodec_find_encoder(codec_id)) ||
+-		!(s_codec_context = avcodec_alloc_context3(codec)))
++	if (!codec || !(s_codec_context = avcodec_alloc_context3(codec)))
+ 	{
+ 		ERROR_LOG(VIDEO, "Could not find encoder or allocate codec context");
+ 		return false;
+@@ -207,8 +205,20 @@ bool AVIDump::CreateVideoFile()
+ 	s_codec_context->time_base.num = 1;
+ 	s_codec_context->time_base.den = VideoInterface::GetTargetRefreshRate();
+ 	s_codec_context->gop_size = 12;
++	if (!g_Config.bUseFFV1)
++		s_codec_context->max_b_frames = 0;
+ 	s_codec_context->pix_fmt = g_Config.bUseFFV1 ? AV_PIX_FMT_BGRA : AV_PIX_FMT_YUV420P;
+ 
++	if (!g_Config.bUseFFV1 && codec->name && std::string(codec->name).find("nvenc") != std::string::npos)
++	{
++		av_opt_set(s_codec_context->priv_data, "preset", "p1", 0);
++		av_opt_set(s_codec_context->priv_data, "tune", "ull", 0);
++		av_opt_set(s_codec_context->priv_data, "rc", "constqp", 0);
++		av_opt_set_int(s_codec_context->priv_data, "qp", 28, 0);
++		av_opt_set_int(s_codec_context->priv_data, "delay", 0, 0);
++		av_opt_set_int(s_codec_context->priv_data, "zerolatency", 1, 0);
++	}
++
+ 	if (output_format->flags & AVFMT_GLOBALHEADER)
+ 		s_codec_context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+ 
+@@ -313,13 +323,6 @@ static void WritePacket(AVPacket& pkt)
+ 
+ void AVIDump::AddFrame(const u8* data, int width, int height, int stride, const Frame& state)
+ {
+-#ifdef IS_PLAYBACK
+-	if (!g_playbackStatus || !g_playbackStatus->inSlippiPlayback ||
+-	    (g_playbackStatus->isHardFFW || g_playbackStatus->isSoftFFW) ||
+-	    g_replayComm->current.startFrame >= g_playbackStatus->currentPlaybackFrame ||
+-	    g_replayComm->current.endFrame <= g_playbackStatus->currentPlaybackFrame)
+-		return;
+-#endif
+ 	// Assume that the timing is valid, if the savestate id of the new frame
+ 	// doesn't match the last one.
+ 	if (state.savestate_index != s_last_savestate_index)
+diff --git a/Source/Core/VideoCommon/AVIDump.h b/Source/Core/VideoCommon/AVIDump.h
+index 2e06e5d..2b09a98 100644
+--- a/Source/Core/VideoCommon/AVIDump.h
++++ b/Source/Core/VideoCommon/AVIDump.h
+@@ -20,6 +20,11 @@ public:
+ 		u32 ticks_per_second = 0;
+ 		bool first_frame = false;
+ 		int savestate_index = 0;
++		// Capture playback eligibility with the pixels. Reading Slippi's global playback state on
++		// the asynchronous dump thread would associate queued frames with a later emulation frame.
++		bool should_dump_avi = true;
++		bool should_dump_image = true;
++		int slippi_frame = 0;
+ 	};
+ 
+ 	static bool Start(int w, int h, bool fromBGRA = false);
+diff --git a/Source/Core/VideoCommon/ImageWrite.cpp b/Source/Core/VideoCommon/ImageWrite.cpp
+index a9fc98a..cd4a5fb 100644
+--- a/Source/Core/VideoCommon/ImageWrite.cpp
++++ b/Source/Core/VideoCommon/ImageWrite.cpp
+@@ -3,6 +3,7 @@
+ // Refer to the license.txt file included.
+ 
+ #include <list>
++#include <cstdlib>
+ #include <string>
+ 
+ #include "png.h"
+@@ -79,6 +80,21 @@ bool TextureToPng(const u8* data, int row_stride, const std::string& filename, i
+ 
+ 	png_init_io(png_ptr, fp.GetHandle());
+ 
++	if (const char* level_text = std::getenv("SLIPPI_PNG_COMPRESSION_LEVEL"))
++	{
++		int level = std::atoi(level_text);
++		if (level < 0)
++			level = 0;
++		else if (level > 9)
++			level = 9;
++		png_set_compression_level(png_ptr, level);
++	}
++	if (const char* filter_none = std::getenv("SLIPPI_PNG_FILTER_NONE"))
++	{
++		if (std::string(filter_none) != "0")
++			png_set_filter(png_ptr, PNG_FILTER_TYPE_BASE, PNG_FILTER_NONE);
++	}
++
+ 	// Write header (8 bit color depth)
+ 	png_set_IHDR(png_ptr, info_ptr, width, height, 8, PNG_COLOR_TYPE_RGB_ALPHA, PNG_INTERLACE_NONE,
+ 		PNG_COMPRESSION_TYPE_BASE, PNG_FILTER_TYPE_BASE);
+diff --git a/Source/Core/VideoCommon/RenderBase.cpp b/Source/Core/VideoCommon/RenderBase.cpp
+index d65243a..51dc65d 100644
+--- a/Source/Core/VideoCommon/RenderBase.cpp
++++ b/Source/Core/VideoCommon/RenderBase.cpp
+@@ -14,6 +14,8 @@
+ 
+ #include <cinttypes>
+ #include <cmath>
++#include <cstddef>
++#include <cstring>
+ #include <memory>
+ #include <mutex>
+ #include <string>
+@@ -74,6 +76,7 @@ int OSDChoice;
+ static int OSDTime;
+ 
+ std::unique_ptr<Renderer> g_renderer;
++constexpr std::size_t Renderer::FRAME_DUMP_QUEUE_CAPACITY;
+ 
+ // The maximum depth that is written to the depth buffer should never exceed this value.
+ // This is necessary because we use a 2^24 divisor for all our depth values to prevent
+@@ -904,14 +907,13 @@ void Renderer::ShutdownFrameDumping()
+ 
+ 	FinishFrameData();
+ 	m_frame_dump_thread_running.Clear();
+-	m_frame_dump_start.Set();
++	m_frame_dump_queue_not_empty.notify_one();
+ }
+ 
+ void Renderer::DumpFrameData(const u8* data, int w, int h, int stride, const AVIDump::Frame& state, bool swap_upside_down, bool bgra)
+ {
+-	FinishFrameData();
+-
+-	m_frame_dump_config = FrameDumpConfig{ data, w, h, stride, swap_upside_down, bgra, state };
++	if (!data || w <= 0 || h <= 0)
++		return;
+ 
+ 	if (!m_frame_dump_thread_running.IsSet())
+ 	{
+@@ -921,17 +923,54 @@ void Renderer::DumpFrameData(const u8* data, int w, int h, int stride, const AVI
+ 		m_frame_dump_thread = std::thread(&Renderer::RunFrameDumps, this);
+ 	}
+ 
+-	m_frame_dump_start.Set();
+-	m_frame_dump_frame_running = true;
++	std::unique_lock<std::mutex> queue_lock(m_frame_dump_queue_mutex);
++	m_frame_dump_queue_not_full.wait(queue_lock, [this] {
++		return m_frame_dump_queue_size < FRAME_DUMP_QUEUE_CAPACITY;
++	});
++
++	FrameDumpConfig& config = m_frame_dump_queue[m_frame_dump_queue_write];
++	config.width = w;
++	config.height = h;
++	config.stride = w * 4;
++	config.bgra = bgra;
++	config.dump_frame = SConfig::GetInstance().m_DumpFrames;
++	config.should_dump_avi = state.should_dump_avi;
++	config.should_dump_image = state.should_dump_image;
++	config.slippi_frame = state.slippi_frame;
++	config.state = state;
++	config.screenshot_filename.clear();
++
++	if (m_screenshot_request.TestAndClear())
++	{
++		std::lock_guard<std::mutex> screenshot_lock(m_screenshot_lock);
++		config.screenshot_filename = m_screenshot_name;
++		m_screenshot_name.clear();
++	}
++
++	// Copy only active pixels and normalize orientation. The graphics backend can immediately
++	// unmap or reuse its readback buffer once this function returns.
++	const std::size_t packed_stride = static_cast<std::size_t>(config.stride);
++	config.pixels.resize(packed_stride * static_cast<std::size_t>(h));
++	for (int y = 0; y < h; ++y)
++	{
++		const int source_y = swap_upside_down ? h - 1 - y : y;
++		std::memcpy(config.pixels.data() + static_cast<std::size_t>(y) * packed_stride,
++			data + static_cast<std::ptrdiff_t>(source_y) * stride, packed_stride);
++	}
++
++	m_frame_dump_queue_write =
++		(m_frame_dump_queue_write + 1) % FRAME_DUMP_QUEUE_CAPACITY;
++	++m_frame_dump_queue_size;
++	queue_lock.unlock();
++	m_frame_dump_queue_not_empty.notify_one();
+ }
+ 
+ void Renderer::FinishFrameData()
+ {
+-	if (!m_frame_dump_frame_running)
+-		return;
+-
+-	m_frame_dump_done.Wait();
+-	m_frame_dump_frame_running = false;
++	std::unique_lock<std::mutex> queue_lock(m_frame_dump_queue_mutex);
++	m_frame_dump_queue_drained.wait(queue_lock, [this] {
++		return m_frame_dump_queue_size == 0;
++	});
+ }
+ 
+ void Renderer::RunFrameDumps()
+@@ -939,6 +978,7 @@ void Renderer::RunFrameDumps()
+ 	Common::SetCurrentThreadName("FrameDumping");
+ 	bool dump_to_avi = !g_ActiveConfig.bDumpFramesAsImages;
+ 	bool frame_dump_started = false;
++	bool frame_dump_failed = false;
+ 
+ 	// If Dolphin was compiled without libav, we only support dumping to images.
+ #if !defined(HAVE_LIBAV) && !defined(_WIN32)
+@@ -952,33 +992,26 @@ void Renderer::RunFrameDumps()
+ 
+ 	while (true)
+ 	{
+-		m_frame_dump_start.Wait();
+-		if (!m_frame_dump_thread_running.IsSet())
++		std::unique_lock<std::mutex> queue_lock(m_frame_dump_queue_mutex);
++		m_frame_dump_queue_not_empty.wait(queue_lock, [this] {
++			return m_frame_dump_queue_size != 0 || !m_frame_dump_thread_running.IsSet();
++		});
++		if (m_frame_dump_queue_size == 0 && !m_frame_dump_thread_running.IsSet())
+ 			break;
+ 
+-		auto config = m_frame_dump_config;
+-
+-		if (config.upside_down)
+-		{
+-			config.data = config.data + (config.height - 1) * config.stride;
+-			config.stride = -config.stride;
+-		}
++		FrameDumpConfig& config = m_frame_dump_queue[m_frame_dump_queue_read];
++		queue_lock.unlock();
+ 
+ 		// Save screenshot
+-		if (m_screenshot_request.TestAndClear())
++		if (!config.screenshot_filename.empty())
+ 		{
+-			std::lock_guard<std::mutex> lk(m_screenshot_lock);
+-
+-			if (TextureToPng(config.data, config.stride, m_screenshot_name, config.width, config.height,
+-				false))
+-				OSD::AddMessage("Screenshot saved to " + m_screenshot_name);
+-
+-			// Reset settings
+-			m_screenshot_name.clear();
++			if (TextureToPng(config.pixels.data(), config.stride, config.screenshot_filename,
++				config.width, config.height, false, config.bgra))
++				OSD::AddMessage("Screenshot saved to " + config.screenshot_filename);
+ 			m_screenshot_completed.Set();
+ 		}
+ 
+-		if (SConfig::GetInstance().m_DumpFrames)
++		if (config.dump_frame && !frame_dump_failed)
+ 		{
+ 			if (!frame_dump_started)
+ 			{
+@@ -990,7 +1023,10 @@ void Renderer::RunFrameDumps()
+ #ifndef IS_PLAYBACK
+ 				// Stop frame dumping if we fail to start.
+ 				if (!frame_dump_started)
++				{
+ 					SConfig::GetInstance().m_DumpFrames = false;
++					frame_dump_failed = true;
++				}
+ #endif
+ 			}
+ 
+@@ -1004,7 +1040,15 @@ void Renderer::RunFrameDumps()
+ 			}
+ 		}
+ 
+-		m_frame_dump_done.Set();
++		queue_lock.lock();
++		m_frame_dump_queue_read =
++			(m_frame_dump_queue_read + 1) % FRAME_DUMP_QUEUE_CAPACITY;
++		--m_frame_dump_queue_size;
++		const bool queue_drained = m_frame_dump_queue_size == 0;
++		queue_lock.unlock();
++		m_frame_dump_queue_not_full.notify_one();
++		if (queue_drained)
++			m_frame_dump_queue_drained.notify_all();
+ 	}
+ 
+ 	if (frame_dump_started)
+@@ -1019,12 +1063,15 @@ void Renderer::RunFrameDumps()
+ 
+ bool Renderer::StartFrameDumpToAVI(const FrameDumpConfig& config)
+ {
+-	return AVIDump::Start(config.width, config.height);
++	if (!config.should_dump_avi)
++		return false;
++	return AVIDump::Start(config.width, config.height, config.bgra);
+ }
+ 
+ void Renderer::DumpFrameToAVI(const FrameDumpConfig& config)
+ {
+-	AVIDump::AddFrame(config.data, config.width, config.height, config.stride, config.state);
++	if (config.should_dump_avi)
++		AVIDump::AddFrame(config.pixels.data(), config.width, config.height, config.stride, config.state);
+ }
+ 
+ void Renderer::StopFrameDumpToAVI()
+@@ -1057,7 +1104,11 @@ std::string Renderer::GetFrameDumpNextImageFileName() const
+ 
+ bool Renderer::StartFrameDumpToImage(const FrameDumpConfig& config)
+ {
++	if (!config.should_dump_image)
++		return false;
++
+ 	m_frame_dump_image_counter = 1;
++	m_frame_dump_last_image_slippi_frame_valid = false;
+ 	if (!SConfig::GetInstance().m_DumpFramesSilent)
+ 	{
+ 		// Only check for the presence of the first image to confirm overwriting.
+@@ -1076,8 +1127,19 @@ bool Renderer::StartFrameDumpToImage(const FrameDumpConfig& config)
+ 
+ void Renderer::DumpFrameToImage(const FrameDumpConfig& config)
+ {
++#ifdef IS_PLAYBACK
++	if (!config.should_dump_image)
++		return;
++
++	if (m_frame_dump_last_image_slippi_frame_valid &&
++	    m_frame_dump_last_image_slippi_frame == config.slippi_frame)
++		return;
++	m_frame_dump_last_image_slippi_frame = config.slippi_frame;
++	m_frame_dump_last_image_slippi_frame_valid = true;
++#endif
+ 	std::string filename = GetFrameDumpNextImageFileName();
+-	TextureToPng(config.data, config.stride, filename, config.width, config.height, false);
++	TextureToPng(config.pixels.data(), config.stride, filename, config.width, config.height, false,
++		config.bgra);
+ 	m_frame_dump_image_counter++;
+ }
+ 
+diff --git a/Source/Core/VideoCommon/RenderBase.h b/Source/Core/VideoCommon/RenderBase.h
+index 35da0a1..fb67ced 100644
+--- a/Source/Core/VideoCommon/RenderBase.h
++++ b/Source/Core/VideoCommon/RenderBase.h
+@@ -13,6 +13,8 @@
+ // ---------------------------------------------------------------------------------------------
+ 
+ #pragma once
++#include <array>
++#include <cstddef>
+ #include <condition_variable>
+ #include <memory>
+ #include <mutex>
+@@ -206,22 +208,38 @@ private:
+ 
+ 	// frame dumping
+ 	std::thread m_frame_dump_thread;
+-	Common::Event m_frame_dump_start;
+-	Common::Event m_frame_dump_done;
+ 	Common::Flag m_frame_dump_thread_running;
+ 	u32 m_frame_dump_image_counter = 0;
+-	bool m_frame_dump_frame_running = false;
++	bool m_frame_dump_last_image_slippi_frame_valid = false;
++	int m_frame_dump_last_image_slippi_frame = 0;
+ 
+ 	struct FrameDumpConfig
+ 	{
+-		const u8* data;
+-		int width;
+-		int height;
+-		int stride;
+-		bool upside_down;
+-		bool bgra;
+-		AVIDump::Frame state;
+-	} m_frame_dump_config;
++		std::vector<u8> pixels;
++		int width = 0;
++		int height = 0;
++		int stride = 0;
++		bool bgra = false;
++		bool dump_frame = false;
++		bool should_dump_avi = true;
++		bool should_dump_image = true;
++		int slippi_frame = 0;
++		std::string screenshot_filename;
++		AVIDump::Frame state{};
++	};
++
++	// Pixel data must be owned by the queue: graphics backends unmap or reuse their readback
++	// buffers as soon as DumpFrameData returns. Keeping several owned frames lets emulation and
++	// readback continue while the dump thread encodes or writes earlier frames.
++	static constexpr std::size_t FRAME_DUMP_QUEUE_CAPACITY = 8;
++	std::array<FrameDumpConfig, FRAME_DUMP_QUEUE_CAPACITY> m_frame_dump_queue;
++	std::size_t m_frame_dump_queue_read = 0;
++	std::size_t m_frame_dump_queue_write = 0;
++	std::size_t m_frame_dump_queue_size = 0;
++	std::mutex m_frame_dump_queue_mutex;
++	std::condition_variable m_frame_dump_queue_not_empty;
++	std::condition_variable m_frame_dump_queue_not_full;
++	std::condition_variable m_frame_dump_queue_drained;
+ 
+ 	// NOTE: The methods below are called on the framedumping thread.
+ 	bool StartFrameDumpToAVI(const FrameDumpConfig& config);
+diff --git a/Source/Core/VideoCommon/VideoBackendBase.cpp b/Source/Core/VideoCommon/VideoBackendBase.cpp
+index b2b2140..47ed92f 100644
+--- a/Source/Core/VideoCommon/VideoBackendBase.cpp
++++ b/Source/Core/VideoCommon/VideoBackendBase.cpp
+@@ -12,8 +12,10 @@
+ 
+ #endif
+ #include "VideoBackends/OGL/VideoBackend.h"
++#ifndef USE_HEADLESS
+ #include "VideoBackends/Software/VideoBackend.h"
+ #include "VideoBackends/Vulkan/VideoBackend.h"
++#endif
+ 
+ #if defined(VK_USE_PLATFORM_METAL_EXT)
+ #include <objc/message.h>
+@@ -92,6 +94,7 @@ void VideoBackendBase::PopulateList()
+ 	//
+ 	// That said, we have seen issues with Vulkan on Playback builds and defaulting to
+ 	// OpenGL should be fine in our supported versions since it translates to Metal under the hood.
++#ifndef USE_HEADLESS
+ 	if (PlatformSupportsVulkan())
+ 	{
+ #if defined(__APPLE__) && !defined(IS_PLAYBACK)
+@@ -101,6 +104,7 @@ void VideoBackendBase::PopulateList()
+ 		g_available_video_backends.push_back(std::make_unique<Vulkan::VideoBackend>());
+ #endif
+ 	}
++#endif
+ 
+ 	// Disable software video backend as is currently not working
+ 	// g_available_video_backends.push_back(std::make_unique<SW::VideoSoftware>());

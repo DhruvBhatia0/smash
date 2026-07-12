@@ -1,0 +1,20 @@
+diff --git a/Source/Core/VideoCommon/RenderBase.cpp b/Source/Core/VideoCommon/RenderBase.cpp
+index 51dc65d..32dd7c7 100644
+--- a/Source/Core/VideoCommon/RenderBase.cpp
++++ b/Source/Core/VideoCommon/RenderBase.cpp
+@@ -906,8 +906,13 @@ void Renderer::ShutdownFrameDumping()
+ 		return;
+ 
+ 	FinishFrameData();
+-	m_frame_dump_thread_running.Clear();
+-	m_frame_dump_queue_not_empty.notify_one();
++	{
++		// Change the worker predicate while holding the same mutex used by its wait. Otherwise the
++		// worker can observe "running", get preempted before waiting, and miss the shutdown wakeup.
++		std::lock_guard<std::mutex> queue_lock(m_frame_dump_queue_mutex);
++		m_frame_dump_thread_running.Clear();
++	}
++	m_frame_dump_queue_not_empty.notify_all();
+ }
+ 
+ void Renderer::DumpFrameData(const u8* data, int w, int h, int stride, const AVIDump::Frame& state, bool swap_upside_down, bool bgra)

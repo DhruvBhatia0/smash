@@ -29,6 +29,14 @@ Key artifacts:
 - `verify-frame-state-summary.mjs`: threshold/completeness verifier for benchmark summaries.
 - `ishiiruka-fast-png-frame-dump.patch`: experimental Dolphin/Ishiiruka patch for Slippi-frame-gated PNG dumping and PNG compression knobs.
 - `ishiiruka-headless-egl-playback.patch`: experimental headless EGL Playback Dolphin patch.
+- `patches/ishiiruka-cpu-fast-frame-dump.patch`: tested CPU-only headless patch with an owned
+  frame queue, per-frame Slippi eligibility, dump-only OpenGL rendering, and Linux memfd fastmem.
+- `daytona-cpu-findings.md`: CPU/Windows audit, upstream research, benchmark table, and exact
+  2,304-frame correctness proof. The final 38.4-second replay run takes 16.227 seconds (~142 FPS).
+- `daytona-cpu-final-summary.json`: machine-readable final configuration, timings, counts, and
+  video/frame-hash checksums.
+- `daytona-source-benchmark.sh`: Daytona benchmark runner whose defaults are the validated fast
+  224x184 CPU configuration and which fails on an incorrect CFR frame count.
 - `render-ffv1-replay.sh`: video render wrapper with end-frame watcher and codec knobs.
 - `render-ffv1-to-png.sh`: two-stage FFV1-to-full-PNG wrapper.
 - `Dockerfile.ffv1-to-png`: derivative renderer image that adds FFmpeg and the FFV1 wrapper.

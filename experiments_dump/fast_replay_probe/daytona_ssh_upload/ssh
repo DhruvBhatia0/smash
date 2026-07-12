@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Daytona's CLI creates a short-lived SSH token, then invokes `ssh <token>@ssh.app.daytona.io`.
+# Put this shim first on PATH to reuse that token with scp without printing or persisting it.
+target="${!#}"
+if [[ "$target" != *@ssh.app.daytona.io ]]; then
+  echo "unexpected Daytona SSH target" >&2
+  exit 2
+fi
+
+files=()
+[[ -z "${DAYTONA_UPLOAD_ISO:-}" ]] || files+=("$DAYTONA_UPLOAD_ISO")
+[[ -z "${DAYTONA_UPLOAD_SLP:-}" ]] || files+=("$DAYTONA_UPLOAD_SLP")
+[[ -z "${DAYTONA_UPLOAD_EXTRA:-}" ]] || files+=("$DAYTONA_UPLOAD_EXTRA")
+[[ -z "${DAYTONA_UPLOAD_EXTRA2:-}" ]] || files+=("$DAYTONA_UPLOAD_EXTRA2")
+[[ -z "${DAYTONA_UPLOAD_EXTRA3:-}" ]] || files+=("$DAYTONA_UPLOAD_EXTRA3")
+[[ -z "${DAYTONA_UPLOAD_EXTRA4:-}" ]] || files+=("$DAYTONA_UPLOAD_EXTRA4")
+[[ -z "${DAYTONA_UPLOAD_EXTRA5:-}" ]] || files+=("$DAYTONA_UPLOAD_EXTRA5")
+if [[ "${#files[@]}" -eq 0 ]]; then
+  echo "set at least one DAYTONA_UPLOAD_* path" >&2
+  exit 2
+fi
+
+destination="${DAYTONA_UPLOAD_DEST:-/tmp/}"
+
+/usr/bin/scp \
+  -o StrictHostKeyChecking=accept-new \
+  "${files[@]}" \
+  "$target:$destination"

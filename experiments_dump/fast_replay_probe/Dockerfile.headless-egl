@@ -1,7 +1,7 @@
 FROM ubuntu:22.04 AS builder
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG ISHIIRUKA_REF=slippi
+ARG ISHIIRUKA_REF=e7711b104b339a99385f2bb12b472d46140a7bc7
 ARG ISHIIRUKA_REPO=https://github.com/project-slippi/Ishiiruka.git
 ARG BUILD_JOBS=8
 
@@ -52,12 +52,14 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /opt/slippi-src
-RUN git clone --branch "${ISHIIRUKA_REF}" --depth 1 "${ISHIIRUKA_REPO}" Ishiiruka
+RUN git clone "${ISHIIRUKA_REPO}" Ishiiruka && \
+    git -C Ishiiruka checkout "${ISHIIRUKA_REF}"
 WORKDIR /opt/slippi-src/Ishiiruka
 RUN git submodule update --init --recursive
 
-COPY fast_replay_probe/ishiiruka-headless-egl-playback.patch /tmp/ishiiruka-headless-egl-playback.patch
-RUN patch -p1 < /tmp/ishiiruka-headless-egl-playback.patch
+COPY fast_replay_probe/patches/ishiiruka-cpu-fast-frame-dump.patch /tmp/ishiiruka-cpu-fast-frame-dump.patch
+RUN git apply --check /tmp/ishiiruka-cpu-fast-frame-dump.patch && \
+    git apply /tmp/ishiiruka-cpu-fast-frame-dump.patch
 
 RUN mkdir -p build && cd build && \
     cmake \
@@ -142,5 +144,15 @@ RUN chmod +x \
 ENV SLIPPI_DOLPHIN_BIN=/opt/slippi/dolphin-emu-nogui
 ENV LD_LIBRARY_PATH=/opt/slippi
 ENV USE_XVFB=0
+ENV EGL_PLATFORM=surfaceless
+ENV SLIPPI_DUMP_ONLY=1
+ENV SLIPPI_USE_FFV1=False
+ENV SLIPPI_DUMP_CODEC=rawvideo
+ENV SLIPPI_INTERNAL_RESOLUTION_FRAME_DUMPS=True
+ENV SLIPPI_EFB_SCALE=0
+ENV SLIPPI_CPU_THREAD=False
+ENV SLIPPI_RENDER_TO_MAIN=False
+ENV SLIPPI_RENDER_WIDTH=204
+ENV SLIPPI_RENDER_HEIGHT=168
 
 ENTRYPOINT ["/opt/slippi-renderer/render-ffv1-replay.sh"]

@@ -1,0 +1,55 @@
+{
+  "testedAt": "2026-07-12",
+  "sandbox": {
+    "provider": "daytona",
+    "snapshot": "daytona-large",
+    "gpu": 0,
+    "vcpuLimit": 4,
+    "memoryGiB": 8,
+    "hostCpu": "AMD EPYC 9275F 24-Core Processor"
+  },
+  "input": {
+    "replay": "experiments_dump/replays/realtimeTest.slp",
+    "sha256": "387311207f966e8ca14f6ccd6b271974f8a0c0e846825fe587d75650f2e45a97",
+    "startFrame": -123,
+    "endFrame": 2182
+  },
+  "configuration": {
+    "videoBackend": "OGL",
+    "softwareRenderer": "Mesa llvmpipe",
+    "lpNumThreads": 4,
+    "dolphinCpuCore": 1,
+    "cpuThread": false,
+    "dumpOnly": true,
+    "internalResolutionFrameDumps": true,
+    "efbScale": 0,
+    "logicalBackbuffer": "204x168",
+    "codec": "rawvideo",
+    "pixelFormat": "yuv420p"
+  },
+  "result": {
+    "wallSeconds": 16.227,
+    "timelineSeconds": 38.4,
+    "effectiveFps": 141.99,
+    "realtimeFactor": 2.3664,
+    "width": 224,
+    "height": 184,
+    "cfrFrames": 2304,
+    "storedPackets": 2298,
+    "bytes": 142132534,
+    "videoSha256": "cc83f4708599d082314af57c6ef023f4a61e70e988322baae6b3a0dbf5759092",
+    "frameMd5ManifestSha256": "780e1f13fe2bf03cc338de7f26059421409acc29891fb6b14de7e9e8c8879dbe"
+  },
+  "validation": {
+    "expectedCfrFrames": 2304,
+    "ffprobeFrameCountMatched": true,
+    "fullDecodeFrameCountMatched": true,
+    "repeatedRunFrameHashesMatched": true,
+    "nativePresentVsDumpOnlyFrameHashesMatched": true
+  },
+  "cleanup": {
+    "sandboxDeleted": true,
+    "customSnapshotsRemaining": 0,
+    "dockerDesktopStopped": true
+  }
+}

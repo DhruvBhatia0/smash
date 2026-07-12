@@ -1,0 +1,57 @@
+diff --git a/Source/Core/Common/MemArena.cpp b/Source/Core/Common/MemArena.cpp
+index 8c634f4..d97fc49 100644
+--- a/Source/Core/Common/MemArena.cpp
++++ b/Source/Core/Common/MemArena.cpp
+@@ -21,6 +21,10 @@
+ #include <fcntl.h>
+ #include <unistd.h>
+ #include <sys/mman.h>
++#if defined(__linux__)
++#include <linux/memfd.h>
++#include <sys/syscall.h>
++#endif
+ #ifdef ANDROID
+ #include <sys/ioctl.h>
+ #include <linux/ashmem.h>
+@@ -67,19 +71,30 @@ void MemArena::GrabSHMSegment(size_t size)
+ 		return;
+ 	}
+ #else
+-	for (int i = 0; i < 10000; i++)
++	fd = -1;
++	// Named POSIX shared memory is charged against the container's /dev/shm mount. Dolphin's
++	// GameCube fastmem arena is 64.25 MiB, just above Docker's common 64 MiB default, which causes
++	// a SIGBUS when playback's initial savestate touches the final pages. A memfd has identical
++	// mmap semantics without the arbitrary mount-size ceiling.
++#if defined(__linux__) && defined(SYS_memfd_create)
++	fd = static_cast<int>(syscall(SYS_memfd_create, "dolphinmem", MFD_CLOEXEC));
++#endif
++	if (fd == -1)
+ 	{
+-		std::string file_name = StringFromFormat("/dolphinmem.%d", i);
+-		fd = shm_open(file_name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
+-		if (fd != -1)
+-		{
+-			shm_unlink(file_name.c_str());
+-			break;
+-		}
+-		else if (errno != EEXIST)
++		for (int i = 0; i < 10000; i++)
+ 		{
+-			ERROR_LOG(MEMMAP, "shm_open failed: %s", strerror(errno));
+-			return;
++			std::string file_name = StringFromFormat("/dolphinmem.%d", i);
++			fd = shm_open(file_name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
++			if (fd != -1)
++			{
++				shm_unlink(file_name.c_str());
++				break;
++			}
++			else if (errno != EEXIST)
++			{
++				ERROR_LOG(MEMMAP, "shm_open failed: %s", strerror(errno));
++				return;
++			}
+ 		}
+ 	}
+ 	if (ftruncate(fd, size) < 0)

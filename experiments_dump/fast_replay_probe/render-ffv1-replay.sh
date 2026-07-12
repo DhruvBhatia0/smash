@@ -15,12 +15,19 @@ Options:
   --no-xvfb                 Run Dolphin directly. Use for EGL/headless builds.
 
 Environment knobs:
+  SLIPPI_DUMP_FRAMES=True|False
   SLIPPI_USE_FFV1=True|False
   SLIPPI_DUMP_CODEC=<ffmpeg codec name>
   SLIPPI_DUMP_FORMAT=<container, e.g. avi or mkv>
   SLIPPI_BITRATE_KBPS=<kbps>
   SLIPPI_INTERNAL_RESOLUTION_FRAME_DUMPS=True|False
   SLIPPI_EFB_SCALE=<Dolphin EFB scale enum, 2 is 1x>
+  SLIPPI_OVERCLOCK_FACTOR=<emulated CPU clock multiplier; defaults to 1.0/off>
+  SLIPPI_CPU_THREAD=True|False
+  SLIPPI_RENDER_TO_MAIN=True|False
+  SLIPPI_RENDER_WIDTH=<pixels>
+  SLIPPI_RENDER_HEIGHT=<pixels>
+  SLIPPI_DUMP_ONLY=0|1 (requires ishiiruka-cpu-fast-frame-dump.patch)
 EOF
 }
 
@@ -33,8 +40,14 @@ TIMEOUT_KILL_AFTER_SECONDS="${TIMEOUT_KILL_AFTER_SECONDS:-5}"
 VIDEO_BACKEND="${VIDEO_BACKEND:-OGL}"
 DOLPHIN_CPU_CORE="${DOLPHIN_CPU_CORE:-1}"
 DOLPHIN_AUDIO_BACKEND="${DOLPHIN_AUDIO_BACKEND:-Null}"
+DUMP_FRAMES="${SLIPPI_DUMP_FRAMES:-True}"
 INTERNAL_RESOLUTION_FRAME_DUMPS="${SLIPPI_INTERNAL_RESOLUTION_FRAME_DUMPS:-False}"
 EFB_SCALE="${SLIPPI_EFB_SCALE:-2}"
+OVERCLOCK_FACTOR="${SLIPPI_OVERCLOCK_FACTOR:-1.0}"
+CPU_THREAD="${SLIPPI_CPU_THREAD:-True}"
+RENDER_TO_MAIN="${SLIPPI_RENDER_TO_MAIN:-True}"
+RENDER_WIDTH="${SLIPPI_RENDER_WIDTH:-960}"
+RENDER_HEIGHT="${SLIPPI_RENDER_HEIGHT:-720}"
 USE_FFV1="${SLIPPI_USE_FFV1:-True}"
 DUMP_CODEC="${SLIPPI_DUMP_CODEC:-}"
 DUMP_FORMAT="${SLIPPI_DUMP_FORMAT:-avi}"
@@ -85,7 +98,7 @@ print(value if isinstance(value, int) else "")
 PY
 )"
 
-python3 - <<'PY' "$USER_DIR" "$ISO" "$DOLPHIN_CPU_CORE" "$VIDEO_BACKEND" "$DOLPHIN_AUDIO_BACKEND" "$INTERNAL_RESOLUTION_FRAME_DUMPS" "$EFB_SCALE" "$USE_FFV1" "$DUMP_CODEC" "$DUMP_FORMAT" "$BITRATE_KBPS"
+python3 - <<'PY' "$USER_DIR" "$ISO" "$DOLPHIN_CPU_CORE" "$VIDEO_BACKEND" "$DOLPHIN_AUDIO_BACKEND" "$INTERNAL_RESOLUTION_FRAME_DUMPS" "$EFB_SCALE" "$USE_FFV1" "$DUMP_CODEC" "$DUMP_FORMAT" "$BITRATE_KBPS" "$DUMP_FRAMES" "$OVERCLOCK_FACTOR" "$CPU_THREAD" "$RENDER_TO_MAIN" "$RENDER_WIDTH" "$RENDER_HEIGHT"
 import configparser
 from pathlib import Path
 import sys
@@ -120,18 +133,20 @@ update_ini(user / "Config" / "Dolphin.ini", {
         "DefaultISO": iso,
         "EmulationSpeed": "0.00000000",
         "CPUCore": cpu_core,
-        "CPUThread": "False" if interpreter_mode else "True",
+        "CPUThread": "False" if interpreter_mode else sys.argv[14],
         "Fastmem": "False" if interpreter_mode else "True",
         "GFXBackend": video_backend,
+        "Overclock": sys.argv[13],
+        "OverclockEnable": "False" if float(sys.argv[13]) == 1.0 else "True",
     },
     "Display": {
         "Fullscreen": "False",
-        "RenderToMain": "True",
-        "RenderWindowWidth": "960",
-        "RenderWindowHeight": "720",
+        "RenderToMain": sys.argv[15],
+        "RenderWindowWidth": sys.argv[16],
+        "RenderWindowHeight": sys.argv[17],
     },
     "Movie": {
-        "DumpFrames": "True",
+        "DumpFrames": sys.argv[12],
         "DumpFramesSilent": "True",
     },
     "DSP": {
@@ -146,6 +161,10 @@ update_ini(user / "Config" / "Dolphin.ini", {
 })
 
 update_ini(user / "Config" / "GFX.ini", {
+    "Hardware": {
+        # Playback builds default this to true. EmulationSpeed=0 does not override swap interval.
+        "VSync": "False",
+    },
     "Settings": {
         "ShowFPS": "False",
         "DumpFramesAsImages": "False",
@@ -234,7 +253,7 @@ if [[ "$status" -ne 0 && -n "$video_path" && "$TARGET_END_FRAME" =~ ^-?[0-9]+$ &
   status=0
 fi
 
-python3 - <<'PY' "$OUTPUT_DIR" "$REPLAY_JSON" "$status" "$current_frame_count" "$TIMEOUT_SECONDS" "$VIDEO_BACKEND" "$DOLPHIN_CPU_CORE" "$DOLPHIN_AUDIO_BACKEND" "$TARGET_END_FRAME" "$USE_FFV1" "$DUMP_CODEC" "$DUMP_FORMAT" "$BITRATE_KBPS" "$INTERNAL_RESOLUTION_FRAME_DUMPS" "$EFB_SCALE"
+python3 - <<'PY' "$OUTPUT_DIR" "$REPLAY_JSON" "$status" "$current_frame_count" "$TIMEOUT_SECONDS" "$VIDEO_BACKEND" "$DOLPHIN_CPU_CORE" "$DOLPHIN_AUDIO_BACKEND" "$TARGET_END_FRAME" "$USE_FFV1" "$DUMP_CODEC" "$DUMP_FORMAT" "$BITRATE_KBPS" "$INTERNAL_RESOLUTION_FRAME_DUMPS" "$EFB_SCALE" "$DUMP_FRAMES" "$OVERCLOCK_FACTOR" "$CPU_THREAD" "$RENDER_TO_MAIN" "$RENDER_WIDTH" "$RENDER_HEIGHT"
 from pathlib import Path
 import json
 import re
@@ -274,6 +293,11 @@ manifest = {
     "bitrateKbps": sys.argv[13],
     "internalResolutionFrameDumps": sys.argv[14],
     "efbScale": sys.argv[15],
+    "dumpFrames": sys.argv[16],
+    "overclockFactor": sys.argv[17],
+    "cpuThread": sys.argv[18],
+    "renderToMain": sys.argv[19],
+    "renderWindow": {"width": int(sys.argv[20]), "height": int(sys.argv[21])},
     "videos": [
         {"path": str(path), "bytes": path.stat().st_size}
         for path in videos
@@ -283,7 +307,7 @@ manifest = {
 print(json.dumps(manifest, indent=2))
 PY
 
-if [[ -z "$video_path" ]]; then
+if [[ "$DUMP_FRAMES" == "True" && -z "$video_path" ]]; then
   echo "No FFV1 video dump was written." >&2
   tail -n 80 "$RUN_LOG" >&2 || true
   exit 2
