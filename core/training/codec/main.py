@@ -1,12 +1,17 @@
+import av
 import torch
-from torchvision.io import read_video
 
 from dinov3_wrapper import DinoV3, DinoV3_versions
 
 
 def load_video(video_path: str) -> torch.Tensor:
-    frames, _, _ = read_video(video_path, pts_unit="sec", output_format="TCHW")
-    return frames.unsqueeze(0)
+    with av.open(video_path) as container:
+        container.streams.video[0].thread_type = "AUTO"
+        frames = [
+            torch.from_numpy(frame.to_ndarray(format="rgb24")).permute(2, 0, 1)
+            for frame in container.decode(video=0)
+        ]
+    return torch.stack(frames).unsqueeze(0)
 
 
 if __name__ == "__main__":

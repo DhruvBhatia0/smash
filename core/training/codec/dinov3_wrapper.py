@@ -21,6 +21,7 @@ class DinoV3(torch.nn.Module):
             model=dino_version.value,
             source="github",
             pretrained=True,
+            weights="/Users/dhruv/code/smash/.checkpoints/dinov3/dinov3_vits16plus_pretrain_lvd1689m-4057cbaa.pth",
         )
 
         self.model.eval()
@@ -40,4 +41,3 @@ class DinoV3(torch.nn.Module):
         averaged_hidden_states = torch.stack(hidden_states).mean(dim=0)
         # Output: (B, T, num_features, patch_h, patch_w); num_features is 384 for ViT-S+.
         return averaged_hidden_states.reshape(B, T, *averaged_hidden_states.shape[1:])
-
