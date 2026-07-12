@@ -1,0 +1,48 @@
+{
+  "format": "ACTION_PRESERVING_20FPS_V1",
+  "replay": {
+    "path": "experiments_dump/replays/realtimeTest.slp",
+    "sha256": "387311207f966e8ca14f6ccd6b271974f8a0c0e846825fe587d75650f2e45a97",
+    "firstFrame": -39,
+    "lastFrame": 2181,
+    "videoFirstSlpFrame": -122,
+    "firstSelectedVideoIndex": 83,
+    "lastSelectedVideoIndex": 2303
+  },
+  "rates": {
+    "sourceFps": 60,
+    "targetFps": 20,
+    "sourceStepsPerFullTransition": 3
+  },
+  "counts": {
+    "sourceObservations": 2221,
+    "sourceTransitions": 2220,
+    "outputObservations": 741,
+    "outputTransitions": 740,
+    "partialTransitions": 0
+  },
+  "verification": {
+    "strictCfrEndpointCompatible": true,
+    "firstStateSha256": "ce029c91e6e3f62258b54426fbae4e29e1be97554d27aebdd2bbfdd9e998b01b",
+    "lastStateSha256": "325a36d8c2813cb819aaf1b1a2880dafb3d2f955acc4e6f732340fecfa46f888",
+    "sourceActionSha256": "3cbd766d9e71292a005f30184438d31b3501439ffa59aa226c53767223327f68",
+    "reconstructedActionSha256": "3cbd766d9e71292a005f30184438d31b3501439ffa59aa226c53767223327f68",
+    "actionRoundTripExact": true
+  },
+  "naiveEveryThirdPhysicalButtons": {
+    "nativeRisingEdges": 234,
+    "exactFrameRisingEdgesRetained": 74,
+    "exactFrameRisingEdgesLost": 160,
+    "exactFrameLossPercent": 68.3760683761,
+    "fullyHiddenPressReleasePulses": 2
+  },
+  "videoValidation": {
+    "localCpuRendererSourceFrames": 100,
+    "selectedFrames": 34,
+    "outputAverageFrameRate": "20/1",
+    "outputStartTimeSeconds": 0,
+    "selectedSourceDecodedSha256": "17e7ce51e41cc6eb3b9b348e45a3c383127856f3f0e13e4384a2fb9e9c3485c1",
+    "outputDecodedSha256": "17e7ce51e41cc6eb3b9b348e45a3c383127856f3f0e13e4384a2fb9e9c3485c1",
+    "decodedFramesExact": true
+  }
+}
