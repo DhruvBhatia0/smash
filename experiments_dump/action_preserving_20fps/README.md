@@ -25,9 +25,16 @@ y[k+1] = x[3k+3]
 ```
 
 For full bins, this gives a 3x reduction in image tokens without deleting, averaging, or reordering
-a single input. The recommended model representation is `[transition, 3, player, action_features]`.
-Embed each sub-action separately with a 0/1/2 position embedding, then concatenate/project or
-use three action tokens.
+a single input. The lossless source representation is
+`[transition, 3, player, action_features]`. It does **not** require three temporal model steps:
+embed the three sub-actions with 0/1/2 position embeddings and project the ordered result into one
+action token per 20 Hz transition. The image rate, action-token rate, and model clock all remain
+20 Hz; only the information inside each action token is richer.
+
+A 100-replay CPU audit found that keeping only one native 60 Hz controller sample per 20 Hz frame
+is not safe for existing Slippi trajectories. It fully deletes 5.24% of button pulses and 16.00%
+of stick-direction episodes; 6.38% of world frames lose an event near a combo or another
+high-stakes state. See [`DAYTONA_100_SLP_AUDIT.md`](DAYTONA_100_SLP_AUDIT.md).
 
 The experiment is CPU-only. It parses `.slp` data with `slippi-js` and uses FFmpeg for optional
 lossless video selection; it does not rerun Dolphin or need a GPU.
@@ -174,11 +181,22 @@ container metadata.
 ## Integration recommendation
 
 Keep the core renderer at its fastest native output and perform this cheap CPU post-process. For
-training, store one observation image/state per anchor and three actions per transition. Validate
-every shard by flattening valid micro-actions and comparing its canonical hash to the original
-60 Hz action stream over source frames `firstFrame+1..lastFrame`. Also compare first/last telemetry
-or pixel hashes and verify explicit
-`videoIndex -> sourceFrame` mappings.
+training, store one observation image/state per anchor and three ordered micro-actions per
+transition. The preferred model interface is still one action token every 50 ms: use a small
+order-sensitive action encoder to map the three micro-actions to that token. Validate every shard
+by flattening valid micro-actions and comparing its canonical hash to the original 60 Hz action
+stream over source frames `firstFrame+1..lastFrame`. Also compare first/last telemetry or pixel
+hashes and verify explicit `videoIndex -> sourceFrame` mappings.
+
+There is an important deployment split:
+
+- If a policy can emit a three-substep macro every 50 ms, train on the ordered replay triples.
+- If the real controller is genuinely observed only once every 50 ms, those unseen substeps do not
+  exist at inference. Do not train on native 60 Hz replay endpoints labeled by a single sampled
+  action. Generate a new dataset by holding each 20 Hz input for all three emulator ticks instead.
+
+No encoding can reconstruct a one-frame human input that was never sampled. This is an information
+limit, not a model-capacity or asynchronous-I/O problem.
 
 The state hashes in this experiment cover canonical, JSON-sanitized Slippi telemetry. Undefined and
 non-finite fields become `null`; these are not Dolphin savestates. The video helper selects original
