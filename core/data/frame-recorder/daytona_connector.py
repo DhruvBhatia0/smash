@@ -196,9 +196,9 @@ class DaytonaConnector:
             1, int(os.environ.get("SMASH_PROCESSES_PER_SANDBOX", "4"))
         )
         self.result_batch_size = max(1, int(os.environ.get("SMASH_WORKER_RESULT_BATCH", "10")))
-        self.upload_batch_size = max(1, int(os.environ.get("SMASH_UPLOAD_BATCH_SIZE", "64")))
+        self.upload_batch_size = max(1, int(os.environ.get("SMASH_UPLOAD_BATCH_SIZE", "100")))
         self.upload_concurrency = max(
-            1, int(os.environ.get("SMASH_UPLOAD_CONCURRENCY", "4"))
+            1, int(os.environ.get("SMASH_UPLOAD_CONCURRENCY", "2"))
         )
         self.upload_tps_limit = max(
             1, int(os.environ.get("SMASH_UPLOAD_TPS_LIMIT", "1"))
@@ -207,7 +207,7 @@ class DaytonaConnector:
             1,
             min(
                 self.upload_batch_size,
-                int(os.environ.get("SMASH_UPLOAD_MIN_BATCH", "32")),
+                int(os.environ.get("SMASH_UPLOAD_MIN_BATCH", "64")),
             ),
         )
         self.upload_max_attempts = max(
@@ -215,7 +215,7 @@ class DaytonaConnector:
         )
         self.upload_max_bytes = max(
             64 * 1024 * 1024,
-            int(os.environ.get("SMASH_UPLOAD_BATCH_MAX_BYTES", str(1024 * 1024 * 1024))),
+            int(os.environ.get("SMASH_UPLOAD_BATCH_MAX_BYTES", str(2 * 1024**3))),
         )
         self.prefetch = max(1, int(os.environ.get("SMASH_COORDINATOR_PREFETCH", "512")))
         self.spool_max_bytes = max(
@@ -3610,12 +3610,12 @@ def build_parser() -> argparse.ArgumentParser:
     coordinator.add_argument("--prefetch", type=int, default=512)
     coordinator.add_argument("--lease-seconds", type=int, default=300)
     coordinator.add_argument("--max-attempts", type=int, default=3)
-    coordinator.add_argument("--upload-batch-size", type=int, default=64)
-    coordinator.add_argument("--upload-concurrency", type=int, default=4)
+    coordinator.add_argument("--upload-batch-size", type=int, default=100)
+    coordinator.add_argument("--upload-concurrency", type=int, default=2)
     coordinator.add_argument("--upload-tps-limit", type=int, default=1)
-    coordinator.add_argument("--upload-min-batch", type=int, default=32)
+    coordinator.add_argument("--upload-min-batch", type=int, default=64)
     coordinator.add_argument("--upload-max-attempts", type=int, default=3)
-    coordinator.add_argument("--upload-max-bytes", type=int, default=1024 * 1024 * 1024)
+    coordinator.add_argument("--upload-max-bytes", type=int, default=2 * 1024**3)
     coordinator.add_argument("--spool-max-bytes", type=int, default=6 * 1024**3)
     coordinator.add_argument("--queue-root")
     worker = subparsers.add_parser("worker")

@@ -209,6 +209,13 @@ the dump-only, single-core, no-window, and 204x168 logical-backbuffer defaults.
 Replacing RunPod provisioning with Daytona CPU provisioning is a separate
 orchestration change from the emulator bottleneck fixed here.
 
+Live production measurements favor two Drive upload streams, 100-result batches
+with a 64-result flush floor, and a 2 GiB archive cap. The worst observed
+two-stream rate was 45.7 results/minute, still above the 38.6 results/minute
+renderer rate; contiguous 100-result batches were 1.54–1.59 GiB. A third stream
+adds no required throughput and risks the 6 GiB coordinator spool and Drive
+quota when several archives overlap.
+
 ## Cleanup
 
 The benchmark sandbox `smash-emulator-cpu-build` was deleted after validation.
