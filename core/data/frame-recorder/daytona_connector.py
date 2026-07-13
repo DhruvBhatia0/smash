@@ -45,7 +45,7 @@ DEFAULT_TARGET_ROOT = (
     "hal-fox-captain-falcon-battlefield/recordings-252x208-20fps-slippi-pts-v3"
 )
 VIDEO_SUFFIXES = (".avi", ".mkv", ".mp4", ".mov", ".nut")
-DEFAULT_DRIVE_CHUNK_SIZE = "128M"
+DEFAULT_DRIVE_CHUNK_SIZE = "512M"
 
 _INVALID_PLAYABLE_MAPPING = re.compile(
     r"(?:RuntimeError: )?invalid playable/render frame mapping: "

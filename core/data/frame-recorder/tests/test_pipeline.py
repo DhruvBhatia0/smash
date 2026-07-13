@@ -1587,7 +1587,7 @@ class PipelineTests(unittest.TestCase):
 
             command = popen.call_args_list[0].args[0]
             index = command.index("--drive-chunk-size")
-            self.assertEqual(command[index + 1], "128M")
+            self.assertEqual(command[index + 1], "512M")
 
     def test_stream_archive_prefers_rclone_error_when_children_exit_nonzero(self):
         with tempfile.TemporaryDirectory() as temporary:
