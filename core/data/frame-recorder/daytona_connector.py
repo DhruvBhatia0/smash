@@ -47,6 +47,7 @@ DEFAULT_TARGET_ROOT = (
 VIDEO_SUFFIXES = (".avi", ".mkv", ".mp4", ".mov", ".nut")
 DEFAULT_DRIVE_CHUNK_SIZE = "512M"
 DEFAULT_SPOOL_MAX_BYTES = 9 * 1024**3
+WORKER_SUPERVISOR_LOCK = "/tmp/smash-worker-supervisor.lock"
 
 _INVALID_PLAYABLE_MAPPING = re.compile(
     r"(?:RuntimeError: )?invalid playable/render frame mapping: "
@@ -76,6 +77,10 @@ def _no_playable_frames_result_tar() -> bytes:
 
 class PostCommitCleanupError(RuntimeError):
     """The Drive manifest is durable, but local committed files could not be removed."""
+
+
+class ResultRejectedError(RuntimeError):
+    """The coordinator durably rejected a worker result for its current lease."""
 
 
 def _json_line(event: str, **fields) -> None:
@@ -280,6 +285,10 @@ class DaytonaConnector:
         )
         if not self.run_id:
             raise ValueError("SMASH_RUN_ID must contain at least one letter or digit")
+        self.controller_id = secrets.token_hex(12)
+        self.target_id = hashlib.sha256(
+            _remote(self.drive_remote, self.target_root).encode()
+        ).hexdigest()[:16]
         self.queue_root = f"{self.queue_mount}/runs/{self.run_id}"
         self._owned_sandboxes: list[str] = []
         self._owned_lock = threading.Lock()
@@ -332,11 +341,13 @@ class DaytonaConnector:
         )
 
     def run(self, sample_limit: int = 0, worker_count: int = 0) -> dict:
+        self._assert_run_id_available()
         token = secrets.token_urlsafe(32)
         coordinator_name = f"smash-coord-{self.run_id}"
         coordinator: DaytonaSandbox | None = None
         workers: list[DaytonaSandbox] = []
         started = time.monotonic()
+        primary_error: BaseException | None = None
         try:
             worker_profile = self._cpu_only_snapshot(self.renderer_snapshot)
             self._cpu_only_snapshot(self.coordinator_snapshot)
@@ -424,14 +435,19 @@ class DaytonaConnector:
                         stalledSeconds=round(time.monotonic() - last_progress, 3),
                     )
                 time.sleep(self.poll_seconds)
+        except BaseException as error:
+            primary_error = error
+            raise
         finally:
             if not self.keep_resources:
+                cleanup_errors: list[str] = []
                 workers_quiesced = False
                 try:
                     self._delete_run_workers()
                     workers_quiesced = True
                 except Exception as error:
                     _json_line("worker_quiesce_failed", error=str(error))
+                    cleanup_errors.append(f"worker quiesce: {error}")
                 coordinator_stopped = False
                 if coordinator is not None and workers_quiesced:
                     try:
@@ -439,10 +455,26 @@ class DaytonaConnector:
                         coordinator_stopped = True
                     except Exception as error:
                         _json_line("coordinator_stop_failed", error=str(error))
+                        cleanup_errors.append(f"coordinator stop: {error}")
                 if coordinator is not None and workers_quiesced and coordinator_stopped:
-                    with contextlib.suppress(Exception):
+                    try:
+                        self._assert_queue_cleanup_owned(coordinator)
                         self._remove_queue_root(coordinator)
-                self._cleanup()
+                    except Exception as error:
+                        _json_line("queue_root_cleanup_failed", error=str(error))
+                        cleanup_errors.append(f"queue root: {error}")
+                try:
+                    self._cleanup()
+                except Exception as error:
+                    cleanup_errors.append(f"sandbox cleanup: {error}")
+                if cleanup_errors:
+                    message = "; ".join(cleanup_errors)
+                    _json_line("run_cleanup_failed", error=message)
+                    if primary_error is None:
+                        raise RuntimeError(message)
+                    add_note = getattr(primary_error, "add_note", None)
+                    if add_note is not None:
+                        add_note(f"Daytona cleanup also failed: {message}")
 
     def _daytona(self, *args: str, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
         return _run([self.daytona, *args], timeout=timeout)
@@ -470,9 +502,22 @@ class DaytonaConnector:
         )
 
     def _list_sandboxes(self) -> list[dict]:
-        rows = json.loads(
-            self._daytona("list", "--format", "json", "--limit", "100").stdout
-        )["items"]
+        rows: list[dict] = []
+        cursor = ""
+        seen_cursors: set[str] = set()
+        while True:
+            command = ["list", "--format", "json", "--limit", "100"]
+            if cursor:
+                command += ["--cursor", cursor]
+            page = json.loads(self._daytona(*command).stdout)
+            rows.extend(page["items"])
+            next_cursor = str(page.get("nextCursor") or "")
+            if not next_cursor:
+                break
+            if next_cursor in seen_cursors:
+                raise RuntimeError("Daytona sandbox pagination cursor repeated")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
         return [
             row
             for row in rows
@@ -502,6 +547,11 @@ class DaytonaConnector:
         env: dict[str, str] | None = None,
         volume: str | None = None,
     ) -> DaytonaSandbox:
+        labels = {
+            **labels,
+            "smash-controller-id": self.controller_id,
+            "smash-target-id": self.target_id,
+        }
         with self._name_lock:
             if self._existing_names is None:
                 self._existing_names = {
@@ -682,19 +732,16 @@ class DaytonaConnector:
             ],
             timeout=300,
         )
-        config_payload = base64.b64encode(self.rclone_config.read_bytes()).decode("ascii")
-        config_script = (
-            "import base64,pathlib; p=pathlib.Path('/tmp/rclone.conf'); "
-            f"p.write_bytes(base64.b64decode({config_payload!r}))"
-        )
-        self._exec(sandbox, ["python3", "-c", config_script], timeout=60)
+        self._upload_file(sandbox, self.rclone_config, "/tmp/")
+        uploaded_config = f"/tmp/{self.rclone_config.name}"
         self._exec(
             sandbox,
             [
-                "install",
-                "-m",
-                "600",
-                "/tmp/rclone.conf",
+                "bash",
+                "-lc",
+                "set -e; "
+                f"trap {shlex.quote(f'rm -f -- {shlex.quote(uploaded_config)}')} EXIT; "
+                f"install -m 600 -- {shlex.quote(uploaded_config)} "
                 "/home/daytona/.config/rclone/rclone.conf",
             ],
             timeout=60,
@@ -805,14 +852,23 @@ if path.is_file():
             "if [ $status -eq 0 ]; then exit 0; fi; sleep 5; done"
         )
         shell = (
-            f"nohup bash -lc {shlex.quote(supervisor)} "
+            f"nohup flock -n {shlex.quote(WORKER_SUPERVISOR_LOCK)} "
+            f"bash -lc {shlex.quote(supervisor)} "
             "> /tmp/smash-worker.log 2>&1 &"
         )
         self._exec(sandbox, ["bash", "-lc", shell], timeout=30)
         self._exec(
             sandbox,
-            ["bash", "-lc", "sleep 1; pgrep -f 'daytona_connector.py worker' >/dev/null"],
+            ["bash", "-lc", f"sleep 1; {self._worker_supervisor_probe()}"],
             timeout=30,
+        )
+
+    @staticmethod
+    def _worker_supervisor_probe() -> str:
+        lock = shlex.quote(WORKER_SUPERVISOR_LOCK)
+        return (
+            f"if flock -n {lock} true; then exit 1; "
+            "else echo supervisor-alive; fi"
         )
 
     def _recover_workers(self, workers: list[DaytonaSandbox]) -> None:
@@ -824,12 +880,14 @@ if path.is_file():
                 row = rows.get(worker.name)
                 if row is None:
                     raise RuntimeError("sandbox is absent")
+                if not self._owns_sandbox(row, "worker"):
+                    raise RuntimeError("sandbox name is owned by another controller")
                 if row.get("state") != "started":
                     self._daytona("start", worker.name, timeout=300)
                 try:
                     process = self._exec(
                         worker,
-                        ["pgrep", "-f", "daytona_connector.py worker"],
+                        ["bash", "-lc", self._worker_supervisor_probe()],
                         timeout=30,
                     )
                 except RuntimeError:
@@ -846,7 +904,16 @@ if path.is_file():
                 )
             # A missing/broken sandbox must not abort the healthy fleet. Delete it if it still
             # exists, then replace just that capacity; lost leases requeue through heartbeats.
-            _run([self.daytona, "delete", worker.name], check=False, timeout=300)
+            try:
+                self._delete_owned_sandbox(worker.name, "worker")
+            except Exception as error:
+                _json_line(
+                    "worker_replacement_blocked",
+                    name=worker.name,
+                    index=index,
+                    error=str(error),
+                )
+                return
             replacement: DaytonaSandbox | None = None
             try:
                 generation = self._worker_recovery_generation.get(index, 0) + 1
@@ -862,7 +929,8 @@ if path.is_file():
                 )
             except Exception as error:
                 if replacement is not None:
-                    _run([self.daytona, "delete", replacement.name], check=False, timeout=300)
+                    with contextlib.suppress(Exception):
+                        self._delete_owned_sandbox(replacement.name, "worker")
                 _json_line(
                     "worker_replacement_retry",
                     oldName=worker.name,
@@ -874,6 +942,18 @@ if path.is_file():
             max_workers=min(self.launch_parallelism, len(workers))
         ) as executor:
             list(executor.map(recover, enumerate(workers)))
+
+    def _delete_owned_sandbox(self, name: str, role: str) -> None:
+        matching = [
+            row for row in self._list_sandboxes() if str(row.get("name")) == name
+        ]
+        if not matching:
+            return
+        if len(matching) != 1 or not self._owns_sandbox(matching[0], role):
+            raise RuntimeError(f"refusing to delete foreign Daytona sandbox: {name}")
+        completed = _run([self.daytona, "delete", name], check=False, timeout=300)
+        if completed.returncode and "not found" not in completed.stderr.lower():
+            raise RuntimeError(completed.stderr.strip() or f"could not delete {name}")
 
     def _upload_file(self, sandbox: DaytonaSandbox, local_path: Path, destination: str) -> None:
         shim = Path(__file__).parents[3] / "experiments_dump/fast_replay_probe/daytona_ssh_upload"
@@ -932,19 +1012,75 @@ if path.is_file():
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.load(response)
 
+    def _assert_run_id_available(self) -> None:
+        conflicts = sorted(
+            str(row["name"])
+            for row in self._list_sandboxes()
+            if (row.get("labels") or {}).get("smash-run-id") == self.run_id
+            or (row.get("labels") or {}).get("smash-target-id") == self.target_id
+        )
+        if conflicts:
+            raise RuntimeError(
+                f"Daytona run ID {self.run_id!r} or target already has live sandboxes: "
+                f"{conflicts}"
+            )
+
+    def _assert_queue_cleanup_owned(self, coordinator: DaytonaSandbox) -> None:
+        same_run = [
+            row
+            for row in self._list_sandboxes()
+            if (row.get("labels") or {}).get("smash-run-id") == self.run_id
+        ]
+        owned_coordinator = [
+            row
+            for row in same_run
+            if str(row.get("name")) == coordinator.name
+            and self._owns_sandbox(row, "coordinator")
+        ]
+        conflicts = sorted(
+            str(row.get("name"))
+            for row in same_run
+            if row not in owned_coordinator
+        )
+        if len(owned_coordinator) != 1 or conflicts:
+            raise RuntimeError(
+                "refusing shared queue deletion with missing/foreign same-run sandboxes: "
+                f"coordinator={len(owned_coordinator)}, conflicts={conflicts}"
+            )
+
+    def _owned_inventory(
+        self,
+        pending: set[str],
+        role: str | None = None,
+    ) -> tuple[set[str], set[str], set[str]]:
+        rows = self._list_sandboxes()
+        existing = {str(row["name"]): row for row in rows}
+        owned = {
+            name for name, row in existing.items() if self._owns_sandbox(row, role)
+        }
+        active = (pending & set(existing)) | owned
+        ambiguous = {name for name in active if name not in owned}
+        return active, owned, ambiguous
+
     def _cleanup(self) -> None:
         with self._owned_lock:
             pending = set(self._owned_sandboxes)
-        with contextlib.suppress(Exception):
-            pending.update(
-                str(row["name"])
-                for row in self._list_sandboxes()
-                if (row.get("labels") or {}).get("smash-run-id") == self.run_id
-            )
+        verification_error: Exception | None = None
         for attempt in range(1, 4):
-            if not pending:
+            deletable: set[str] = set()
+            try:
+                pending, deletable, ambiguous = self._owned_inventory(pending)
+                verification_error = (
+                    RuntimeError(f"sandbox names changed ownership: {sorted(ambiguous)}")
+                    if ambiguous
+                    else None
+                )
+            except Exception as error:
+                verification_error = error
+                _json_line("sandbox_discovery_retry", attempt=attempt, error=str(error))
+            if not pending and verification_error is None:
                 break
-            for name in sorted(pending, reverse=True):
+            for name in sorted(deletable, reverse=True):
                 completed = _run([self.daytona, "delete", name], check=False, timeout=300)
                 _json_line(
                     "sandbox_delete_attempt",
@@ -954,52 +1090,84 @@ if path.is_file():
                     or "not found" in completed.stderr.lower(),
                 )
             try:
-                existing = {str(row["name"]) for row in self._list_sandboxes()}
-                pending.intersection_update(existing)
+                pending, _, ambiguous = self._owned_inventory(pending)
+                verification_error = (
+                    RuntimeError(f"sandbox names changed ownership: {sorted(ambiguous)}")
+                    if ambiguous
+                    else None
+                )
             except Exception as error:
+                verification_error = error
                 _json_line("sandbox_delete_verify_retry", attempt=attempt, error=str(error))
-            if pending:
+            if pending or verification_error is not None:
                 time.sleep(2**attempt)
+            else:
+                break
+        try:
+            pending, _, ambiguous = self._owned_inventory(pending)
+            verification_error = (
+                RuntimeError(f"sandbox names changed ownership: {sorted(ambiguous)}")
+                if ambiguous
+                else None
+            )
+        except Exception as error:
+            verification_error = error
         if pending:
             _json_line("sandbox_cleanup_incomplete", names=sorted(pending))
         with self._owned_lock:
             self._owned_sandboxes[:] = [
                 name for name in self._owned_sandboxes if name in pending
             ]
+        if pending or verification_error is not None:
+            detail = (
+                f"remaining={sorted(pending)}"
+                if verification_error is None
+                else f"verification failed: {verification_error}; remaining={sorted(pending)}"
+            )
+            raise RuntimeError(f"Daytona sandbox cleanup incomplete: {detail}")
+
+    def _owns_sandbox(self, row: dict, role: str | None = None) -> bool:
+        labels = row.get("labels") or {}
+        return bool(
+            labels.get("smash-run-id") == self.run_id
+            and labels.get("smash-controller-id") == self.controller_id
+            and (role is None or labels.get("smash-role") == role)
+        )
 
     def _delete_run_workers(self) -> None:
-        pending = {
-            str(row["name"])
-            for row in self._list_sandboxes()
-            if (row.get("labels") or {}).get("smash-run-id") == self.run_id
-            and (row.get("labels") or {}).get("smash-role") == "worker"
-        }
+        with self._owned_lock:
+            pending = {
+                name
+                for name in self._owned_sandboxes
+                if name.startswith(f"smash-worker-{self.run_id}-")
+            }
 
         def delete(name: str) -> tuple[str, bool]:
             completed = _run([self.daytona, "delete", name], check=False, timeout=300)
             return name, completed.returncode == 0 or "not found" in completed.stderr.lower()
 
         for attempt in range(1, 4):
+            pending, deletable, ambiguous = self._owned_inventory(pending, "worker")
+            if ambiguous:
+                raise RuntimeError(f"worker names changed ownership: {sorted(ambiguous)}")
             if not pending:
                 break
             with ThreadPoolExecutor(
-                max_workers=min(self.launch_parallelism, len(pending) or 1)
+                max_workers=min(self.launch_parallelism, len(deletable) or 1)
             ) as pool:
-                results = list(pool.map(delete, sorted(pending)))
+                results = list(pool.map(delete, sorted(deletable)))
             for name, ok in results:
                 _json_line("worker_quiesced", name=name, attempt=attempt, ok=ok)
-            existing = {str(row["name"]) for row in self._list_sandboxes()}
-            pending.intersection_update(existing)
+            pending, _, ambiguous = self._owned_inventory(pending, "worker")
+            if ambiguous:
+                raise RuntimeError(f"worker names changed ownership: {sorted(ambiguous)}")
             if pending:
                 time.sleep(2**attempt)
         if pending:
             raise RuntimeError(f"could not quiesce workers: {sorted(pending)}")
-        run_worker_names = {
-            str(row["name"])
-            for row in self._list_sandboxes()
-            if (row.get("labels") or {}).get("smash-run-id") == self.run_id
-            and (row.get("labels") or {}).get("smash-role") == "worker"
-        }
+        run_worker_names, _, ambiguous = self._owned_inventory(set(), "worker")
+        if ambiguous:
+            raise RuntimeError(f"worker names changed ownership: {sorted(ambiguous)}")
         if run_worker_names:
             raise RuntimeError(f"workers reappeared during quiesce: {sorted(run_worker_names)}")
         with self._owned_lock:
@@ -1093,6 +1261,41 @@ class DriveClient:
             raise RuntimeError(completed.stderr.strip() or completed.stdout.strip())
         return sorted(line for line in completed.stdout.splitlines() if line)
 
+    def list_file_metadata(self, root: str) -> dict[str, int]:
+        completed = _run(
+            [
+                "rclone",
+                "lsjson",
+                _remote(self.remote, root),
+                "--recursive",
+                "--files-only",
+                "--no-modtime",
+                "--no-mimetype",
+                "--config",
+                str(self.config),
+                "--retries",
+                "10",
+                "--low-level-retries",
+                "20",
+                "--tpslimit",
+                "1",
+                "--tpslimit-burst",
+                "1",
+            ],
+            check=False,
+        )
+        if completed.returncode:
+            message = completed.stderr.lower()
+            if "directory not found" in message or "object not found" in message:
+                return {}
+            raise RuntimeError(completed.stderr.strip() or completed.stdout.strip())
+        rows = json.loads(completed.stdout or "[]")
+        return {
+            str(row["Path"]): int(row["Size"])
+            for row in rows
+            if not row.get("IsDir")
+        }
+
     def cat(self, path: str) -> bytes:
         completed = subprocess.run(
             [
@@ -1150,9 +1353,9 @@ class DriveClient:
                 "--include",
                 "*.manifest.jsonl",
                 "--transfers",
-                "8",
+                "1",
                 "--checkers",
-                "8",
+                "1",
                 "--config",
                 str(self.config),
                 "--retries",
@@ -1160,9 +1363,9 @@ class DriveClient:
                 "--low-level-retries",
                 "5",
                 "--tpslimit",
-                "8",
+                "1",
                 "--tpslimit-burst",
-                "8",
+                "1",
             ],
             check=False,
         )
@@ -1231,6 +1434,7 @@ class CoordinatorState:
                 "grants",
                 "leased",
                 "results",
+                "acks",
                 "failures",
                 "heartbeats",
             ):
@@ -1301,7 +1505,9 @@ class CoordinatorState:
 
     def initialize(self) -> None:
         references = self._source_references()
-        uploaded = self._uploaded_references()
+        uploaded = self._uploaded_references(
+            {reference: job_id for job_id, (reference, _, _) in enumerate(references)}
+        )
         filesystem_leases: set[int] = set()
         if self.queue_root is not None:
             for path in (self.queue_root / "leased").glob("*.json"):
@@ -1406,6 +1612,29 @@ class CoordinatorState:
                 if not self._unlink_shared_paths([payload], attempts=4):
                     raise RuntimeError(f"could not remove stale shared result: {payload}")
                 _json_line("stale_shared_result_removed", payload=str(payload))
+        ack_max_age = max(3600, self.lease_seconds * 4)
+        for ack in (self.queue_root / "acks").glob("*.json"):
+            try:
+                stale = now - ack.stat().st_mtime > ack_max_age
+                descriptor = json.loads(ack.read_text())
+                job_id = int(descriptor["id"])
+                lease_token = str(descriptor["leaseToken"])
+                source_reference = str(descriptor["sourceReference"])
+            except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            with self.lock:
+                row = self.db.execute(
+                    "SELECT reference, status, result_token FROM jobs WHERE id=?",
+                    (job_id,),
+                ).fetchone()
+            committed = bool(
+                row is not None
+                and row["reference"] == source_reference
+                and row["status"] in {"complete", "uploading", "uploaded"}
+                and (row["status"] == "uploaded" or row["result_token"] == lease_token)
+            )
+            if stale and committed and not self._unlink_shared_paths([ack], attempts=4):
+                raise RuntimeError(f"could not remove stale shared result ack: {ack}")
 
     def _delete_local_rows(self, rows: Iterable[sqlite3.Row]) -> None:
         allowed_roots = [self.spool.resolve()]
@@ -1462,16 +1691,111 @@ class CoordinatorState:
             raise RuntimeError(f"no indexed SLPs found under {_remote(self.drive.remote, self.source_root)}")
         return rows
 
-    def _uploaded_references(self) -> set[str]:
+    def _uploaded_references(self, expected_samples: dict[str, int]) -> set[str]:
         uploaded: set[str] = set()
         committed = self.manifests / "committed"
-        for manifest in self.drive.download_manifests(
-            f"{self.target_root}/batches", committed
-        ):
-            for raw_line in manifest.read_bytes().splitlines():
-                row = json.loads(raw_line)
-                if row.get("status") == "complete" and row.get("sourceReference"):
-                    uploaded.add(str(row["sourceReference"]))
+        remote_root = f"{self.target_root}/batches"
+        manifests = self.drive.download_manifests(remote_root, committed)
+        remote_files = self.drive.list_file_metadata(remote_root)
+        local_manifest_paths = {
+            manifest.relative_to(committed).as_posix() for manifest in manifests
+        }
+        remote_manifest_paths = {
+            path for path in remote_files if path.endswith(".manifest.jsonl")
+        }
+        if local_manifest_paths != remote_manifest_paths:
+            raise ValueError(
+                "committed manifest sync was incomplete: "
+                f"missing={sorted(remote_manifest_paths - local_manifest_paths)}, "
+                f"unexpected={sorted(local_manifest_paths - remote_manifest_paths)}"
+            )
+        base_keys = {
+            "schemaVersion",
+            "status",
+            "sample",
+            "sourceReference",
+            "sourceSha256",
+            "archive",
+        }
+        skipped_keys = base_keys | {"artifact", "skipReason"}
+        for manifest in manifests:
+            relative = manifest.relative_to(committed).as_posix()
+            match = re.fullmatch(r"batch-([0-9a-f]{20})[.]manifest[.]jsonl", relative)
+            if match is None:
+                raise ValueError(f"noncanonical committed manifest path: {relative}")
+            remote_size = remote_files.get(relative)
+            local_size = manifest.stat().st_size
+            if remote_size is None or remote_size <= 0 or remote_size != local_size:
+                raise ValueError(
+                    f"committed manifest size mismatch for {relative}: "
+                    f"local={local_size}, remote={remote_size}"
+                )
+            rows: list[dict] = []
+            for line_number, raw_line in enumerate(manifest.read_bytes().splitlines(), 1):
+                try:
+                    row = json.loads(raw_line)
+                except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise ValueError(
+                        f"invalid committed manifest JSON {relative}:{line_number}: {error}"
+                    ) from error
+                if not isinstance(row, dict):
+                    raise ValueError(
+                        f"invalid committed manifest row {relative}:{line_number}"
+                    )
+                rows.append(row)
+            if not 1 <= len(rows) <= self.upload_batch_size:
+                raise ValueError(
+                    f"invalid committed manifest batch size for {relative}: {len(rows)}"
+                )
+            key = match.group(1)
+            expected_archive = f"{remote_root}/batch-{key}.tar.zst"
+            archive_relative = f"batch-{key}.tar.zst"
+            if int(remote_files.get(archive_relative, 0)) <= 0:
+                raise ValueError(f"committed manifest archive is absent: {expected_archive}")
+            references: list[str] = []
+            samples: list[int] = []
+            for line_number, row in enumerate(rows, 1):
+                keys = set(row)
+                skipped = row.get("artifact") == "skipped"
+                if keys != (skipped_keys if skipped else base_keys):
+                    raise ValueError(
+                        f"invalid committed manifest fields {relative}:{line_number}: "
+                        f"{sorted(keys)}"
+                    )
+                sample = row.get("sample")
+                reference = row.get("sourceReference")
+                if (
+                    not isinstance(row.get("schemaVersion"), int)
+                    or isinstance(row.get("schemaVersion"), bool)
+                    or row.get("schemaVersion") != 1
+                    or row.get("status") != "complete"
+                    or not isinstance(sample, int)
+                    or isinstance(sample, bool)
+                    or not isinstance(reference, str)
+                    or expected_samples.get(reference) != sample
+                    or not isinstance(row.get("sourceSha256"), str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", row.get("sourceSha256", ""))
+                    or row.get("archive") != expected_archive
+                    or (
+                        skipped
+                        and row.get("skipReason") != NO_PLAYABLE_FRAMES
+                    )
+                ):
+                    raise ValueError(
+                        f"invalid committed manifest value {relative}:{line_number}"
+                    )
+                if reference in uploaded:
+                    raise ValueError(f"duplicate committed source reference: {reference}")
+                uploaded.add(reference)
+                references.append(reference)
+                samples.append(sample)
+            computed = hashlib.sha256("\n".join(references).encode()).hexdigest()[:20]
+            if computed != key:
+                raise ValueError(
+                    f"committed manifest identity mismatch for {relative}: {computed}"
+                )
+            if samples != sorted(samples):
+                raise ValueError(f"committed manifest samples are not sorted: {relative}")
         return uploaded
 
     def start(self) -> None:
@@ -1520,7 +1844,25 @@ class CoordinatorState:
         for archive in archives:
             if self.stop.is_set():
                 break
-            self._stream_archive(archive)
+            for attempt in range(1, 6):
+                try:
+                    self._stream_archive(archive)
+                    break
+                except Exception as error:
+                    if self.stop.is_set() or attempt == 5:
+                        raise
+                    delay = min(30, 2**attempt)
+                    _json_line(
+                        "source_archive_stream_retry",
+                        archive=archive,
+                        attempt=attempt,
+                        retryAfterSeconds=delay,
+                        error=f"{type(error).__name__}: {error}",
+                    )
+                    if self.stop.wait(delay):
+                        raise RuntimeError(
+                            "coordinator stopped while retrying source archive"
+                        ) from error
         with self.condition:
             self.producer_done = True
             self.condition.notify_all()
@@ -1785,9 +2127,20 @@ class CoordinatorState:
         token_key = hashlib.sha256(lease_token.encode()).hexdigest()[:12]
         temporary = self.results / f"{job_id:06d}.{token_key}.{secrets.token_hex(4)}.partial"
         try:
-            temporary.write_bytes(payload)
+            with temporary.open("wb") as output:
+                output.write(payload)
+                output.flush()
+                os.fsync(output.fileno())
             result_sha256 = hashlib.sha256(payload).hexdigest()
             with self.condition, self.db:
+                row = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+                if (
+                    row is None
+                    or row["status"] != "leased"
+                    or row["lease_token"] != lease_token
+                ):
+                    return
+                self._durable_replace(temporary, target)
                 cursor = self.db.execute(
                     """
                     UPDATE jobs SET status='complete', result_path=?, result_bytes=?,
@@ -1806,9 +2159,9 @@ class CoordinatorState:
                         lease_token,
                     ),
                 )
-                if cursor.rowcount == 1:
-                    temporary.replace(target)
-                    self.condition.notify_all()
+                if cursor.rowcount != 1:
+                    raise RuntimeError("no-playable result lease changed during commit")
+                self.condition.notify_all()
         finally:
             temporary.unlink(missing_ok=True)
             self._release_result_capacity(result_bytes)
@@ -1859,6 +2212,8 @@ class CoordinatorState:
                     output.write(chunk)
                     digest.update(chunk)
                     remaining -= len(chunk)
+                output.flush()
+                os.fsync(output.fileno())
             result_sha256 = digest.hexdigest()
             if expected_sha256 is not None and result_sha256 != expected_sha256:
                 raise ValueError(
@@ -1882,6 +2237,21 @@ class CoordinatorState:
             self._validate_result(temporary, job_id)
             result_bytes = temporary.stat().st_size
             with self.condition, self.db:
+                row = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+                if (
+                    row is not None
+                    and row["status"] in {"complete", "uploading", "uploaded"}
+                    and row["result_token"] == lease_token
+                    and row["result_sha256"] == result_sha256
+                ):
+                    return
+                if (
+                    row is None
+                    or row["status"] != "leased"
+                    or row["lease_token"] != lease_token
+                ):
+                    raise PermissionError("lease expired while result was committing")
+                self._durable_replace(temporary, target)
                 cursor = self.db.execute(
                     """
                     UPDATE jobs SET status='complete', result_path=?, result_bytes=?,
@@ -1900,20 +2270,23 @@ class CoordinatorState:
                     ),
                 )
                 if cursor.rowcount != 1:
-                    row = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
-                    if not (
-                        row is not None
-                        and row["status"] in {"complete", "uploading", "uploaded"}
-                        and row["result_token"] == lease_token
-                        and row["result_sha256"] == result_sha256
-                    ):
-                        raise PermissionError("lease expired while result was committing")
-                else:
-                    temporary.replace(target)
-                    self.condition.notify_all()
+                    raise RuntimeError("result lease changed during locked commit")
+                self.condition.notify_all()
         finally:
             temporary.unlink(missing_ok=True)
             self._release_result_capacity(length)
+
+    @staticmethod
+    def _durable_replace(temporary: Path, target: Path) -> None:
+        os.replace(temporary, target)
+        directory_fd = os.open(
+            target.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
     def _validate_result(self, path: Path, job_id: int) -> None:
         with tarfile.open(path, "r") as result:
@@ -2108,6 +2481,10 @@ class CoordinatorState:
             lease_token = str(descriptor["leaseToken"])
             worker_id = str(descriptor["workerId"])
             attempts = int(descriptor["attempts"])
+            reference = str(descriptor["reference"])
+            source_path = str(descriptor["sourcePath"])
+            source_bytes = int(descriptor["sourceBytes"])
+            source_sha256 = str(descriptor["sourceSha256"])
         except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
             with contextlib.suppress(OSError):
                 stale = time.time() - lease_path.stat().st_mtime > self.lease_seconds
@@ -2129,10 +2506,27 @@ class CoordinatorState:
             heartbeat_seen = True
         cleanup = False
         adopted = False
+        republish = False
         with self.condition, self.db:
             row = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
-            if row is None or row["status"] in {"complete", "uploading", "uploaded", "failed"}:
+            identity_matches = bool(
+                row is not None
+                and reference == str(row["reference"])
+                and source_path == str(row["source_path"])
+                and source_bytes == int(row["source_bytes"] or -1)
+                and source_sha256 == str(row["source_sha256"])
+            )
+            if (
+                row is None
+                or not identity_matches
+                or row["status"] in {"complete", "uploading", "uploaded", "failed"}
+            ):
                 cleanup = True
+                republish = bool(
+                    row is not None
+                    and row["status"] == "queued"
+                    and not identity_matches
+                )
             elif row["status"] == "queued":
                 cursor = self.db.execute(
                     """
@@ -2157,6 +2551,8 @@ class CoordinatorState:
                 cleanup = True
         if cleanup:
             self._cleanup_shared_lease(job_id, lease_token, include_result=True)
+            if republish:
+                self._publish_pending(job_id)
         elif adopted:
             descriptor["granted"] = True
             grant = self.queue_root / "grants" / f"{self._lease_stem(job_id, lease_token)}.json"
@@ -2166,49 +2562,205 @@ class CoordinatorState:
     def _sync_filesystem_result(self, marker: Path) -> None:
         job_id: int | None = None
         lease_token: str | None = None
+        source_reference: str | None = None
+        source_sha256: str | None = None
+        result_bytes: int | None = None
+        result_sha256: str | None = None
+        completed_at: float | None = None
+        accepted = False
         cleanup = False
         try:
             descriptor = json.loads(marker.read_text())
+            if descriptor.get("schemaVersion") != 1:
+                raise ValueError("unsupported shared result marker schema")
+            completed_at = float(descriptor["completedAt"])
             job_id = int(descriptor["id"])
             lease_token = str(descriptor["leaseToken"])
+            source_reference = str(descriptor["sourceReference"])
+            source_sha256 = str(descriptor["sourceSha256"])
             stem = self._lease_stem(job_id, lease_token)
             expected_marker = self.queue_root / "results" / f"{stem}.result.json"
             expected_result = self.queue_root / "results" / f"{stem}.tar"
             result = Path(str(descriptor["resultPath"]))
             length = int(descriptor["resultBytes"])
+            result_bytes = length
             result_sha256 = str(descriptor["resultSha256"])
             if marker != expected_marker or result != expected_result:
                 raise ValueError("result marker path does not match its lease")
-            if not result.is_file():
-                if time.time() - marker.stat().st_mtime <= 60:
-                    return
-                raise FileNotFoundError("shared result payload did not become visible")
-            if result.stat().st_size != length:
-                raise ValueError("shared result size does not match its marker")
-            with result.open("rb") as source:
-                self.accept_result(
-                    job_id,
-                    lease_token,
-                    source,
-                    length,
-                    expected_sha256=result_sha256,
-                )
+            with self.lock:
+                row = self.db.execute(
+                    "SELECT * FROM jobs WHERE id=?",
+                    (job_id,),
+                ).fetchone()
+            if (
+                row is None
+                or row["reference"] != source_reference
+                or row["source_sha256"] != source_sha256
+            ):
+                raise ValueError("shared result source identity does not match its job")
+            committed_retry = bool(
+                row["status"] in {"complete", "uploading", "uploaded"}
+                and row["result_token"] == lease_token
+                and row["result_sha256"] == result_sha256
+            )
+            if committed_retry:
+                if row["status"] != "uploaded":
+                    local_result = Path(str(row["result_path"] or ""))
+                    try:
+                        durable = bool(
+                            local_result.is_file()
+                            and int(row["result_bytes"] or -1) == length
+                            and local_result.stat().st_size == length
+                            and _sha256(local_result) == result_sha256
+                        )
+                    except OSError as error:
+                        raise RuntimeError(
+                            f"could not verify committed result {job_id}: {error}"
+                        ) from error
+                    if not durable:
+                        try:
+                            shared_ready = bool(
+                                result.is_file() and result.stat().st_size == length
+                            )
+                        except OSError as error:
+                            raise RuntimeError(
+                                f"could not verify shared repair payload {job_id}: {error}"
+                            ) from error
+                        if not shared_ready:
+                            raise RuntimeError(
+                                f"committed result {job_id} is not durable on coordinator "
+                                "or shared storage"
+                            )
+                        repair = self.results / (
+                            f"{job_id:06d}.repair.{secrets.token_hex(4)}.partial"
+                        )
+                        repair_digest = hashlib.sha256()
+                        try:
+                            with result.open("rb") as source, repair.open("wb") as output:
+                                while chunk := source.read(1024 * 1024):
+                                    output.write(chunk)
+                                    repair_digest.update(chunk)
+                                output.flush()
+                                os.fsync(output.fileno())
+                            if repair_digest.hexdigest() != result_sha256:
+                                raise RuntimeError(
+                                    f"shared repair payload for {job_id} failed checksum"
+                                )
+                            self._validate_result(repair, job_id)
+                            expected_local = self.results / f"{job_id:06d}.tar"
+                            if local_result != expected_local:
+                                raise RuntimeError(
+                                    f"committed result {job_id} has unsafe local path"
+                                )
+                            with self.condition, self.db:
+                                current = self.db.execute(
+                                    "SELECT * FROM jobs WHERE id=?", (job_id,)
+                                ).fetchone()
+                                if (
+                                    current is None
+                                    or current["status"] not in {"complete", "uploading", "uploaded"}
+                                    or current["result_token"] != lease_token
+                                    or current["result_sha256"] != result_sha256
+                                ):
+                                    raise PermissionError(
+                                        "committed result changed while it was being repaired"
+                                    )
+                                if current["status"] != "uploaded":
+                                    self._durable_replace(repair, expected_local)
+                        finally:
+                            repair.unlink(missing_ok=True)
+            else:
+                if not result.is_file():
+                    if self._shared_result_age(marker, completed_at) <= 60:
+                        return
+                    raise FileNotFoundError("shared result payload did not become visible")
+                if result.stat().st_size != length:
+                    raise ValueError("shared result size does not match its marker")
+                with result.open("rb") as source:
+                    self.accept_result(
+                        job_id,
+                        lease_token,
+                        source,
+                        length,
+                        expected_sha256=result_sha256,
+                    )
+            accepted = True
+            _atomic_json(
+                self.queue_root / "acks" / f"{stem}.json",
+                {
+                    "schemaVersion": 1,
+                    "id": job_id,
+                    "leaseToken": lease_token,
+                    "sourceReference": source_reference,
+                    "sourceSha256": source_sha256,
+                    "resultBytes": result_bytes,
+                    "resultSha256": result_sha256,
+                    "status": "accepted",
+                    "acceptedAt": time.time(),
+                },
+            )
             cleanup = True
-        except PermissionError:
+        except PermissionError as error:
+            if job_id is not None and lease_token is not None:
+                _atomic_json(
+                    self.queue_root / "acks" / f"{self._lease_stem(job_id, lease_token)}.json",
+                    {
+                        "schemaVersion": 1,
+                        "id": job_id,
+                        "leaseToken": lease_token,
+                        "sourceReference": source_reference,
+                        "sourceSha256": source_sha256,
+                        "resultBytes": result_bytes,
+                        "resultSha256": result_sha256,
+                        "status": "rejected",
+                        "error": str(error),
+                        "rejectedAt": time.time(),
+                    },
+                )
             cleanup = True
         except (KeyError, OSError, TypeError, ValueError, EOFError, tarfile.TarError,
                 json.JSONDecodeError) as error:
-            with contextlib.suppress(OSError):
-                if time.time() - marker.stat().st_mtime <= 60:
-                    return
+            if accepted:
+                # The result is already committed. Preserve its payload and marker so a later
+                # sync pass can retry the durable ack before the worker releases its lease.
+                raise
+            if self._shared_result_age(marker, completed_at) <= 60:
+                return
             if job_id is not None and lease_token is not None:
                 self.fail_job(job_id, lease_token, f"invalid shared result: {error}")
+                _atomic_json(
+                    self.queue_root / "acks" / f"{self._lease_stem(job_id, lease_token)}.json",
+                    {
+                        "schemaVersion": 1,
+                        "id": job_id,
+                        "leaseToken": lease_token,
+                        "sourceReference": source_reference,
+                        "sourceSha256": source_sha256,
+                        "resultBytes": result_bytes,
+                        "resultSha256": result_sha256,
+                        "status": "rejected",
+                        "error": str(error),
+                        "rejectedAt": time.time(),
+                    },
+                )
                 cleanup = True
             else:
                 marker.unlink(missing_ok=True)
             _json_line("filesystem_result_rejected", marker=str(marker), error=str(error))
         if cleanup and job_id is not None and lease_token is not None:
             self._cleanup_shared_lease(job_id, lease_token, include_result=True)
+
+    @staticmethod
+    def _shared_result_age(marker: Path, completed_at: float | None) -> float:
+        now = time.time()
+        if completed_at is not None and 0 < completed_at <= now + 60:
+            return max(0.0, now - completed_at)
+        payload_name = marker.name.removesuffix(".result.json") + ".tar"
+        payload = marker.with_name(payload_name)
+        for candidate in (payload, marker):
+            with contextlib.suppress(OSError):
+                return max(0.0, now - candidate.stat().st_mtime)
+        return float("inf")
 
     def _sync_filesystem_failure(self, marker: Path) -> None:
         try:
@@ -2344,8 +2896,11 @@ class CoordinatorState:
     @staticmethod
     def _is_drive_rate_limit(error: Exception) -> bool:
         message = str(error).lower()
-        return "ratelimitexceeded" in message or (
-            "quota exceeded" in message and "queries" in message
+        return (
+            "ratelimitexceeded" in message
+            or "too many requests" in message
+            or re.search(r"(?:^|\D)429(?:\D|$)", message) is not None
+            or ("quota exceeded" in message and "queries" in message)
         )
 
     def _wait_for_drive_backoff(self) -> bool:
@@ -2928,6 +3483,7 @@ class SharedQueueClient:
             "grants",
             "leased",
             "results",
+            "acks",
             "failures",
             "heartbeats",
         ):
@@ -3020,7 +3576,10 @@ class SharedQueueClient:
         lease_token = str(job["leaseToken"])
         stem = self._stem(job_id, lease_token)
         target = self.root / "results" / f"{stem}.tar"
+        marker = self.root / "results" / f"{stem}.result.json"
+        ack = self.root / "acks" / f"{stem}.json"
         target.parent.mkdir(parents=True, exist_ok=True)
+        ack.unlink(missing_ok=True)
         digest = hashlib.sha256()
         size = 0
         # This path is token-unique. Close the immutable payload before publishing its marker;
@@ -3033,17 +3592,68 @@ class SharedQueueClient:
             output.flush()
             with contextlib.suppress(OSError):
                 os.fsync(output.fileno())
-        _atomic_json(
-            self.root / "results" / f"{stem}.result.json",
-            {
-                "id": job_id,
-                "leaseToken": lease_token,
-                "resultPath": str(target),
-                "resultBytes": size,
-                "resultSha256": digest.hexdigest(),
-                "completedAt": time.time(),
-            },
+        result_sha256 = digest.hexdigest()
+        marker_value = {
+            "schemaVersion": 1,
+            "id": job_id,
+            "leaseToken": lease_token,
+            "sourceReference": str(job["reference"]),
+            "sourceSha256": str(job["sourceSha256"]),
+            "resultPath": str(target),
+            "resultBytes": size,
+            "resultSha256": result_sha256,
+            "completedAt": time.time(),
+        }
+        _atomic_json(marker, marker_value)
+        deadline = time.monotonic() + max(
+            1800,
+            int(job.get("leaseSeconds", 300)) * 4,
         )
+        heartbeat_interval = min(
+            30.0,
+            max(5.0, float(job.get("leaseSeconds", 300)) / 3),
+        )
+        next_heartbeat = 0.0
+        next_republish = time.monotonic() + 15
+        poll_seconds = 0.1
+        while time.monotonic() < deadline:
+            try:
+                decision = json.loads(ack.read_text())
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                decision = None
+            valid_identity = bool(
+                decision is not None
+                and decision.get("schemaVersion") == 1
+                and isinstance(decision.get("id"), int)
+                and not isinstance(decision.get("id"), bool)
+                and decision.get("id") == job_id
+                and decision.get("leaseToken") == lease_token
+                and decision.get("sourceReference") == str(job["reference"])
+                and decision.get("sourceSha256") == str(job["sourceSha256"])
+                and decision.get("resultBytes") == size
+                and decision.get("resultSha256") == result_sha256
+            )
+            status = decision.get("status") if valid_identity else None
+            if status == "accepted":
+                with contextlib.suppress(OSError):
+                    ack.unlink(missing_ok=True)
+                return
+            if status == "rejected":
+                with contextlib.suppress(OSError):
+                    ack.unlink(missing_ok=True)
+                raise ResultRejectedError(
+                    f"coordinator rejected result {stem}: {decision.get('error', 'unknown error')}"
+                )
+            now = time.monotonic()
+            if now >= next_heartbeat:
+                self.heartbeat(job)
+                next_heartbeat = now + heartbeat_interval
+            if now >= next_republish:
+                _atomic_json(marker, marker_value)
+                next_republish = now + 15
+            time.sleep(poll_seconds)
+            poll_seconds = min(1.0, poll_seconds * 2)
+        raise TimeoutError(f"coordinator did not acknowledge result {stem}")
 
     def fail(self, job: dict, error: str) -> None:
         job_id = int(job["id"])
@@ -3678,6 +4288,17 @@ def run_worker(worker_id: str, processes: int, result_batch_size: int) -> None:
                         shutil.rmtree(path.parent, ignore_errors=True)
                         forget(job)
                         _json_line("worker_uploaded", worker=worker_id, sample=job["id"])
+                        break
+                    except ResultRejectedError as error:
+                        path.unlink(missing_ok=True)
+                        shutil.rmtree(path.parent, ignore_errors=True)
+                        forget(job)
+                        _json_line(
+                            "worker_result_rejected",
+                            worker=worker_id,
+                            sample=job["id"],
+                            error=str(error),
+                        )
                         break
                     except Exception:
                         if attempt == 6:

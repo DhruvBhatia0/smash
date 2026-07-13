@@ -97,6 +97,9 @@ class FakeDrive:
     def list_files(self, root: str) -> list[str]:
         return []
 
+    def list_file_metadata(self, root: str) -> dict[str, int]:
+        return {}
+
     def cat(self, path: str) -> bytes:
         raise AssertionError(f"unexpected Drive read: {path}")
 
@@ -206,6 +209,27 @@ class PipelineTests(unittest.TestCase):
                 extra.write_text("unexpected")
                 output.add(extra, arcname="unexpected.txt", recursive=False)
         return bundle
+
+    def _shared_result_marker(
+        self,
+        state,
+        job_id: int,
+        lease_token: str,
+        result: Path,
+        payload: bytes,
+    ) -> dict:
+        row = state.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        return {
+            "schemaVersion": 1,
+            "id": job_id,
+            "leaseToken": lease_token,
+            "sourceReference": row["reference"],
+            "sourceSha256": row["source_sha256"],
+            "resultPath": str(result),
+            "resultBytes": len(payload),
+            "resultSha256": hashlib.sha256(payload).hexdigest(),
+            "completedAt": time.time(),
+        }
 
     def _valid_video_metadata(self) -> dict:
         return {
@@ -526,6 +550,328 @@ class PipelineTests(unittest.TestCase):
             round(1_000 * 90.0 / (3.0 * 7 * 2 * 3600), 3),
         )
 
+    def test_sandbox_listing_follows_every_daytona_cursor(self):
+        connector = object.__new__(daytona_module.DaytonaConnector)
+        connector._daytona = mock.Mock(
+            side_effect=[
+                mock.Mock(
+                    stdout=json.dumps(
+                        {
+                            "items": [{"id": "first", "name": "worker-000", "state": "started"}],
+                            "nextCursor": "page-two",
+                        }
+                    )
+                ),
+                mock.Mock(
+                    stdout=json.dumps(
+                        {
+                            "items": [
+                                {"id": "second", "name": "worker-100", "state": "started"},
+                                {
+                                    "id": "destroyed",
+                                    "name": "DESTROYED_worker-old",
+                                    "state": "destroyed",
+                                },
+                            ],
+                            "nextCursor": "",
+                        }
+                    )
+                ),
+            ]
+        )
+
+        rows = connector._list_sandboxes()
+
+        self.assertEqual([row["name"] for row in rows], ["worker-000", "worker-100"])
+        self.assertEqual(
+            connector._daytona.call_args_list,
+            [
+                mock.call("list", "--format", "json", "--limit", "100"),
+                mock.call(
+                    "list",
+                    "--format",
+                    "json",
+                    "--limit",
+                    "100",
+                    "--cursor",
+                    "page-two",
+                ),
+            ],
+        )
+
+    def test_cleanup_raises_when_billable_sandbox_remains(self):
+        connector = object.__new__(daytona_module.DaytonaConnector)
+        connector.daytona = "daytona"
+        connector.run_id = "run"
+        connector.controller_id = "owner-b"
+        connector._owned_sandboxes = ["stuck-worker"]
+        connector._owned_lock = threading.Lock()
+        connector._list_sandboxes = mock.Mock(
+            return_value=[
+                {
+                    "name": "stuck-worker",
+                    "labels": {
+                        "smash-run-id": "run",
+                        "smash-controller-id": "owner-b",
+                        "smash-role": "worker",
+                    },
+                }
+            ]
+        )
+
+        with mock.patch.object(
+            daytona_module,
+            "_run",
+            return_value=mock.Mock(returncode=1, stderr="still running"),
+        ), mock.patch.object(daytona_module.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "stuck-worker"):
+                connector._cleanup()
+
+        self.assertEqual(connector._owned_sandboxes, ["stuck-worker"])
+
+    def test_same_run_preflight_cannot_cleanup_foreign_controller(self):
+        connector = object.__new__(daytona_module.DaytonaConnector)
+        connector.run_id = "shared-run"
+        connector.target_id = "target-id"
+        connector._list_sandboxes = mock.Mock(
+            return_value=[
+                {
+                    "name": "foreign-worker",
+                    "labels": {
+                        "smash-run-id": "shared-run",
+                        "smash-controller-id": "owner-a",
+                        "smash-role": "worker",
+                    },
+                }
+            ]
+        )
+        connector._ensure_asset_volume = mock.Mock()
+        connector._delete_run_workers = mock.Mock()
+        connector._remove_queue_root = mock.Mock()
+        connector._cleanup = mock.Mock()
+
+        with self.assertRaisesRegex(RuntimeError, "already has live sandboxes"):
+            connector.run()
+
+        connector._ensure_asset_volume.assert_not_called()
+        connector._delete_run_workers.assert_not_called()
+        connector._remove_queue_root.assert_not_called()
+        connector._cleanup.assert_not_called()
+
+    def test_preflight_blocks_different_run_for_same_drive_target(self):
+        connector = object.__new__(daytona_module.DaytonaConnector)
+        connector.run_id = "run-b"
+        connector.target_id = "shared-target"
+        connector._list_sandboxes = mock.Mock(
+            return_value=[
+                {
+                    "name": "run-a-worker",
+                    "labels": {
+                        "smash-run-id": "run-a",
+                        "smash-target-id": "shared-target",
+                        "smash-controller-id": "owner-a",
+                        "smash-role": "worker",
+                    },
+                }
+            ]
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "target already has live sandboxes"):
+            connector._assert_run_id_available()
+
+    def test_cleanup_deletes_only_its_owner_and_fails_closed_on_name_reuse(self):
+        connector = object.__new__(daytona_module.DaytonaConnector)
+        connector.daytona = "daytona"
+        connector.run_id = "shared-run"
+        connector.controller_id = "owner-b"
+        connector._owned_sandboxes = ["worker-b"]
+        connector._owned_lock = threading.Lock()
+        owner_b = {
+            "name": "worker-b",
+            "labels": {
+                "smash-run-id": "shared-run",
+                "smash-controller-id": "owner-b",
+                "smash-role": "worker",
+            },
+        }
+        owner_a = {
+            "name": "worker-a",
+            "labels": {
+                "smash-run-id": "shared-run",
+                "smash-controller-id": "owner-a",
+                "smash-role": "worker",
+            },
+        }
+        connector._list_sandboxes = mock.Mock(
+            side_effect=[
+                [owner_a, owner_b],
+                [owner_a],
+                [owner_a],
+            ]
+        )
+        deleted: list[str] = []
+
+        def delete(command, **kwargs):
+            deleted.append(command[-1])
+            return mock.Mock(returncode=0, stderr="")
+
+        with mock.patch.object(daytona_module, "_run", side_effect=delete):
+            connector._cleanup()
+
+        self.assertEqual(deleted, ["worker-b"])
+        self.assertEqual(connector._owned_sandboxes, [])
+
+        reused = dict(owner_a, name="worker-b")
+        connector._owned_sandboxes = ["worker-b"]
+        connector._list_sandboxes = mock.Mock(
+            side_effect=[[owner_b], [reused], [reused], [reused], [reused], [reused], [reused]]
+        )
+        deleted.clear()
+        with mock.patch.object(daytona_module, "_run", side_effect=delete), mock.patch.object(
+            daytona_module.time, "sleep"
+        ):
+            with self.assertRaisesRegex(RuntimeError, "changed ownership"):
+                connector._cleanup()
+        self.assertEqual(deleted, ["worker-b"])
+
+    def test_queue_cleanup_refuses_foreign_same_run_sandbox(self):
+        connector = object.__new__(daytona_module.DaytonaConnector)
+        connector.run_id = "shared-run"
+        connector.controller_id = "owner-b"
+        coordinator = daytona_module.DaytonaSandbox(
+            id="coordinator-id",
+            name="coordinator-b",
+            cpu=2,
+            memory=4,
+            disk=8,
+            gpu=0,
+            state="started",
+        )
+        connector._list_sandboxes = mock.Mock(
+            return_value=[
+                {
+                    "name": "coordinator-b",
+                    "labels": {
+                        "smash-run-id": "shared-run",
+                        "smash-controller-id": "owner-b",
+                        "smash-role": "coordinator",
+                    },
+                },
+                {
+                    "name": "worker-a",
+                    "labels": {
+                        "smash-run-id": "shared-run",
+                        "smash-controller-id": "owner-a",
+                        "smash-role": "worker",
+                    },
+                },
+            ]
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "refusing shared queue deletion"):
+            connector._assert_queue_cleanup_owned(coordinator)
+
+    def test_worker_recovery_never_executes_or_deletes_reused_foreign_name(self):
+        connector = object.__new__(daytona_module.DaytonaConnector)
+        connector.daytona = "daytona"
+        connector.run_id = "shared-run"
+        connector.controller_id = "owner-b"
+        connector.launch_parallelism = 1
+        connector._worker_recovery_generation = {}
+        worker = daytona_module.DaytonaSandbox(
+            id="old-id",
+            name="worker-b",
+            cpu=4,
+            memory=8,
+            disk=10,
+            gpu=0,
+            state="started",
+        )
+        foreign = {
+            "id": "foreign-id",
+            "name": "worker-b",
+            "state": "started",
+            "labels": {
+                "smash-run-id": "shared-run",
+                "smash-controller-id": "owner-a",
+                "smash-role": "worker",
+            },
+        }
+        connector._list_sandboxes = mock.Mock(return_value=[foreign])
+        connector._exec = mock.Mock()
+        connector._create_worker = mock.Mock()
+
+        with mock.patch.object(daytona_module, "_run") as run, mock.patch.object(
+            daytona_module, "_json_line"
+        ):
+            connector._recover_workers([worker])
+
+        connector._exec.assert_not_called()
+        connector._create_worker.assert_not_called()
+        run.assert_not_called()
+
+    def test_worker_supervisor_lock_covers_child_restart_gap(self):
+        connector = object.__new__(daytona_module.DaytonaConnector)
+        connector.worker_processes = 4
+        connector.result_batch_size = 10
+        connector._deploy_self = mock.Mock()
+        connector._exec = mock.Mock(return_value=mock.Mock(stdout=""))
+        sandbox = daytona_module.DaytonaSandbox(
+            id="sandbox",
+            name="worker",
+            cpu=4,
+            memory=8,
+            disk=10,
+            gpu=0,
+            state="started",
+        )
+
+        connector._start_worker(sandbox, 7)
+
+        launch = connector._exec.call_args_list[0].args[1]
+        probe = connector._exec.call_args_list[1].args[1]
+        self.assertIn("flock -n /tmp/smash-worker-supervisor.lock", launch[-1])
+        self.assertIn("while true; do python3 /tmp/daytona_connector.py worker", launch[-1])
+        self.assertEqual(
+            probe,
+            [
+                "bash",
+                "-lc",
+                "sleep 1; if flock -n /tmp/smash-worker-supervisor.lock true; "
+                "then exit 1; else echo supervisor-alive; fi",
+            ],
+        )
+        self.assertNotIn("pgrep", " ".join(probe))
+
+    def test_coordinator_config_uses_private_upload_and_removes_temporary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "private-rclone.conf"
+            config.write_text("refresh_token = must-not-enter-command-line\n")
+            config.chmod(0o600)
+            connector = object.__new__(daytona_module.DaytonaConnector)
+            connector.rclone_config = config
+            connector._deploy_self = mock.Mock()
+            connector._upload_file = mock.Mock()
+            connector._exec = mock.Mock(return_value=mock.Mock(stdout=""))
+            sandbox = daytona_module.DaytonaSandbox(
+                id="sandbox",
+                name="coordinator",
+                cpu=2,
+                memory=4,
+                disk=8,
+                gpu=0,
+                state="started",
+            )
+
+            connector._prepare_coordinator(sandbox)
+
+            connector._upload_file.assert_called_once_with(sandbox, config, "/tmp/")
+            commands = [call.args[1] for call in connector._exec.call_args_list]
+            rendered = json.dumps(commands)
+            self.assertNotIn("must-not-enter-command-line", rendered)
+            self.assertIn("install -m 600", commands[-1][-1])
+            self.assertIn("rm -f -- /tmp/private-rclone.conf", commands[-1][-1])
+
     def test_zero_work_fleet_plan_launches_no_workers(self):
         connector = object.__new__(daytona_module.DaytonaConnector)
         connector.average_replay_seconds = 90.0
@@ -806,13 +1152,9 @@ class PipelineTests(unittest.TestCase):
             marker = queue_root / "results" / f"{stem}.result.json"
             marker.write_text(
                 json.dumps(
-                    {
-                        "id": 0,
-                        "leaseToken": lease["leaseToken"],
-                        "resultPath": str(shared_result),
-                        "resultBytes": len(payload),
-                        "resultSha256": hashlib.sha256(payload).hexdigest(),
-                    }
+                    self._shared_result_marker(
+                        state, 0, lease["leaseToken"], shared_result, payload
+                    )
                 )
             )
 
@@ -839,6 +1181,254 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(Path(row["result_path"]).read_bytes(), payload)
             self.assertFalse(marker.exists())
             self.assertFalse(shared_result.exists())
+            ack = queue_root / "acks" / f"{stem}.json"
+            decision = json.loads(ack.read_text())
+            self.assertEqual(decision["status"], "accepted")
+            self.assertEqual(decision["resultSha256"], hashlib.sha256(payload).hexdigest())
+
+    def test_shared_worker_waits_for_exact_ack_and_keeps_heartbeat(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            client = daytona_module.SharedQueueClient(root / "queue", "worker")
+            result = root / "result.tar"
+            payload = b"rendered-result"
+            result.write_bytes(payload)
+            job = {
+                "id": 7,
+                "leaseToken": "lease-token",
+                "reference": "archive.tar.zst::games/7.slp",
+                "sourceSha256": "7" * 64,
+                "leaseSeconds": 30,
+            }
+            stem = client._stem(7, "lease-token")
+            ack = client.root / "acks" / f"{stem}.json"
+            marker = client.root / "results" / f"{stem}.result.json"
+            errors: Queue[BaseException] = Queue()
+
+            def upload() -> None:
+                try:
+                    client.upload(job, result)
+                except BaseException as error:
+                    errors.put(error)
+
+            thread = threading.Thread(target=upload)
+            thread.start()
+            deadline = time.monotonic() + 2
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(marker.exists())
+            self.assertTrue(thread.is_alive())
+            self.assertTrue((client.root / "heartbeats" / f"{stem}.json").exists())
+
+            wrong = {
+                "schemaVersion": 1,
+                "status": "accepted",
+                "id": 7,
+                "leaseToken": "lease-token",
+                "sourceReference": job["reference"],
+                "sourceSha256": job["sourceSha256"],
+                "resultBytes": len(payload),
+                "resultSha256": "0" * 64,
+                "acceptedAt": time.time(),
+            }
+            ack.write_text(json.dumps(wrong))
+            time.sleep(0.2)
+            self.assertTrue(thread.is_alive())
+            wrong["resultSha256"] = hashlib.sha256(payload).hexdigest()
+            ack.write_text(json.dumps(wrong))
+            thread.join(timeout=2)
+
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(errors.empty())
+            self.assertFalse(ack.exists())
+
+    def test_rejected_result_does_not_stop_worker_supervisor(self):
+        class RejectingClient:
+            def __init__(self) -> None:
+                self.leased = False
+                self.uploads = 0
+
+            def lease(self):
+                if self.leased:
+                    return None, True
+                self.leased = True
+                return {
+                    "id": 0,
+                    "leaseToken": "token",
+                    "reference": "archive.tar.zst::games/0.slp",
+                    "sourceSha256": "0" * 64,
+                }, False
+
+            def upload(self, job, path):
+                self.uploads += 1
+                raise daytona_module.ResultRejectedError("expired lease")
+
+            def fail(self, job, error):
+                pass
+
+            def heartbeat(self, job):
+                pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            client = RejectingClient()
+
+            def render(job, process_root, llvm_threads, worker_client):
+                result = process_root / f"{job['id']:06d}" / "result.tar"
+                result.parent.mkdir(parents=True, exist_ok=True)
+                result.write_bytes(b"result")
+                return result
+
+            with mock.patch.dict(
+                os.environ, {"SMASH_WORK_DIR": str(root)}, clear=False
+            ), mock.patch.object(
+                daytona_module, "_worker_client", return_value=client
+            ), mock.patch.object(
+                daytona_module, "_allocated_cpus", return_value=1
+            ), mock.patch.object(
+                daytona_module, "render_job", side_effect=render
+            ), mock.patch.object(daytona_module, "_json_line"):
+                daytona_module.run_worker("worker-000", 1, 1)
+
+            self.assertEqual(client.uploads, 1)
+
+    def test_committed_shared_result_regenerates_lost_ack_without_payload(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue_root = root / "queue"
+            state = self._state(root / "spool", queue_root=queue_root)
+            self.addCleanup(state.db.close)
+            self._insert_job(state, 0, "queued")
+            lease = state.lease("worker")
+            bundle = self._result_tar(root, {"video": self._valid_video_metadata()})
+            payload = bundle.read_bytes()
+            stem = state._lease_stem(0, lease["leaseToken"])
+            shared_result = queue_root / "results" / f"{stem}.tar"
+            marker = queue_root / "results" / f"{stem}.result.json"
+            descriptor = self._shared_result_marker(
+                state, 0, lease["leaseToken"], shared_result, payload
+            )
+            shared_result.write_bytes(payload)
+            marker.write_text(json.dumps(descriptor))
+            state._sync_filesystem_result(marker)
+            ack = queue_root / "acks" / f"{stem}.json"
+            ack.unlink()
+            self.assertFalse(shared_result.exists())
+
+            marker.write_text(json.dumps(descriptor))
+            state._sync_filesystem_result(marker)
+
+            self.assertEqual(json.loads(ack.read_text())["status"], "accepted")
+            self.assertFalse(marker.exists())
+
+    def test_ack_failure_preserves_shared_result_until_retry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue_root = root / "queue"
+            state = self._state(root / "spool", queue_root=queue_root)
+            self.addCleanup(state.db.close)
+            self._insert_job(state, 0, "queued")
+            lease = state.lease("worker")
+            bundle = self._result_tar(root, {"video": self._valid_video_metadata()})
+            payload = bundle.read_bytes()
+            stem = state._lease_stem(0, lease["leaseToken"])
+            shared_result = queue_root / "results" / f"{stem}.tar"
+            marker = queue_root / "results" / f"{stem}.result.json"
+            shared_result.write_bytes(payload)
+            marker.write_text(
+                json.dumps(
+                    self._shared_result_marker(
+                        state, 0, lease["leaseToken"], shared_result, payload
+                    )
+                )
+            )
+            atomic_json = daytona_module._atomic_json
+
+            def fail_ack(path: Path, value: dict) -> None:
+                if path.parent.name == "acks":
+                    raise OSError("ack storage unavailable")
+                atomic_json(path, value)
+
+            with mock.patch.object(daytona_module, "_atomic_json", side_effect=fail_ack):
+                with self.assertRaisesRegex(OSError, "ack storage unavailable"):
+                    state._sync_filesystem_result(marker)
+
+            row = state.db.execute("SELECT * FROM jobs WHERE id=0").fetchone()
+            self.assertEqual(row["status"], "complete")
+            self.assertTrue(Path(row["result_path"]).is_file())
+            self.assertTrue(shared_result.exists())
+            self.assertTrue(marker.exists())
+
+            state._sync_filesystem_result(marker)
+            self.assertFalse(shared_result.exists())
+            self.assertFalse(marker.exists())
+
+    def test_republished_invalid_marker_uses_stable_completion_grace(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue_root = root / "queue"
+            state = self._state(root / "spool", queue_root=queue_root)
+            self.addCleanup(state.db.close)
+            self._insert_job(state, 0, "queued")
+            lease = state.lease("worker")
+            payload = b"not-a-valid-result"
+            stem = state._lease_stem(0, lease["leaseToken"])
+            shared_result = queue_root / "results" / f"{stem}.tar"
+            marker = queue_root / "results" / f"{stem}.result.json"
+            shared_result.write_bytes(payload)
+            descriptor = self._shared_result_marker(
+                state, 0, lease["leaseToken"], shared_result, payload
+            )
+            descriptor["completedAt"] = 100.0
+            descriptor["resultSha256"] = "f" * 64
+            marker.write_text(json.dumps(descriptor))
+            os.utime(marker, (160.0, 160.0))
+
+            with mock.patch.object(daytona_module.time, "time", return_value=161.0):
+                state._sync_filesystem_result(marker)
+
+            row = state.db.execute("SELECT * FROM jobs WHERE id=0").fetchone()
+            self.assertEqual(row["status"], "queued")
+            decision = json.loads(
+                (queue_root / "acks" / f"{stem}.json").read_text()
+            )
+            self.assertEqual(decision["status"], "rejected")
+            self.assertFalse(marker.exists())
+            self.assertFalse(shared_result.exists())
+
+    def test_committed_result_repairs_local_copy_from_shared_payload(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue_root = root / "queue"
+            state = self._state(root / "spool", queue_root=queue_root)
+            self.addCleanup(state.db.close)
+            self._insert_job(state, 0, "queued")
+            lease = state.lease("worker")
+            bundle = self._result_tar(root, {"video": self._valid_video_metadata()})
+            payload = bundle.read_bytes()
+            stem = state._lease_stem(0, lease["leaseToken"])
+            shared_result = queue_root / "results" / f"{stem}.tar"
+            marker = queue_root / "results" / f"{stem}.result.json"
+            descriptor = self._shared_result_marker(
+                state, 0, lease["leaseToken"], shared_result, payload
+            )
+            shared_result.write_bytes(payload)
+            marker.write_text(json.dumps(descriptor))
+            state._sync_filesystem_result(marker)
+            row = state.db.execute("SELECT * FROM jobs WHERE id=0").fetchone()
+            local_result = Path(row["result_path"])
+            local_result.unlink()
+            (queue_root / "acks" / f"{stem}.json").unlink()
+            shared_result.write_bytes(payload)
+            marker.write_text(json.dumps(descriptor))
+
+            state._sync_filesystem_result(marker)
+
+            self.assertEqual(local_result.read_bytes(), payload)
+            self.assertEqual(
+                json.loads((queue_root / "acks" / f"{stem}.json").read_text())["status"],
+                "accepted",
+            )
 
     def test_valid_shared_result_wins_over_simultaneous_failure(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -857,13 +1447,9 @@ class PipelineTests(unittest.TestCase):
             shared_result.write_bytes(payload)
             result_marker.write_text(
                 json.dumps(
-                    {
-                        "id": 0,
-                        "leaseToken": lease["leaseToken"],
-                        "resultPath": str(shared_result),
-                        "resultBytes": len(payload),
-                        "resultSha256": hashlib.sha256(payload).hexdigest(),
-                    }
+                    self._shared_result_marker(
+                        state, 0, lease["leaseToken"], shared_result, payload
+                    )
                 )
             )
             failure_marker.write_text(
@@ -930,13 +1516,9 @@ class PipelineTests(unittest.TestCase):
             stale_result.write_bytes(payload)
             stale_marker.write_text(
                 json.dumps(
-                    {
-                        "id": 0,
-                        "leaseToken": stale_token,
-                        "resultPath": str(stale_result),
-                        "resultBytes": len(payload),
-                        "resultSha256": hashlib.sha256(payload).hexdigest(),
-                    }
+                    self._shared_result_marker(
+                        state, 0, stale_token, stale_result, payload
+                    )
                 )
             )
 
@@ -1027,13 +1609,9 @@ class PipelineTests(unittest.TestCase):
             shared_result.write_bytes(payload)
             result_marker.write_text(
                 json.dumps(
-                    {
-                        "id": 0,
-                        "leaseToken": token,
-                        "resultPath": str(shared_result),
-                        "resultBytes": len(payload),
-                        "resultSha256": hashlib.sha256(payload).hexdigest(),
-                    }
+                    self._shared_result_marker(
+                        state, 0, token, shared_result, payload
+                    )
                 )
             )
             reconcile_lease = state._sync_filesystem_lease
@@ -1315,6 +1893,44 @@ class PipelineTests(unittest.TestCase):
             finally:
                 restarted.db.close()
 
+    def test_stale_shared_lease_identity_is_removed_and_current_job_republished(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue_root = root / "queue"
+            state = self._state(root / "spool", queue_root=queue_root)
+            self.addCleanup(state.db.close)
+            self._insert_job(state, 0, "queued")
+            row = state.db.execute("SELECT * FROM jobs WHERE id=0").fetchone()
+            token = "stale-run-token"
+            stem = state._lease_stem(0, token)
+            lease_path = queue_root / "leased" / f"{stem}.json"
+            lease_path.write_text(
+                json.dumps(
+                    {
+                        "id": 0,
+                        "reference": "old-archive::old-game.slp",
+                        "sourcePath": row["source_path"],
+                        "sourceBytes": row["source_bytes"],
+                        "sourceSha256": "f" * 64,
+                        "attempts": 1,
+                        "leaseToken": token,
+                        "workerId": "stale-worker",
+                        "leaseDeadline": time.time() + state.lease_seconds,
+                    }
+                )
+            )
+            (queue_root / "pending" / "000000.json").unlink(missing_ok=True)
+
+            state._sync_filesystem_lease(lease_path)
+
+            current = state.db.execute("SELECT * FROM jobs WHERE id=0").fetchone()
+            self.assertEqual(current["status"], "queued")
+            self.assertIsNone(current["lease_token"])
+            self.assertFalse(lease_path.exists())
+            pending = json.loads((queue_root / "pending" / "000000.json").read_text())
+            self.assertEqual(pending["reference"], row["reference"])
+            self.assertEqual(pending["sourceSha256"], row["source_sha256"])
+
     def test_upload_claim_waits_for_batch_unless_backpressure_requires_flush(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1535,6 +2151,9 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(float(row["upload_not_before"]), 1060.0)
             self.assertEqual(retry_after, 60.0)
             self.assertTrue(state._is_drive_rate_limit(error))
+            self.assertTrue(
+                state._is_drive_rate_limit(RuntimeError("HTTP 429: Too Many Requests"))
+            )
             self.assertFalse(state._is_drive_rate_limit(RuntimeError("connection reset")))
 
             state.stop.set()
@@ -1572,6 +2191,43 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(state._is_drive_rate_limit(raised.exception))
             rclone.kill.assert_called_once_with()
             zstd.kill.assert_called_once_with()
+
+    def test_producer_retries_truncated_archive_and_only_restreams_pending_jobs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = self._state(Path(temporary))
+            self.addCleanup(state.db.close)
+            self._insert_job(state, 0, "pending")
+            self._insert_job(state, 1, "pending")
+            pending_by_attempt: list[list[int]] = []
+
+            def stream(archive: str) -> None:
+                pending = [
+                    int(row[0])
+                    for row in state.db.execute(
+                        "SELECT id FROM jobs WHERE archive=? AND status='pending' ORDER BY id",
+                        (archive,),
+                    )
+                ]
+                pending_by_attempt.append(pending)
+                with state.db:
+                    state.db.execute(
+                        "UPDATE jobs SET status='queued' WHERE id=?", (pending[0],)
+                    )
+                if len(pending_by_attempt) == 1:
+                    raise tarfile.ReadError("unexpected end of data")
+
+            state._stream_archive = mock.Mock(side_effect=stream)
+            with mock.patch.object(state.stop, "wait", return_value=False), mock.patch.object(
+                daytona_module, "_json_line"
+            ) as log:
+                state.produce()
+
+            self.assertEqual(pending_by_attempt, [[0, 1], [1]])
+            self.assertEqual(state._stream_archive.call_count, 2)
+            self.assertTrue(state.producer_done)
+            self.assertTrue(
+                any(call.args[0] == "source_archive_stream_retry" for call in log.call_args_list)
+            )
 
     def test_stream_archive_uses_large_drive_chunks(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1770,41 +2426,154 @@ class PipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             state = self._state(Path(temporary))
             self.addCleanup(state.db.close)
+            references = ["archive::one.slp", "archive::two.slp"]
+            keys = {
+                reference: hashlib.sha256(reference.encode()).hexdigest()[:20]
+                for reference in references
+            }
 
             def download(remote_root: str, destination: Path) -> list[Path]:
                 self.assertEqual(remote_root, "target/batches")
                 destination.mkdir(parents=True, exist_ok=True)
-                first = destination / "batch-a.manifest.jsonl"
-                second = destination / "batch-b.manifest.jsonl"
-                first.write_text(
-                    json.dumps(
-                        {
-                            "status": "complete",
-                            "sourceReference": "archive::one.slp",
-                        }
+                manifests = []
+                for sample, reference in enumerate(references):
+                    key = keys[reference]
+                    manifest = destination / f"batch-{key}.manifest.jsonl"
+                    manifest.write_text(
+                        json.dumps(
+                            {
+                                "schemaVersion": 1,
+                                "status": "complete",
+                                "sample": sample,
+                                "sourceReference": reference,
+                                "sourceSha256": f"{sample + 1:064x}",
+                                "archive": f"target/batches/batch-{key}.tar.zst",
+                            }
+                        )
+                        + "\n"
                     )
-                    + "\n"
+                    manifests.append(manifest)
+                return manifests
+
+            def metadata(remote_root: str) -> dict[str, int]:
+                self.assertEqual(remote_root, "target/batches")
+                committed = state.manifests / "committed"
+                files = {
+                    path.name: path.stat().st_size
+                    for path in committed.glob("*.manifest.jsonl")
+                }
+                files.update(
+                    {f"batch-{key}.tar.zst": 123 for key in keys.values()}
                 )
-                second.write_text(
-                    json.dumps(
-                        {
-                            "status": "complete",
-                            "sourceReference": "archive::two.slp",
-                        }
-                    )
-                    + "\n"
-                )
-                return [first, second]
+                return files
 
             state.drive.download_manifests = mock.Mock(side_effect=download)
+            state.drive.list_file_metadata = mock.Mock(side_effect=metadata)
             state.drive.cat = mock.Mock(side_effect=AssertionError("sequential cat forbidden"))
 
             self.assertEqual(
-                state._uploaded_references(),
-                {"archive::one.slp", "archive::two.slp"},
+                state._uploaded_references(
+                    {reference: sample for sample, reference in enumerate(references)}
+                ),
+                set(references),
             )
             state.drive.download_manifests.assert_called_once()
+            state.drive.list_file_metadata.assert_called_once_with("target/batches")
             state.drive.cat.assert_not_called()
+
+    def test_resume_rejects_manifest_without_its_committed_archive(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = self._state(Path(temporary))
+            self.addCleanup(state.db.close)
+            reference = "archive::one.slp"
+            key = hashlib.sha256(reference.encode()).hexdigest()[:20]
+
+            def download(remote_root: str, destination: Path) -> list[Path]:
+                destination.mkdir(parents=True, exist_ok=True)
+                manifest = destination / f"batch-{key}.manifest.jsonl"
+                manifest.write_text(
+                    json.dumps(
+                        {
+                            "schemaVersion": 1,
+                            "status": "complete",
+                            "sample": 0,
+                            "sourceReference": reference,
+                            "sourceSha256": "1" * 64,
+                            "archive": f"target/batches/batch-{key}.tar.zst",
+                        }
+                    )
+                    + "\n"
+                )
+                return [manifest]
+
+            state.drive.download_manifests = mock.Mock(side_effect=download)
+            state.drive.list_file_metadata = mock.Mock(
+                side_effect=lambda remote_root: {
+                    f"batch-{key}.manifest.jsonl": (
+                        state.manifests / "committed" / f"batch-{key}.manifest.jsonl"
+                    ).stat().st_size
+                }
+            )
+
+            with self.assertRaisesRegex(ValueError, "archive is absent"):
+                state._uploaded_references({reference: 0})
+
+    def test_resume_rejects_incomplete_bulk_manifest_download(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = self._state(Path(temporary))
+            self.addCleanup(state.db.close)
+            state.drive.download_manifests = mock.Mock(return_value=[])
+            state.drive.list_file_metadata = mock.Mock(
+                return_value={
+                    "batch-0123456789abcdef0123.manifest.jsonl": 123,
+                    "batch-0123456789abcdef0123.tar.zst": 456,
+                }
+            )
+
+            with self.assertRaisesRegex(ValueError, "manifest sync was incomplete"):
+                state._uploaded_references({})
+
+    def test_resume_rejects_bool_schema_and_numeric_source_hash(self):
+        reference = "archive::one.slp"
+        key = hashlib.sha256(reference.encode()).hexdigest()[:20]
+        invalid_values = {
+            "schemaVersion": True,
+            "sourceSha256": int("1" * 64),
+        }
+        for field, value in invalid_values.items():
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                state = self._state(Path(temporary))
+                self.addCleanup(state.db.close)
+
+                def download(remote_root: str, destination: Path) -> list[Path]:
+                    destination.mkdir(parents=True, exist_ok=True)
+                    row = {
+                        "schemaVersion": 1,
+                        "status": "complete",
+                        "sample": 0,
+                        "sourceReference": reference,
+                        "sourceSha256": "1" * 64,
+                        "archive": f"target/batches/batch-{key}.tar.zst",
+                    }
+                    row[field] = value
+                    manifest = destination / f"batch-{key}.manifest.jsonl"
+                    manifest.write_text(json.dumps(row) + "\n")
+                    return [manifest]
+
+                state.drive.download_manifests = mock.Mock(side_effect=download)
+                state.drive.list_file_metadata = mock.Mock(
+                    side_effect=lambda remote_root: {
+                        f"batch-{key}.manifest.jsonl": (
+                            state.manifests
+                            / "committed"
+                            / f"batch-{key}.manifest.jsonl"
+                        ).stat().st_size,
+                        f"batch-{key}.tar.zst": 123,
+                    }
+                )
+
+                with self.assertRaisesRegex(ValueError, "invalid committed manifest value"):
+                    state._uploaded_references({reference: 0})
 
     def test_upload_claim_flushes_on_batch_bytes_and_final_drain(self):
         with tempfile.TemporaryDirectory() as temporary:
