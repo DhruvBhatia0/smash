@@ -2,6 +2,10 @@
 
 This folder is a first pass at a Slippi replay dataset pipeline.
 
+The production Fox-versus-Captain-Falcon video corpus is documented in
+[`frame-video-dataset.md`](frame-video-dataset.md). That document is the handoff
+for data locations, schemas, frame alignment, integrity, and regeneration.
+
 - `replays/realtimeTest.slp` is a public sample replay downloaded from the official `project-slippi/slippi-js` repository.
 - `scripts/extract-slp.mjs` replays the `.slp` through `@slippi/slippi-js`, walking every frame in numeric order.
 - `patches/ishiiruka-macos-png-frame-dump.patch` is the small source patch needed for macOS PNG frame dumping.
