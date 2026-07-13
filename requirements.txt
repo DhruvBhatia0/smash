@@ -2,6 +2,7 @@ huggingface_hub[hf_xet]>=1.0.0
 einops==0.8.2
 av>=14.0.0
 ftfy>=6.3.0
+lpips>=0.1.4
 omegaconf>=2.3.0
 regex>=2024.0.0
 scikit-learn>=1.6.0

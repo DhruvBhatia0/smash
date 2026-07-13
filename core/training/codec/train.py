@@ -13,6 +13,7 @@ from typing import Any
 import av
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
@@ -35,6 +36,7 @@ class TrainConfig:
     height: int = 288
     width: int = 512
     fps: int = 20
+    loss: str = "l1"
     compile: bool = True
     wandb_project: str = "smash-codec"
     wandb_name: str | None = None
@@ -52,6 +54,7 @@ class TrainConfig:
         parser.add_argument("--batch-size", type=int, default=cls.batch_size)
         parser.add_argument("--workers", type=int, default=cls.workers)
         parser.add_argument("--learning-rate", type=float, default=cls.learning_rate)
+        parser.add_argument("--loss", choices=("l1", "mira"), default=cls.loss)
         parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=cls.compile)
         parser.add_argument("--wandb-project", default=cls.wandb_project)
         parser.add_argument("--wandb-name")
@@ -99,6 +102,97 @@ class VideoFolderDataset(Dataset[Tensor]):
         return torch.stack(video)
 
 
+class ReconstructionLoss(nn.Module):
+    """Pixel L1 alone or MIRA's L1, LPIPS, and DINO objective."""
+
+    def __init__(self, mode: str, dino: nn.Module, last_layer: Tensor):
+        super().__init__()
+        self.mode = mode
+        self.dino = dino
+        self.last_layer = last_layer
+
+        self.lpips: nn.Module | None = None
+        if mode == "mira":
+            import lpips
+
+            self.lpips = (
+                lpips.LPIPS(net="vgg", verbose=False).eval().requires_grad_(False)
+            )
+
+    def forward(self, prediction: Tensor, target: Tensor) -> dict[str, Tensor]:
+        prediction, target = prediction.float(), target.float()
+        losses = {"pixel": F.l1_loss(prediction, target)}
+        if self.mode == "l1":
+            return {"loss": losses["pixel"], **losses}
+
+        losses |= self._mira_losses(prediction, target)
+        total = losses["pixel"]
+        for name in ("lpips", "dino"):
+            weight = self._adaptive_weight(losses["pixel"], losses[name])
+            losses[f"{name}_weight"] = weight
+            total = total + weight * losses[name]
+
+        return {"loss": total, **losses}
+
+    def _mira_losses(self, prediction: Tensor, target: Tensor) -> dict[str, Tensor]:
+        assert self.lpips is not None
+        time = prediction.shape[1]
+        count = max(1, round(0.25 * time))
+
+        lpips_frames = torch.randperm(time, device=prediction.device)[:count].sort().values
+        predicted = prediction[:, lpips_frames].flatten(0, 1)
+        expected = target[:, lpips_frames].flatten(0, 1)
+        perceptual = self.lpips(predicted, expected).mean()
+
+        dino_frames = torch.randperm(time, device=prediction.device)[:count].sort().values
+        predicted = self._normalize_dino((prediction[:, dino_frames] + 1) / 2)
+        expected = self._normalize_dino((target[:, dino_frames] + 1) / 2)
+        predicted_features = self._dino_features(predicted)
+        with torch.no_grad():
+            expected_features = self._dino_features(expected)
+        dino = torch.stack(
+            [
+                F.mse_loss(
+                    F.normalize(actual, dim=1, eps=1e-6),
+                    F.normalize(wanted, dim=1, eps=1e-6),
+                )
+                for actual, wanted in zip(predicted_features, expected_features)
+            ]
+        ).mean()
+        return {"lpips": perceptual, "dino": dino}
+
+    def _normalize_dino(self, video: Tensor) -> Tensor:
+        mean = video.new_tensor((0.485, 0.456, 0.406)).view(1, 1, 3, 1, 1)
+        std = video.new_tensor((0.229, 0.224, 0.225)).view(1, 1, 3, 1, 1)
+        return (video - mean) / std
+
+    def _dino_features(self, video: Tensor) -> tuple[Tensor, ...]:
+        frames = video.flatten(0, 1)
+        return tuple(
+            self.dino.model.get_intermediate_layers(
+                frames,
+                n=self.dino.desired_hidden_states,
+                norm=True,
+                reshape=True,
+            )
+        )
+
+    def _adaptive_weight(self, anchor: Tensor, other: Tensor) -> Tensor:
+        if not torch.is_grad_enabled() or not anchor.requires_grad:
+            return anchor.new_ones(())
+        anchor_gradient = torch.autograd.grad(
+            anchor, self.last_layer, retain_graph=True
+        )[0]
+        other_gradient = torch.autograd.grad(other, self.last_layer, retain_graph=True)[
+            0
+        ]
+        return (
+            (anchor_gradient.norm() / (other_gradient.norm() + 1e-6))
+            .clamp(0, 1e4)
+            .detach()
+        )
+
+
 class CodecTrainer:
     DINO_MEAN = (0.485, 0.456, 0.406)
     DINO_STD = (0.229, 0.224, 0.225)
@@ -143,7 +237,11 @@ class CodecTrainer:
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=config.steps, eta_min=1e-6
         )
-        self.loss = nn.L1Loss()
+        self.loss = ReconstructionLoss(
+            config.loss,
+            dino=self.raw_model.encoder.dinov3,
+            last_layer=self.raw_model.decoder.last_layer_weight,
+        ).to(self.device)
         self.mean = torch.tensor(self.DINO_MEAN, device=self.device).view(1, 1, 3, 1, 1)
         self.std = torch.tensor(self.DINO_STD, device=self.device).view(1, 1, 3, 1, 1)
         self.wandb: Any | None = None
@@ -202,38 +300,42 @@ class CodecTrainer:
         prediction = self.model((video - self.mean) / self.std)
         return prediction, target
 
-    def _train_step(self, video: Tensor) -> Tensor:
+    def _train_step(self, video: Tensor) -> dict[str, Tensor]:
         video = video.to(self.device, non_blocking=True).float().div_(255)
         self.optimizer.zero_grad(set_to_none=True)
         with self._autocast():
             prediction, target = self._reconstruct(video)
-            loss = self.loss(prediction, target)
-        loss.backward()
+            losses = self.loss(prediction, target)
+        losses["loss"].backward()
         self.optimizer.step()
         self.scheduler.step()
-        return loss.detach()
+        return {name: value.detach() for name, value in losses.items()}
 
     @torch.inference_mode()
-    def _evaluate(self) -> tuple[float, tuple[Tensor, Tensor]]:
+    def _evaluate(self) -> tuple[dict[str, float], tuple[Tensor, Tensor]]:
         self.model.eval()
-        totals = torch.zeros(2, device=self.device)
+        totals: dict[str, Tensor] = {}
+        samples = torch.zeros((), device=self.device)
         sample: tuple[Tensor, Tensor] | None = None
         for video in self.eval_loader:
             video = video.to(self.device, non_blocking=True).float().div_(255)
             with self._autocast():
                 prediction, target = self._reconstruct(video)
-            totals[0] += nn.functional.l1_loss(prediction.float(), target, reduction="sum")
-            totals[1] += target.numel()
+                losses = self.loss(prediction, target)
+            for name, value in losses.items():
+                totals[name] = totals.get(name, torch.zeros_like(value)) + value * len(video)
+            samples += len(video)
             sample = sample or (prediction[0].float().cpu(), target[0].cpu())
         if self.distributed:
-            dist.all_reduce(totals)
+            for value in (*totals.values(), samples):
+                dist.all_reduce(value)
         self.model.train()
         self.raw_model.encoder.dinov3.eval()
         assert sample is not None
-        return (totals[0] / totals[1]).item(), sample
+        return {name: (value / samples).item() for name, value in totals.items()}, sample
 
     def _save_and_log(self, step: int) -> None:
-        eval_loss, (prediction, target) = self._evaluate()
+        eval_losses, (prediction, target) = self._evaluate()
         if not self.rank:
             self.config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
             checkpoint_path = self.config.checkpoint_dir / f"step-{step:07d}.pt"
@@ -254,7 +356,7 @@ class CodecTrainer:
             if self.wandb:
                 self.wandb.log(
                     {
-                        "eval/loss": eval_loss,
+                        **{f"eval/{name}": value for name, value in eval_losses.items()},
                         "eval/reconstruction": self.wandb.Video(
                             str(video_path),
                             format="mp4",
@@ -286,15 +388,19 @@ class CodecTrainer:
                     self.train_sampler.set_epoch(epoch)
                 for video in self.train_loader:
                     step += 1
-                    train_loss = self._train_step(video)
+                    train_losses = self._train_step(video)
                     if step % self.config.log_every == 0:
                         if self.distributed:
-                            dist.all_reduce(train_loss)
-                            train_loss /= self.world_size
+                            for value in train_losses.values():
+                                dist.all_reduce(value)
+                                value /= self.world_size
                         if self.wandb:
                             self.wandb.log(
                                 {
-                                    "train/loss": train_loss.item(),
+                                    **{
+                                        f"train/{name}": value.item()
+                                        for name, value in train_losses.items()
+                                    },
                                     "train/learning_rate": self.scheduler.get_last_lr()[0],
                                 },
                                 step=step,
