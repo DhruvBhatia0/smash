@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
+from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 import av
-from huggingface_hub import HfApi, hf_hub_download
+import httpx
+from huggingface_hub import HfApi, hf_hub_download, hf_hub_url
 
 SOURCE_REPO = "DhruvBhatia0/smash-battlefield-fox"
 SOURCE_REVISION = "2c94351b82c2c65a31fb39fe52a34ff905b6abcf"
@@ -46,6 +47,75 @@ class Config:
     workers: int
     work_dir: Path
     upload: bool
+
+
+class HTTPRangeReader:
+    """Seekable HTTP reader that keeps only a small LRU cache in memory."""
+
+    chunk_size = 8 * 1024 * 1024
+    cache_size = 4
+
+    def __init__(self, url: str, size: int):
+        self.url = url
+        self.size = size
+        self.position = 0
+        self.cache: OrderedDict[int, bytes] = OrderedDict()
+        self.client = httpx.Client(follow_redirects=True, timeout=120)
+
+    def __enter__(self) -> HTTPRangeReader:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.client.close()
+
+    def read(self, count: int = -1) -> bytes:
+        count = self.size - self.position if count < 0 else count
+        count = min(count, self.size - self.position)
+        data = bytearray()
+        while count:
+            chunk = self._chunk(self.position // self.chunk_size)
+            offset = self.position % self.chunk_size
+            piece = chunk[offset : offset + count]
+            data.extend(piece)
+            self.position += len(piece)
+            count -= len(piece)
+        return bytes(data)
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        if whence == 1:
+            offset += self.position
+        elif whence == 2:
+            offset += self.size
+        if not 0 <= offset <= self.size:
+            raise ValueError(f"Invalid seek to {offset}")
+        self.position = offset
+        return offset
+
+    def tell(self) -> int:
+        return self.position
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def _chunk(self, index: int) -> bytes:
+        if index in self.cache:
+            data = self.cache.pop(index)
+            self.cache[index] = data
+            return data
+        start = index * self.chunk_size
+        end = min(start + self.chunk_size, self.size) - 1
+        response = self.client.get(self.url, headers={"Range": f"bytes={start}-{end}"})
+        response.raise_for_status()
+        data = response.content
+        if response.status_code != 206 or len(data) != end - start + 1:
+            raise OSError(f"Unexpected range response for {self.url}")
+        self.cache[index] = data
+        if len(self.cache) > self.cache_size:
+            self.cache.popitem(last=False)
+        return data
 
 
 def parse_args() -> Config:
@@ -113,52 +183,45 @@ def assigned_videos(config: Config) -> list[RemoteVideo]:
 
 
 def convert(video: RemoteVideo, config: Config) -> dict[str, int | str]:
-    input_dir = config.work_dir / "input" / video.video_id
     output = config.work_dir / "output" / video.output_path
-    if output.exists():
-        with av.open(output) as container:
-            stream = container.streams.video[0]
-            return {
-                "path": video.output_path,
-                "frames": stream.frames,
-                "fps": float(stream.average_rate),
-            }
+    marker = config.work_dir / "progress" / f"{video.video_id}.json"
+    if marker.exists():
+        return json.loads(marker.read_text())
 
-    source = hf_hub_download(
-        repo_id=SOURCE_REPO,
+    source = hf_hub_url(
+        SOURCE_REPO,
+        video.path,
         repo_type="dataset",
         revision=SOURCE_REVISION,
-        filename=video.path,
-        local_dir=input_dir,
-        token=True,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_suffix(".partial.nut")
     frames = 0
-    try:
-        with av.open(source) as input_container, av.open(
-            temporary, "w", format="nut"
-        ) as output_container:
-            input_stream = input_container.streams.video[0]
-            source_fps = float(input_stream.average_rate)
-            stride = round(source_fps / TARGET_FPS)
-            if stride * TARGET_FPS != round(source_fps):
-                raise ValueError(f"{video.path} is {source_fps:g} FPS, not divisible by 20")
-            output_stream = output_container.add_stream("ffv1", rate=TARGET_FPS)
-            output_stream.width, output_stream.height = WIDTH, HEIGHT
-            output_stream.pix_fmt = "gbrp"
-            for index, frame in enumerate(input_container.decode(input_stream)):
-                if index % stride:
-                    continue
-                resized = frame.reformat(width=WIDTH, height=HEIGHT, format="rgb24")
-                output_container.mux(output_stream.encode(resized))
-                frames += 1
-            output_container.mux(output_stream.encode())
-        temporary.replace(output)
-    finally:
-        temporary.unlink(missing_ok=True)
-        shutil.rmtree(input_dir, ignore_errors=True)
-    return {"path": video.output_path, "frames": frames, "fps": float(TARGET_FPS)}
+    with (
+        HTTPRangeReader(source, video.size) as reader,
+        av.open(reader) as input_container,
+        av.open(
+            output, "w", format="nut"
+        ) as output_container,
+    ):
+        input_stream = input_container.streams.video[0]
+        source_fps = float(input_stream.average_rate)
+        stride = round(source_fps / TARGET_FPS)
+        if stride * TARGET_FPS != round(source_fps):
+            raise ValueError(f"{video.path} is {source_fps:g} FPS, not divisible by 20")
+        output_stream = output_container.add_stream("ffv1", rate=TARGET_FPS)
+        output_stream.width, output_stream.height = WIDTH, HEIGHT
+        output_stream.pix_fmt = "gbrp"
+        for index, frame in enumerate(input_container.decode(input_stream)):
+            if index % stride:
+                continue
+            resized = frame.reformat(width=WIDTH, height=HEIGHT, format="rgb24")
+            output_container.mux(output_stream.encode(resized))
+            frames += 1
+        output_container.mux(output_stream.encode())
+    row = {"path": video.output_path, "frames": frames, "fps": float(TARGET_FPS)}
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps(row))
+    return row
 
 
 def upload(config: Config, rows: list[dict[str, int | str]]) -> None:
