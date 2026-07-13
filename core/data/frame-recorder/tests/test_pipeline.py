@@ -1898,10 +1898,12 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(args.upload_concurrency, 1)
         self.assertEqual(args.upload_tps_limit, 1)
         self.assertEqual(args.upload_max_bytes, 2 * 1024**3)
+        self.assertEqual(args.spool_max_bytes, 9 * 1024**3)
         self.assertEqual(connector.upload_batch_size, 100)
         self.assertEqual(connector.upload_min_batch, 64)
         self.assertEqual(connector.upload_concurrency, 1)
         self.assertEqual(connector.upload_max_bytes, 2 * 1024**3)
+        self.assertEqual(connector.spool_max_bytes, 9 * 1024**3)
 
     def test_raw_packet_pts_bounds_preserve_a_head_gap(self):
         completed = mock.Mock(stdout="0.016667,\n0.033333,\n1.000000,\n")

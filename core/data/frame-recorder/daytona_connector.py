@@ -46,6 +46,7 @@ DEFAULT_TARGET_ROOT = (
 )
 VIDEO_SUFFIXES = (".avi", ".mkv", ".mp4", ".mov", ".nut")
 DEFAULT_DRIVE_CHUNK_SIZE = "512M"
+DEFAULT_SPOOL_MAX_BYTES = 9 * 1024**3
 
 _INVALID_PLAYABLE_MAPPING = re.compile(
     r"(?:RuntimeError: )?invalid playable/render frame mapping: "
@@ -249,7 +250,12 @@ class DaytonaConnector:
         self.prefetch = max(1, int(os.environ.get("SMASH_COORDINATOR_PREFETCH", "512")))
         self.spool_max_bytes = max(
             1024 * 1024 * 1024,
-            int(os.environ.get("SMASH_COORDINATOR_SPOOL_MAX_BYTES", str(6 * 1024**3))),
+            int(
+                os.environ.get(
+                    "SMASH_COORDINATOR_SPOOL_MAX_BYTES",
+                    str(DEFAULT_SPOOL_MAX_BYTES),
+                )
+            ),
         )
         self.lease_seconds = max(120, int(os.environ.get("SMASH_JOB_LEASE_SECONDS", "300")))
         self.max_attempts = max(1, int(os.environ.get("SMASH_JOB_MAX_ATTEMPTS", "3")))
@@ -1186,7 +1192,7 @@ class CoordinatorState:
         upload_tps_limit: int = 1,
         upload_min_batch: int = 1,
         upload_max_attempts: int = 3,
-        spool_max_bytes: int = 6 * 1024**3,
+        spool_max_bytes: int = DEFAULT_SPOOL_MAX_BYTES,
         queue_root: Path | None = None,
     ) -> None:
         self.drive = drive
@@ -3840,7 +3846,9 @@ def build_parser() -> argparse.ArgumentParser:
     coordinator.add_argument("--upload-min-batch", type=int, default=64)
     coordinator.add_argument("--upload-max-attempts", type=int, default=3)
     coordinator.add_argument("--upload-max-bytes", type=int, default=2 * 1024**3)
-    coordinator.add_argument("--spool-max-bytes", type=int, default=6 * 1024**3)
+    coordinator.add_argument(
+        "--spool-max-bytes", type=int, default=DEFAULT_SPOOL_MAX_BYTES
+    )
     coordinator.add_argument("--queue-root")
     worker = subparsers.add_parser("worker")
     worker.add_argument("--worker-id", required=True)
