@@ -54,6 +54,8 @@ DUMP_FORMAT="${SLIPPI_DUMP_FORMAT:-avi}"
 BITRATE_KBPS="${SLIPPI_BITRATE_KBPS:-2500}"
 DOLPHIN_BIN="${SLIPPI_DOLPHIN_BIN:-/opt/slippi/Slippi Dolphin}"
 MAX_RAW_BYTES="${SLIPPI_MAX_RAW_BYTES:-}"
+STALL_SECONDS="${SLIPPI_STALL_SECONDS:-0}"
+STALL_MIN_FRAME="${SLIPPI_STALL_MIN_FRAME:-}"
 USE_XVFB="${USE_XVFB:-1}"
 export LD_LIBRARY_PATH="/opt/slippi:${LD_LIBRARY_PATH:-}"
 
@@ -81,7 +83,9 @@ fi
 mkdir -p "$OUTPUT_DIR"
 USER_DIR="${USER_DIR:-$(dirname "$OUTPUT_DIR")/dolphin-user}"
 RUN_LOG="$OUTPUT_DIR/render-ffv1.log"
+STALL_MARKER="$OUTPUT_DIR/.stall-frame"
 mkdir -p "$USER_DIR/Config" "$USER_DIR/Dump/Frames" "$USER_DIR/Dump/Audio" "$USER_DIR/ScreenShots"
+rm -f -- "$STALL_MARKER"
 find "$USER_DIR/Dump/Frames" -maxdepth 1 -type f \
   \( -name 'framedump*.avi' -o -name 'framedump*.mkv' -o -name 'framedump*.mp4' -o -name 'framedump*.mov' -o -name 'framedump*.nut' \) \
   -delete
@@ -219,12 +223,16 @@ command=(
 )
 
 END_WATCHER_PID=""
-if [[ "$TARGET_STOP_FRAME" =~ ^-?[0-9]+$ ]]; then
+if [[ "$TARGET_STOP_FRAME" =~ ^-?[0-9]+$ || "$STALL_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
   (
+    progress_frame=""
+    progress_at="$SECONDS"
     while true; do
       if [[ -f "$RUN_LOG" ]]; then
         last_frame="$({ grep -a '\[CURRENT_FRAME\]' "$RUN_LOG" 2>/dev/null || true; } | tail -1 | awk '{print $2}')"
-        if [[ "$last_frame" =~ ^-?[0-9]+$ && "$last_frame" -ge "$TARGET_STOP_FRAME" ]]; then
+        if [[ "$TARGET_STOP_FRAME" =~ ^-?[0-9]+$ \
+          && "$last_frame" =~ ^-?[0-9]+$ \
+          && "$last_frame" -ge "$TARGET_STOP_FRAME" ]]; then
           echo "[STOP_FRAME_REACHED] $last_frame >= $TARGET_STOP_FRAME" >> "$RUN_LOG"
           sleep "${SLIPPI_END_FRAME_GRACE_SECONDS:-0.25}"
           ps -eo pid=,args= | while read -r pid args; do
@@ -233,6 +241,24 @@ if [[ "$TARGET_STOP_FRAME" =~ ^-?[0-9]+$ ]]; then
             fi
           done
           exit 0
+        fi
+        if [[ "$last_frame" =~ ^-?[0-9]+$ ]]; then
+          if [[ "$last_frame" != "$progress_frame" ]]; then
+            progress_frame="$last_frame"
+            progress_at="$SECONDS"
+          elif [[ "$STALL_SECONDS" =~ ^[1-9][0-9]*$ \
+            && "$STALL_MIN_FRAME" =~ ^-?[0-9]+$ \
+            && "$last_frame" -ge "$STALL_MIN_FRAME" \
+            && $((SECONDS - progress_at)) -ge "$STALL_SECONDS" ]]; then
+            echo "[STALL_FRAME_REACHED] $last_frame after ${STALL_SECONDS}s" >> "$RUN_LOG"
+            printf '%s\n' "$last_frame" > "$STALL_MARKER"
+            ps -eo pid=,args= | while read -r pid args; do
+              if [[ "$args" == "$DOLPHIN_BIN "* && "$args" == *"$USER_DIR"* && "$args" == *"$REPLAY_JSON"* ]]; then
+                kill -TERM "$pid" 2>/dev/null || true
+              fi
+            done
+            exit 0
+          fi
         fi
       fi
       sleep "${SLIPPI_END_FRAME_POLL_SECONDS:-0.25}"
@@ -264,12 +290,19 @@ raw_dir="$USER_DIR/Dump/Frames"
 video_path="$(find "$raw_dir" -maxdepth 1 -type f \( -name 'framedump*.avi' -o -name 'framedump*.mkv' -o -name 'framedump*.mp4' -o -name 'framedump*.mov' -o -name 'framedump*.nut' \) | sort | head -1 || true)"
 current_frame_count="$(grep -a '\[CURRENT_FRAME\]' "$RUN_LOG" 2>/dev/null | wc -l | tr -d ' ')"
 last_current_frame="$(grep -a '\[CURRENT_FRAME\]' "$RUN_LOG" 2>/dev/null | tail -1 | awk '{print $2}')"
+last_stall_frame=""
+if [[ -f "$STALL_MARKER" ]]; then
+  read -r last_stall_frame < "$STALL_MARKER"
+fi
 if [[ -n "$video_path" ]]; then
   mv -f "$video_path" "$OUTPUT_DIR/"
 fi
 cp -p "$USER_DIR/Logs/dolphin.log" "$OUTPUT_DIR/dolphin.log" 2>/dev/null || true
 
 if [[ "$status" -ne 0 && -n "$video_path" && "$TARGET_STOP_FRAME" =~ ^-?[0-9]+$ && "$last_current_frame" =~ ^-?[0-9]+$ && "$last_current_frame" -ge "$TARGET_STOP_FRAME" ]]; then
+  status=0
+fi
+if [[ "$status" -ne 0 && -n "$video_path" && "$last_stall_frame" =~ ^-?[0-9]+$ && "$last_stall_frame" == "$last_current_frame" ]]; then
   status=0
 fi
 
@@ -287,6 +320,11 @@ if run_log.exists():
         match = re.search(r"\[CURRENT_FRAME\]\s+(-?\d+)", line)
         if match:
             current_frames.append(int(match.group(1)))
+stall_marker = out_dir / ".stall-frame"
+try:
+    stalled_frame = int(stall_marker.read_text().strip())
+except (OSError, ValueError):
+    stalled_frame = None
 videos = sorted([
     *out_dir.glob("framedump*.avi"),
     *out_dir.glob("framedump*.mkv"),
@@ -302,6 +340,7 @@ manifest = {
         "first": current_frames[0] if current_frames else None,
         "last": current_frames[-1] if current_frames else None,
     },
+    "stalledFrame": stalled_frame,
     "timeoutSeconds": int(sys.argv[5]),
     "videoBackend": sys.argv[6],
     "dolphinCpuCore": sys.argv[7],

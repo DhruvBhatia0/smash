@@ -209,13 +209,41 @@ the dump-only, single-core, no-window, and 204x168 logical-backbuffer defaults.
 Replacing RunPod provisioning with Daytona CPU provisioning is a separate
 orchestration change from the emulator bottleneck fixed here.
 
+The end-to-end worker-shape benchmark, including source handling and final MP4
+creation, favored one render process per vCPU:
+
+| Daytona shape | Render processes | Measured throughput |
+|---|---:|---:|
+| 1 vCPU | 1 | 63.36 replays/hour |
+| 2 vCPU | 2 | 164.60 replays/hour |
+| 4 vCPU | 4 | **369.67 replays/hour** |
+
+The 4-vCPU shape was fastest both per sandbox and per allocated vCPU. Production
+therefore uses 23 GPU-free 4-vCPU/8-GiB workers plus one GPU-free
+2-vCPU/4-GiB coordinator. The committed artifact contract is a 252x208, 20 Hz
+CFR H.264 MP4 with no audio. Results are streamed back as bounded 100-result
+`tar.zst` batches containing the source SLP, MP4 (or an explicit no-playable-frame
+skip), and metadata; the laptop carries control traffic only.
+
 Live production measurements favor one Drive upload stream with 512 MiB chunks,
 100-result batches, a 64-result flush floor, a 2 GiB archive cap, and a 9 GiB
 logical spool guarded independently by physical free space. A 30-minute window
 rendered 38.85 results/minute and uploaded 39.88 results/minute, so the serial
 uploader drained backlog while minimizing requests against the shared Drive
-OAuth project's quota. The one observed quota pause recovered through the
-persisted 60-second global backoff without a failed batch.
+OAuth project's quota. The full run saw 11 quota pauses; every one recovered
+through the persisted global backoff without a component or upload failure.
+
+The production fleet completed 10,326 of 10,327 indexed replays in 5:11:58. The
+only holdout was a malformed replay whose Dolphin frame progress deterministically
+stopped at frame 7200 even though its SLP declared frame 9204. A bounded CPU-only
+repair accepted the independently validated stable prefix after 60 seconds with
+no frame progress, retained the original SLP, and recorded the discarded 2,004
+frame tail explicitly. Its output is a 2,414-frame, 120.700-second, 252x208 CFR20
+H.264 MP4 with no audio. The final strict source/manifest audit covers all 10,327
+references: eight are explicit `no_playable_frames` skips and 10,319 have video
+artifacts. Those videos contain exactly 31,359,489 CFR20 frames, or
+435 hours, 32 minutes, 54.45 seconds. GPU count was zero for every seed,
+coordinator, benchmark, repair, and production worker.
 
 ## Cleanup
 
