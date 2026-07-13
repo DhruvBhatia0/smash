@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import bisect
+import json
 import os
+import random
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
-from itertools import count
 from pathlib import Path
 from typing import Any
 
@@ -16,48 +20,60 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 from .codec import Codec, CodecDecoder
 
 
 @dataclass(frozen=True)
 class TrainConfig:
-    train_dir: Path
-    eval_dir: Path
+    data_dir: Path
     checkpoint_dir: Path = Path("checkpoints/codec")
-    steps: int = 250_000
+    epochs: int = 3
+    steps: int | None = None
     save_every: int = 5_000
     log_every: int = 10
     batch_size: int = 4
     workers: int = 6
     learning_rate: float = 1e-4
+    train_fraction: float = 0.9
+    split_seed: int = 28
+    clip_seconds: float = 2.0
+    eval_batches: int = 32
     frames: int = 40
-    height: int = 288
-    width: int = 512
+    height: int = 208
+    width: int = 252
     fps: int = 20
     loss: str = "l1"
     compile: bool = True
     wandb_project: str = "smash-codec"
     wandb_name: str | None = None
     wandb_mode: str = "online"
+    hf_repo: str | None = None
 
     @classmethod
     def from_cli(cls) -> TrainConfig:
         parser = argparse.ArgumentParser(description=__doc__)
-        parser.add_argument("train_dir", type=Path)
-        parser.add_argument("eval_dir", type=Path)
+        parser.add_argument("data_dir", type=Path)
         parser.add_argument("--checkpoint-dir", type=Path, default=cls.checkpoint_dir)
-        parser.add_argument("--steps", type=int, default=cls.steps)
+        parser.add_argument("--epochs", type=int, default=cls.epochs)
+        parser.add_argument("--steps", type=int)
         parser.add_argument("--save-every", type=int, default=cls.save_every)
         parser.add_argument("--log-every", type=int, default=cls.log_every)
         parser.add_argument("--batch-size", type=int, default=cls.batch_size)
         parser.add_argument("--workers", type=int, default=cls.workers)
         parser.add_argument("--learning-rate", type=float, default=cls.learning_rate)
+        parser.add_argument("--train-fraction", type=float, default=cls.train_fraction)
+        parser.add_argument("--split-seed", type=int, default=cls.split_seed)
+        parser.add_argument("--clip-seconds", type=float, default=cls.clip_seconds)
+        parser.add_argument("--eval-batches", type=int, default=cls.eval_batches)
         parser.add_argument("--loss", choices=("l1", "mira"), default=cls.loss)
-        parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=cls.compile)
+        parser.add_argument(
+            "--compile", action=argparse.BooleanOptionalAction, default=cls.compile
+        )
         parser.add_argument("--wandb-project", default=cls.wandb_project)
         parser.add_argument("--wandb-name")
+        parser.add_argument("--hf-repo")
         parser.add_argument(
             "--wandb-mode",
             choices=("online", "offline", "disabled"),
@@ -66,40 +82,207 @@ class TrainConfig:
         return cls(**vars(parser.parse_args()))
 
 
-class VideoFolderDataset(Dataset[Tensor]):
-    """Loads one fixed-length, uniformly sampled video clip per file."""
+@dataclass(frozen=True)
+class VideoInfo:
+    path: Path
+    frames: int
+    fps: float
 
-    VIDEO_EXTENSIONS = {".avi", ".mkv", ".mov", ".mp4", ".webm"}
 
-    def __init__(self, folder: Path, frames: int, size: tuple[int, int]):
-        self.paths = sorted(
-            path for path in folder.rglob("*") if path.suffix.lower() in self.VIDEO_EXTENSIONS
-        )
-        self.frames = frames
+class VideoClipDataset(Dataset[Tensor]):
+    """Seek-decodes fixed clips without loading complete replays."""
+
+    INDEX_NAME = ".codec-video-index.json"
+    VIDEO_EXTENSIONS = {".avi", ".mkv", ".mov", ".mp4", ".nut", ".webm"}
+
+    def __init__(
+        self,
+        videos: list[VideoInfo],
+        clip_seconds: float,
+        target_fps: int,
+        size: tuple[int, int],
+    ):
+        self.videos = videos
+        self.clip_seconds = clip_seconds
+        self.target_fps = target_fps
+        self.output_frames = round(clip_seconds * target_fps)
         self.height, self.width = size
-        if not self.paths:
-            raise ValueError(f"No video clips found in {folder}")
+        self.offsets = [0]
+        for video in videos:
+            if video.fps < target_fps:
+                raise ValueError(
+                    f"{video.path} is {video.fps:g} FPS; expected at least {target_fps}"
+                )
+            source_frames = round(video.fps * clip_seconds)
+            self.offsets.append(self.offsets[-1] + video.frames // source_frames)
+        self._containers: OrderedDict[Path, Any] = OrderedDict()
+        if not self.offsets[-1]:
+            raise ValueError("No complete video clips found")
+
+    @classmethod
+    def index(cls, folder: Path) -> list[VideoInfo]:
+        index_path = folder / cls.INDEX_NAME
+        if index_path.exists():
+            rows = json.loads(index_path.read_text())
+            return [
+                VideoInfo(folder / row["path"], row["frames"], row["fps"])
+                for row in rows
+            ]
+
+        paths = sorted(
+            path
+            for path in folder.rglob("*")
+            if path.suffix.lower() in cls.VIDEO_EXTENSIONS
+        )
+        if not paths:
+            raise ValueError(f"No videos found in {folder}")
+        with ThreadPoolExecutor(max_workers=min(32, len(paths))) as pool:
+            videos = list(pool.map(cls._probe, paths))
+        rows = [
+            {
+                "path": str(video.path.relative_to(folder)),
+                "frames": video.frames,
+                "fps": video.fps,
+            }
+            for video in videos
+        ]
+        temporary = index_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(rows, indent=2) + "\n")
+        temporary.replace(index_path)
+        return videos
+
+    @staticmethod
+    def _probe(path: Path) -> VideoInfo:
+        with av.open(path) as container:
+            stream = container.streams.video[0]
+            fps = float(stream.average_rate)
+            if stream.frames:
+                frames = stream.frames
+            elif stream.duration is not None:
+                frames = round(float(stream.duration * stream.time_base) * fps)
+            elif container.duration is not None:
+                frames = round(container.duration / av.time_base * fps)
+            else:
+                raise ValueError(f"Could not determine the duration of {path}")
+        return VideoInfo(path, frames, fps)
+
+    @staticmethod
+    def split(
+        videos: list[VideoInfo], train_fraction: float, seed: int
+    ) -> tuple[list[VideoInfo], list[VideoInfo]]:
+        if len(videos) < 2 or not 0 < train_fraction < 1:
+            raise ValueError(
+                "The dataset needs at least two videos and a split strictly between 0 and 1"
+            )
+        videos = videos.copy()
+        random.Random(seed).shuffle(videos)
+        split = min(len(videos) - 1, max(1, round(len(videos) * train_fraction)))
+        return videos[:split], videos[split:]
 
     def __len__(self) -> int:
-        return len(self.paths)
+        return self.offsets[-1]
 
     def __getitem__(self, index: int) -> Tensor:
-        path = self.paths[index]
-        with av.open(path) as container:
-            container.streams.video[0].thread_type = "AUTO"
-            frames = list(container.decode(video=0))
+        video_index = bisect.bisect_right(self.offsets, index) - 1
+        clip_index = index - self.offsets[video_index]
+        info = self.videos[video_index]
+        source_start = clip_index * round(info.fps * self.clip_seconds)
+        wanted = [
+            source_start + round(frame * info.fps / self.target_fps)
+            for frame in range(self.output_frames)
+        ]
 
-        if len(frames) < self.frames:
-            raise ValueError(
-                f"{path} contains {len(frames)} frames; expected at least {self.frames}"
+        container = self._open(info.path)
+        stream = container.streams.video[0]
+        stream_start = stream.start_time or 0
+        start_seconds = source_start / info.fps
+        container.seek(
+            stream_start + round(start_seconds / float(stream.time_base)),
+            stream=stream,
+            backward=True,
+        )
+        output = []
+        for frame in container.decode(stream):
+            if frame.pts is None:
+                continue
+            source_frame = round(
+                float((frame.pts - stream_start) * stream.time_base) * info.fps
             )
+            if source_frame < wanted[len(output)]:
+                continue
+            resized = frame.reformat(
+                width=self.width, height=self.height, format="rgb24"
+            )
+            output.append(torch.from_numpy(resized.to_ndarray()).permute(2, 0, 1))
+            if len(output) == self.output_frames:
+                return torch.stack(output)
+        raise RuntimeError(f"Could not decode clip {clip_index} from {info.path}")
 
-        indices = torch.linspace(0, len(frames) - 1, self.frames).round().long()
-        video = []
-        for index in indices.tolist():
-            frame = frames[index].reformat(width=self.width, height=self.height, format="rgb24")
-            video.append(torch.from_numpy(frame.to_ndarray()).permute(2, 0, 1))
-        return torch.stack(video)
+    def _open(self, path: Path):
+        if path in self._containers:
+            container = self._containers.pop(path)
+        else:
+            container = av.open(path)
+            container.streams.video[0].thread_count = 1
+        self._containers[path] = container
+        if len(self._containers) > 2:
+            self._containers.popitem(last=False)[1].close()
+        return container
+
+    @property
+    def replay_ranges(self) -> list[tuple[int, int]]:
+        return list(zip(self.offsets, self.offsets[1:]))
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_containers"] = OrderedDict()
+        return state
+
+
+class ReplaySampler(Sampler[int]):
+    """Shuffles replays and clips while keeping file access locally grouped."""
+
+    def __init__(self, dataset: VideoClipDataset, shuffle: bool, seed: int):
+        self.dataset = dataset
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+        self.replicas = dist.get_world_size() if dist.is_initialized() else 1
+        self.rank = dist.get_rank() if dist.is_initialized() else 0
+        self.samples = (len(dataset) + self.replicas - 1) // self.replicas
+
+    def __iter__(self):
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        replay_order = (
+            torch.randperm(len(self.dataset.videos), generator=generator).tolist()
+            if self.shuffle
+            else range(len(self.dataset.videos))
+        )
+        indices = []
+        for replay in replay_order:
+            start, stop = self.dataset.replay_ranges[replay]
+            if self.shuffle:
+                order = (
+                    torch.randperm(stop - start, generator=generator)
+                    .add(start)
+                    .tolist()
+                )
+                indices.extend(order)
+            else:
+                indices.extend(range(start, stop))
+        total = self.samples * self.replicas
+        indices.extend(
+            (indices * ((total - len(indices)) // len(indices) + 1))[
+                : total - len(indices)
+            ]
+        )
+        return iter(indices[self.rank : total : self.replicas])
+
+    def __len__(self) -> int:
+        return self.samples
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
 
 
 class ReconstructionLoss(nn.Module):
@@ -139,12 +322,16 @@ class ReconstructionLoss(nn.Module):
         time = prediction.shape[1]
         count = max(1, round(0.25 * time))
 
-        lpips_frames = torch.randperm(time, device=prediction.device)[:count].sort().values
+        lpips_frames = (
+            torch.randperm(time, device=prediction.device)[:count].sort().values
+        )
         predicted = prediction[:, lpips_frames].flatten(0, 1)
         expected = target[:, lpips_frames].flatten(0, 1)
         perceptual = self.lpips(predicted, expected).mean()
 
-        dino_frames = torch.randperm(time, device=prediction.device)[:count].sort().values
+        dino_frames = (
+            torch.randperm(time, device=prediction.device)[:count].sort().values
+        )
         predicted = self._normalize_dino((prediction[:, dino_frames] + 1) / 2)
         expected = self._normalize_dino((target[:, dino_frames] + 1) / 2)
         predicted_features = self._dino_features(predicted)
@@ -215,8 +402,25 @@ class CodecTrainer:
 
         torch.manual_seed(28 + self.rank)
         torch.set_float32_matmul_precision("high")
-        self.train_loader, self.train_sampler = self._loader(config.train_dir, training=True)
-        self.eval_loader, _ = self._loader(config.eval_dir, training=False)
+        videos = self._video_index()
+        train_videos, eval_videos = VideoClipDataset.split(
+            videos, config.train_fraction, config.split_seed
+        )
+        self.train_loader, self.train_sampler = self._loader(
+            train_videos, training=True
+        )
+        self.eval_loader, _ = self._loader(eval_videos, training=False)
+        epoch_steps = len(self.train_loader)
+        self.steps = min(
+            config.steps or config.epochs * epoch_steps, config.epochs * epoch_steps
+        )
+        if not self.rank:
+            print(
+                f"{len(train_videos):,} train videos / {len(eval_videos):,} eval videos; "
+                f"{len(self.train_loader.dataset):,} train clips / "
+                f"{len(self.eval_loader.dataset):,} eval clips; {epoch_steps:,} steps/epoch; "
+                f"training for {self.steps:,} steps"
+            )
 
         self.raw_model = Codec(
             desired_hidden_states=list(self.DINO_LAYERS),
@@ -230,12 +434,16 @@ class CodecTrainer:
         if config.compile:
             self.model.compile()
 
-        parameters = (parameter for parameter in self.model.parameters() if parameter.requires_grad)
+        parameters = (
+            parameter
+            for parameter in self.model.parameters()
+            if parameter.requires_grad
+        )
         self.optimizer = torch.optim.AdamW(
             parameters, lr=config.learning_rate, betas=(0.9, 0.95), weight_decay=0.1
         )
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=config.steps, eta_min=1e-6
+            self.optimizer, T_max=self.steps, eta_min=1e-6
         )
         self.loss = ReconstructionLoss(
             config.loss,
@@ -245,24 +453,41 @@ class CodecTrainer:
         self.mean = torch.tensor(self.DINO_MEAN, device=self.device).view(1, 1, 3, 1, 1)
         self.std = torch.tensor(self.DINO_STD, device=self.device).view(1, 1, 3, 1, 1)
         self.wandb: Any | None = None
+        self.hf: Any | None = None
+        self.hf_uploads: list[Any] = []
         self._start_wandb()
+        self._start_huggingface()
+
+    def _video_index(self) -> list[VideoInfo]:
+        if not self.rank:
+            VideoClipDataset.index(self.config.data_dir)
+        if self.distributed:
+            dist.barrier()
+        return VideoClipDataset.index(self.config.data_dir)
 
     def _loader(
-        self, folder: Path, training: bool
-    ) -> tuple[DataLoader[Tensor], DistributedSampler[Tensor] | None]:
-        dataset = VideoFolderDataset(
-            folder,
-            frames=self.config.frames,
+        self, videos: list[VideoInfo], training: bool
+    ) -> tuple[DataLoader[Tensor], ReplaySampler]:
+        dataset = VideoClipDataset(
+            videos,
+            clip_seconds=self.config.clip_seconds,
+            target_fps=self.config.fps,
             size=(self.config.height, self.config.width),
         )
-        sampler = DistributedSampler(dataset, shuffle=training) if self.distributed else None
+        if dataset.output_frames != self.config.frames:
+            raise ValueError(
+                f"{self.config.clip_seconds:g}s at {self.config.fps} FPS produces "
+                f"{dataset.output_frames} frames, not {self.config.frames}"
+            )
+        sampler = ReplaySampler(dataset, shuffle=training, seed=self.config.split_seed)
         worker_options = (
-            {"persistent_workers": True, "prefetch_factor": 2} if self.config.workers else {}
+            {"persistent_workers": True, "prefetch_factor": 2}
+            if self.config.workers
+            else {}
         )
         loader = DataLoader(
             dataset,
             batch_size=self.config.batch_size,
-            shuffle=training and sampler is None,
             sampler=sampler,
             num_workers=self.config.workers,
             pin_memory=torch.cuda.is_available(),
@@ -270,7 +495,9 @@ class CodecTrainer:
             **worker_options,
         )
         if training and not len(loader):
-            raise ValueError("The training folder must contain at least one full global batch")
+            raise ValueError(
+                "The training folder must contain at least one full global batch"
+            )
         return loader, sampler
 
     def _start_wandb(self) -> None:
@@ -282,6 +509,11 @@ class CodecTrainer:
             key: str(value) if isinstance(value, Path) else value
             for key, value in asdict(self.config).items()
         }
+        config |= {
+            "train_clips": len(self.train_loader.dataset),
+            "eval_clips": len(self.eval_loader.dataset),
+            "training_steps": self.steps,
+        }
         self.wandb = wandb
         wandb.init(
             project=self.config.wandb_project,
@@ -290,6 +522,14 @@ class CodecTrainer:
             config=config,
         )
 
+    def _start_huggingface(self) -> None:
+        if self.rank or not self.config.hf_repo:
+            return
+        from huggingface_hub import HfApi
+
+        self.hf = HfApi()
+        self.hf.create_repo(self.config.hf_repo, exist_ok=True)
+
     def _autocast(self):
         if self.device.type == "cuda":
             return torch.autocast("cuda", dtype=torch.bfloat16)
@@ -297,7 +537,14 @@ class CodecTrainer:
 
     def _reconstruct(self, video: Tensor) -> tuple[Tensor, Tensor]:
         target = video.mul(2).sub(1)
-        prediction = self.model((video - self.mean) / self.std)
+        model_input = (video - self.mean) / self.std
+        alignment = 2 * self.raw_model.decoder.patch_size
+        pad_height = -video.shape[-2] % alignment
+        pad_width = -video.shape[-1] % alignment
+        model_input = F.pad(
+            model_input, (0, pad_width, 0, pad_height, 0, 0), mode="replicate"
+        )
+        prediction = self.model(model_input)[..., : video.shape[-2], : video.shape[-1]]
         return prediction, target
 
     def _train_step(self, video: Tensor) -> dict[str, Tensor]:
@@ -317,13 +564,17 @@ class CodecTrainer:
         totals: dict[str, Tensor] = {}
         samples = torch.zeros((), device=self.device)
         sample: tuple[Tensor, Tensor] | None = None
-        for video in self.eval_loader:
+        for batch, video in enumerate(self.eval_loader):
+            if batch == self.config.eval_batches:
+                break
             video = video.to(self.device, non_blocking=True).float().div_(255)
             with self._autocast():
                 prediction, target = self._reconstruct(video)
                 losses = self.loss(prediction, target)
             for name, value in losses.items():
-                totals[name] = totals.get(name, torch.zeros_like(value)) + value * len(video)
+                totals[name] = totals.get(name, torch.zeros_like(value)) + value * len(
+                    video
+                )
             samples += len(video)
             sample = sample or (prediction[0].float().cpu(), target[0].cpu())
         if self.distributed:
@@ -332,7 +583,9 @@ class CodecTrainer:
         self.model.train()
         self.raw_model.encoder.dinov3.eval()
         assert sample is not None
-        return {name: (value / samples).item() for name, value in totals.items()}, sample
+        return {
+            name: (value / samples).item() for name, value in totals.items()
+        }, sample
 
     def _save_and_log(self, step: int) -> None:
         eval_losses, (prediction, target) = self._evaluate()
@@ -353,10 +606,22 @@ class CodecTrainer:
             comparison = comparison.clamp(0, 1).mul(255).byte()
             video_path = checkpoint_path.with_suffix(".mp4")
             self._write_video(comparison, video_path)
+            if self.hf:
+                self.hf_uploads.append(
+                    self.hf.upload_folder(
+                        repo_id=self.config.hf_repo,
+                        folder_path=self.config.checkpoint_dir,
+                        allow_patterns=[checkpoint_path.name, video_path.name],
+                        commit_message=f"Codec checkpoint at step {step:,}",
+                        run_as_future=True,
+                    )
+                )
             if self.wandb:
                 self.wandb.log(
                     {
-                        **{f"eval/{name}": value for name, value in eval_losses.items()},
+                        **{
+                            f"eval/{name}": value for name, value in eval_losses.items()
+                        },
                         "eval/reconstruction": self.wandb.Video(
                             str(video_path),
                             format="mp4",
@@ -375,7 +640,9 @@ class CodecTrainer:
             stream.width, stream.height = video.shape[-1], video.shape[-2]
             stream.pix_fmt = "yuv420p"
             for frame in frames:
-                container.mux(stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")))
+                container.mux(
+                    stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24"))
+                )
             container.mux(stream.encode())
 
     def run(self) -> None:
@@ -383,9 +650,8 @@ class CodecTrainer:
         self.raw_model.encoder.dinov3.eval()
         step = 0
         try:
-            for epoch in count():
-                if self.train_sampler:
-                    self.train_sampler.set_epoch(epoch)
+            for epoch in range(self.config.epochs):
+                self.train_sampler.set_epoch(epoch)
                 for video in self.train_loader:
                     step += 1
                     train_losses = self._train_step(video)
@@ -401,17 +667,21 @@ class CodecTrainer:
                                         f"train/{name}": value.item()
                                         for name, value in train_losses.items()
                                     },
-                                    "train/learning_rate": self.scheduler.get_last_lr()[0],
+                                    "train/learning_rate": self.scheduler.get_last_lr()[
+                                        0
+                                    ],
                                 },
                                 step=step,
                             )
-                    if step % self.config.save_every == 0 or step == self.config.steps:
+                    if step % self.config.save_every == 0 or step == self.steps:
                         self._save_and_log(step)
-                    if step == self.config.steps:
+                    if step == self.steps:
                         return
         finally:
             if self.wandb:
                 self.wandb.finish()
+            for upload in self.hf_uploads:
+                upload.result()
             if self.distributed:
                 dist.destroy_process_group()
 
