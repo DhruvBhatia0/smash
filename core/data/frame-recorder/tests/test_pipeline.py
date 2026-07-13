@@ -1573,6 +1573,22 @@ class PipelineTests(unittest.TestCase):
             rclone.kill.assert_called_once_with()
             zstd.kill.assert_called_once_with()
 
+    def test_stream_archive_uses_large_drive_chunks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = self._state(Path(temporary))
+            rclone = mock.Mock(stdin=io.BytesIO(), stderr=io.BytesIO())
+            rclone.wait.return_value = 0
+            zstd = mock.Mock(stdin=io.BytesIO(), stderr=io.BytesIO())
+            zstd.wait.return_value = 0
+            with mock.patch.object(
+                daytona_module.subprocess, "Popen", side_effect=[rclone, zstd]
+            ) as popen:
+                state._stream_result_archive([], "target/archive.tar.zst")
+
+            command = popen.call_args_list[0].args[0]
+            index = command.index("--drive-chunk-size")
+            self.assertEqual(command[index + 1], "128M")
+
     def test_stream_archive_prefers_rclone_error_when_children_exit_nonzero(self):
         with tempfile.TemporaryDirectory() as temporary:
             state = self._state(Path(temporary))

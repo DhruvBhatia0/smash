@@ -45,6 +45,7 @@ DEFAULT_TARGET_ROOT = (
     "hal-fox-captain-falcon-battlefield/recordings-252x208-20fps-slippi-pts-v3"
 )
 VIDEO_SUFFIXES = (".avi", ".mkv", ".mp4", ".mov", ".nut")
+DEFAULT_DRIVE_CHUNK_SIZE = "128M"
 
 _INVALID_PLAYABLE_MAPPING = re.compile(
     r"(?:RuntimeError: )?invalid playable/render frame mapping: "
@@ -1122,6 +1123,8 @@ class DriveClient:
                 "3",
                 "--low-level-retries",
                 "5",
+                "--drive-chunk-size",
+                os.environ.get("SMASH_DRIVE_CHUNK_SIZE", DEFAULT_DRIVE_CHUNK_SIZE),
                 "--tpslimit",
                 str(limit),
                 "--tpslimit-burst",
@@ -2560,6 +2563,8 @@ class CoordinatorState:
                 "3",
                 "--low-level-retries",
                 "5",
+                "--drive-chunk-size",
+                os.environ.get("SMASH_DRIVE_CHUNK_SIZE", DEFAULT_DRIVE_CHUNK_SIZE),
                 "--tpslimit",
                 str(self.upload_tps_limit),
                 "--tpslimit-burst",
