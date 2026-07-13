@@ -41,8 +41,8 @@ class TrainConfig:
     clip_seconds: float = 2.0
     eval_batches: int = 32
     frames: int = 40
-    height: int = 288
-    width: int = 512
+    height: int = 208
+    width: int = 252
     fps: int = 20
     loss: str = "l1"
     compile: bool = True
@@ -537,7 +537,14 @@ class CodecTrainer:
 
     def _reconstruct(self, video: Tensor) -> tuple[Tensor, Tensor]:
         target = video.mul(2).sub(1)
-        prediction = self.model((video - self.mean) / self.std)
+        model_input = (video - self.mean) / self.std
+        alignment = 2 * self.raw_model.decoder.patch_size
+        pad_height = -video.shape[-2] % alignment
+        pad_width = -video.shape[-1] % alignment
+        model_input = F.pad(
+            model_input, (0, pad_width, 0, pad_height, 0, 0), mode="replicate"
+        )
+        prediction = self.model(model_input)[..., : video.shape[-2], : video.shape[-1]]
         return prediction, target
 
     def _train_step(self, video: Tensor) -> dict[str, Tensor]:
