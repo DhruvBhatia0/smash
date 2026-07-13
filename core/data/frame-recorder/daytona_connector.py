@@ -34,11 +34,11 @@ VIDEO_WIDTH = 252
 VIDEO_HEIGHT = 208
 VIDEO_FPS = 20
 SOURCE_FPS = 60
-DEFAULT_RENDERER_SNAPSHOT = "smash-cpu-renderer-e7711b1-v2"
+DEFAULT_RENDERER_SNAPSHOT = "smash-cpu-renderer-e7711b1-v3"
 DEFAULT_ASSET_VOLUME = "smash-frame-assets-v1"
 DEFAULT_SOURCE_ROOT = "hal-fox-captain-falcon-battlefield"
 DEFAULT_TARGET_ROOT = (
-    "hal-fox-captain-falcon-battlefield/recordings-252x208-20fps-slippi-pts-v2"
+    "hal-fox-captain-falcon-battlefield/recordings-252x208-20fps-slippi-pts-v3"
 )
 VIDEO_SUFFIXES = (".avi", ".mkv", ".mp4", ".mov", ".nut")
 
@@ -3012,6 +3012,31 @@ def _probe_video(path: Path) -> dict:
     return stream
 
 
+def _packet_pts_bounds(path: Path) -> tuple[float, float]:
+    completed = _run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "packet=pts_time",
+            "-of",
+            "csv=p=0",
+            str(path),
+        ]
+    )
+    values = [
+        float(line.rstrip(","))
+        for line in completed.stdout.splitlines()
+        if line.rstrip(",") not in {"", "N/A"}
+    ]
+    if not values:
+        raise RuntimeError(f"ffprobe could not read packet PTS from {path}")
+    return values[0], max(values)
+
+
 def _validate_no_audio_and_zero_pts(path: Path) -> None:
     streams = _run(
         [
@@ -3197,6 +3222,16 @@ def render_job(
             "raw capture contains duplicate frames on its Slippi timeline: "
             f"{raw_probe['frames']} > {expected_raw_timeline_frames}"
         )
+    raw_first_pts, raw_last_pts = _packet_pts_bounds(raw)
+    expected_last_pts = (expected_raw_timeline_frames - 1) / SOURCE_FPS
+    max_head_gap_pts = 1 / SOURCE_FPS + 0.001
+    if raw_first_pts < -0.0001 or raw_first_pts > max_head_gap_pts:
+        raise RuntimeError(f"raw capture has invalid first PTS: {raw_first_pts}")
+    if abs(raw_last_pts - expected_last_pts) > 0.001:
+        raise RuntimeError(
+            "raw capture does not reach its final Slippi timeline PTS: "
+            f"{raw_last_pts} != {expected_last_pts}"
+        )
     # Held images are represented as AVI packet-duration gaps. The `fps=60` filter below
     # materializes the authoritative game timeline, so stored packet count can be smaller than
     # the strict playback interval even for a complete render.
@@ -3215,7 +3250,7 @@ def render_job(
         f"not(mod(n-{first_selected_index}\\,3))"
     )
     filter_graph = (
-        f"fps=60,select='{select_expression}',"
+        f"fps=60:start_time=0,select='{select_expression}',"
         "setpts=N/(20*TB),"
         "scale=252:208:flags=lanczos,format=yuv420p"
     )
@@ -3285,6 +3320,8 @@ def render_job(
         "outputBytes": target.stat().st_size,
         "rawFrames": raw_probe["frames"],
         "expectedRawTimelineFrames": expected_raw_timeline_frames,
+        "rawFirstPts": raw_first_pts,
+        "rawLastPts": raw_last_pts,
         "sourceFps": SOURCE_FPS,
         "targetFps": VIDEO_FPS,
         "firstSelectedSlpFrame": first_playable_frame,

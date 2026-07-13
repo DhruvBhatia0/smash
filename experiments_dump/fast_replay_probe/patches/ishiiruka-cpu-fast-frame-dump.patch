@@ -588,7 +588,7 @@ index d3b6b91..9acc084 100644
  	// This is necessary so that the worker thread is no more than one frame behind, and the pointer
  	// (which is actually the buffer) is safe for us to re-use next time.
 diff --git a/Source/Core/VideoCommon/AVIDump.cpp b/Source/Core/VideoCommon/AVIDump.cpp
-index 50592fe..09f0c23 100644
+index 50592fe..481e42f 100644
 --- a/Source/Core/VideoCommon/AVIDump.cpp
 +++ b/Source/Core/VideoCommon/AVIDump.cpp
 @@ -13,6 +13,7 @@ extern "C" {
@@ -746,7 +746,7 @@ index 50592fe..09f0c23 100644
  	// Assume that the timing is valid, if the savestate id of the new frame
  	// doesn't match the last one.
  	if (state.savestate_index != s_last_savestate_index)
-@@ -329,6 +365,13 @@ void AVIDump::AddFrame(const u8* data, int width, int height, int stride, const
+@@ -329,6 +365,14 @@ void AVIDump::AddFrame(const u8* data, int width, int height, int stride, const
  	}
  
  	CheckResolution(width, height);
@@ -755,12 +755,13 @@ index 50592fe..09f0c23 100644
 +	const s64 slippi_pts = s_last_slippi_frame_is_valid ?
 +		s_last_slippi_pts + static_cast<s64>(state.slippi_frame) -
 +			static_cast<s64>(s_last_slippi_frame) :
-+		0;
++		static_cast<s64>(state.slippi_frame) -
++			static_cast<s64>(state.slippi_start_frame) - 1;
 +#endif
  	s_src_frame->data[0] = const_cast<u8*>(data);
  	s_src_frame->linesize[0] = stride;
  	s_src_frame->format = s_pix_fmt;
-@@ -349,6 +392,17 @@ void AVIDump::AddFrame(const u8* data, int width, int height, int stride, const
+@@ -349,6 +393,17 @@ void AVIDump::AddFrame(const u8* data, int width, int height, int stride, const
  	PreparePacket(&pkt);
  	int got_packet = 0;
  	int error = 0;
@@ -778,7 +779,7 @@ index 50592fe..09f0c23 100644
  	u64 delta;
  	s64 last_pts;
  	// Check to see if the first frame being dumped is the first frame of output from the emulator.
-@@ -378,6 +432,7 @@ void AVIDump::AddFrame(const u8* data, int width, int height, int stride, const
+@@ -378,6 +433,7 @@ void AVIDump::AddFrame(const u8* data, int width, int height, int stride, const
  		s_last_pts = pts_in_ticks;
  		error = SendFrameAndReceivePacket(s_codec_context, &pkt, s_scaled_frame, &got_packet);
  	}
@@ -786,7 +787,7 @@ index 50592fe..09f0c23 100644
  	if (!error && got_packet)
  	{
  		WritePacket(pkt);
-@@ -467,5 +522,21 @@ AVIDump::Frame AVIDump::FetchState(u64 ticks)
+@@ -467,5 +523,22 @@ AVIDump::Frame AVIDump::FetchState(u64 ticks)
  	state.first_frame = Movie::GetCurrentFrame() < 1;
  	state.ticks_per_second = SystemTimers::GetTicksPerSecond();
  	state.savestate_index = s_savestate_index;
@@ -797,6 +798,7 @@ index 50592fe..09f0c23 100644
 +	    !g_playbackStatus->isHardFFW && !g_playbackStatus->isSoftFFW)
 +	{
 +		const auto& watch = g_replayComm->current;
++		state.slippi_start_frame = watch.startFrame;
 +		state.slippi_frame = g_playbackStatus->currentPlaybackFrame;
 +		// Preserve the established AVI boundary behavior. Image dumps intentionally include both
 +		// boundary frames.
@@ -809,10 +811,10 @@ index 50592fe..09f0c23 100644
  	return state;
  }
 diff --git a/Source/Core/VideoCommon/AVIDump.h b/Source/Core/VideoCommon/AVIDump.h
-index 2e06e5d..2b09a98 100644
+index 2e06e5d..a100ddb 100644
 --- a/Source/Core/VideoCommon/AVIDump.h
 +++ b/Source/Core/VideoCommon/AVIDump.h
-@@ -20,6 +20,11 @@ public:
+@@ -20,6 +20,12 @@ public:
  		u32 ticks_per_second = 0;
  		bool first_frame = false;
  		int savestate_index = 0;
@@ -820,6 +822,7 @@ index 2e06e5d..2b09a98 100644
 +		// the asynchronous dump thread would associate queued frames with a later emulation frame.
 +		bool should_dump_avi = true;
 +		bool should_dump_image = true;
++		int slippi_start_frame = 0;
 +		int slippi_frame = 0;
  	};
  

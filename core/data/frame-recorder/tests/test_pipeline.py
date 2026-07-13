@@ -1426,6 +1426,14 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(args.upload_concurrency, 4)
         self.assertEqual(args.upload_tps_limit, 1)
 
+    def test_raw_packet_pts_bounds_preserve_a_head_gap(self):
+        completed = mock.Mock(stdout="0.016667,\n0.033333,\n1.000000,\n")
+        with mock.patch.object(daytona_module, "_run", return_value=completed):
+            self.assertEqual(
+                daytona_module._packet_pts_bounds(Path("capture.avi")),
+                (0.016667, 1.0),
+            )
+
     def test_runner_rejects_non_drive_provider_without_constructing_daytona(self):
         with mock.patch.dict(
             os.environ, {"SMASH_STORAGE_PROVIDER": "hf"}, clear=True

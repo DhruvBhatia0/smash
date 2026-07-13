@@ -121,8 +121,9 @@ The production regression replay
 second timestamp edge. Its semantic interval contains 4,131 frames, but the old
 AVI path emitted 4,375, 4,414, and 4,456 decoded frames across three runs while
 the LRAS terminal frame remained displayed during shutdown grace. Snapshot
-`smash-cpu-renderer-e7711b1-v2` fixes this at the AVI boundary by suppressing
-non-increasing Slippi IDs and assigning accepted frames frame-ID-based PTS. Core
+`smash-cpu-renderer-e7711b1-v3` fixes this at the AVI boundary by suppressing
+non-increasing Slippi IDs and assigning accepted frames start-anchored,
+frame-ID-based PTS. Core
 validation now rejects any raw packet count above the semantic interval rather
 than tolerating an extra two seconds.
 
