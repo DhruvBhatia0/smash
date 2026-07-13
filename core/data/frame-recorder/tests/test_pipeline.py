@@ -767,6 +767,75 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(fresh.exists())
             self.assertTrue(tracked.exists())
 
+    def test_queue_sync_reconciles_durable_lease_before_result_after_restart(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue_root = root / "queue"
+            state = self._state(root / "spool", queue_root=queue_root)
+            self.addCleanup(state.db.close)
+            self._insert_job(state, 0, "queued", attempts=1)
+            row = state.db.execute("SELECT * FROM jobs WHERE id=0").fetchone()
+            token = "durable-lease"
+            stem = state._lease_stem(0, token)
+            lease_path = queue_root / "leased" / f"{stem}.json"
+            lease_path.write_text(
+                json.dumps(
+                    {
+                        "id": 0,
+                        "reference": row["reference"],
+                        "sourcePath": row["source_path"],
+                        "sourceBytes": row["source_bytes"],
+                        "sourceSha256": row["source_sha256"],
+                        "attempts": 1,
+                        "leaseToken": token,
+                        "workerId": "worker-before-restart",
+                        "leaseDeadline": time.time() + state.lease_seconds,
+                    }
+                )
+            )
+            bundle = self._result_tar(root, {"video": self._valid_video_metadata()})
+            payload = bundle.read_bytes()
+            shared_result = queue_root / "results" / f"{stem}.tar"
+            result_marker = queue_root / "results" / f"{stem}.result.json"
+            shared_result.write_bytes(payload)
+            result_marker.write_text(
+                json.dumps(
+                    {
+                        "id": 0,
+                        "leaseToken": token,
+                        "resultPath": str(shared_result),
+                        "resultBytes": len(payload),
+                        "resultSha256": hashlib.sha256(payload).hexdigest(),
+                    }
+                )
+            )
+            reconcile_lease = state._sync_filesystem_lease
+            accept_result = state._sync_filesystem_result
+
+            def delayed_reconcile(path: Path) -> None:
+                time.sleep(0.05)
+                reconcile_lease(path)
+
+            def accept_then_stop(path: Path) -> None:
+                try:
+                    accept_result(path)
+                finally:
+                    state.stop.set()
+
+            with mock.patch.object(
+                state, "_sync_filesystem_lease", side_effect=delayed_reconcile
+            ), mock.patch.object(
+                state, "_sync_filesystem_result", side_effect=accept_then_stop
+            ):
+                state.sync_filesystem()
+
+            committed = state.db.execute("SELECT * FROM jobs WHERE id=0").fetchone()
+            self.assertEqual(committed["status"], "complete")
+            self.assertEqual(committed["result_token"], token)
+            self.assertEqual(Path(committed["result_path"]).read_bytes(), payload)
+            self.assertFalse(shared_result.exists())
+            self.assertFalse(result_marker.exists())
+
     def test_result_tar_rejects_wrong_video_contract_or_extra_members(self):
         valid_video = self._valid_video_metadata()
         invalid_values = {
@@ -1146,6 +1215,36 @@ class PipelineTests(unittest.TestCase):
                     "SELECT status FROM jobs WHERE id=0"
                 ).fetchone()[0]
                 self.assertEqual(status, "failed" if attempt == 3 else "complete")
+
+    def test_drive_query_rate_limit_refunds_attempt_and_stops_all_uploaders(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = self._state(
+                Path(temporary),
+                prefetch=1,
+                upload_batch_size=1,
+                upload_concurrency=8,
+                upload_max_attempts=3,
+            )
+            self.addCleanup(state.db.close)
+            self._insert_job(state, 0, "complete")
+            rows = state._claim_upload_batch()
+            self.assertEqual(int(rows[0]["upload_attempts"]), 1)
+            error = RuntimeError(
+                "Quota exceeded for quota metric 'Queries': rateLimitExceeded"
+            )
+
+            with mock.patch.object(daytona_module.time, "monotonic", return_value=100.0):
+                retry_after = state._record_drive_rate_limit(rows, error)
+
+            row = state.db.execute("SELECT * FROM jobs WHERE id=0").fetchone()
+            self.assertEqual(row["status"], "complete")
+            self.assertEqual(int(row["upload_attempts"]), 0)
+            self.assertEqual(retry_after, 60.0)
+            self.assertTrue(state._is_drive_rate_limit(error))
+            self.assertFalse(state._is_drive_rate_limit(RuntimeError("connection reset")))
+
+            state.stop.set()
+            self.assertFalse(state._wait_for_drive_backoff())
 
     def test_committed_batch_cleans_local_files_before_releasing_capacity(self):
         with tempfile.TemporaryDirectory() as temporary:

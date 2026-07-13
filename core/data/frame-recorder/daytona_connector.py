@@ -1170,6 +1170,11 @@ class CoordinatorState:
         self.spool_max_bytes = spool_max_bytes
         self.spool_headroom_bytes = min(512 * 1024**2, max(1, spool_max_bytes // 10))
         self._reserved_result_bytes = 0
+        self.queue_sync_concurrency = max(
+            1, int(os.environ.get("SMASH_QUEUE_SYNC_CONCURRENCY", "16"))
+        )
+        self._drive_backoff_until = 0.0
+        self._drive_rate_limit_streak = 0
         self.queue_root = queue_root
         if self.queue_root is not None:
             for name in (
@@ -1348,7 +1353,7 @@ class CoordinatorState:
             except OSError:
                 continue
             if stale and not marker.exists() and not lease.exists():
-                if not self._unlink_shared_paths([payload]):
+                if not self._unlink_shared_paths([payload], attempts=4):
                     raise RuntimeError(f"could not remove stale shared result: {payload}")
                 _json_line("stale_shared_result_removed", payload=str(payload))
 
@@ -1893,9 +1898,9 @@ class CoordinatorState:
         return removed
 
     @staticmethod
-    def _unlink_shared_paths(paths: Iterable[Path]) -> bool:
+    def _unlink_shared_paths(paths: Iterable[Path], *, attempts: int = 1) -> bool:
         pending = set(paths)
-        for attempt in range(1, 5):
+        for attempt in range(1, max(1, attempts) + 1):
             for path in list(pending):
                 try:
                     path.unlink(missing_ok=True)
@@ -1905,7 +1910,8 @@ class CoordinatorState:
                     continue
             if not pending:
                 return True
-            time.sleep(min(4, 2**attempt))
+            if attempt < attempts:
+                time.sleep(min(4, 2**attempt))
         return False
 
     def _sync_filesystem_claim(self, claim_path: Path) -> None:
@@ -2150,24 +2156,16 @@ class CoordinatorState:
     def sync_filesystem(self) -> None:
         assert self.queue_root is not None
         next_lease_reconcile = 0.0
-        while not self.stop.is_set():
-            operations = []
-            if time.monotonic() >= next_lease_reconcile:
-                operations.append(
-                    ("lease", self.queue_root / "leased", "*.json", self._sync_filesystem_lease)
-                )
-                next_lease_reconcile = time.monotonic() + 30
-            operations.extend(
-                (
-                    ("claim", self.queue_root / "claims", "*.json", self._sync_filesystem_claim),
-                    ("result", self.queue_root / "results", "*.result.json", self._sync_filesystem_result),
-                    ("failure", self.queue_root / "failures", "*.failure.json", self._sync_filesystem_failure),
-                )
-            )
-            for kind, directory, pattern, function in operations:
-                for path in sorted(directory.glob(pattern)):
+        with ThreadPoolExecutor(max_workers=self.queue_sync_concurrency) as executor:
+            def run_tasks(tasks) -> None:
+                futures = {
+                    executor.submit(function, path): (kind, path)
+                    for kind, path, function in tasks
+                }
+                for future in as_completed(futures):
+                    kind, path = futures[future]
                     try:
-                        function(path)
+                        future.result()
                     except Exception as error:
                         _json_line(
                             "filesystem_queue_retry",
@@ -2175,14 +2173,43 @@ class CoordinatorState:
                             path=str(path),
                             error=str(error),
                         )
-            try:
-                self._update_rendering_done()
-            except Exception as error:
-                _json_line("filesystem_queue_retry", kind="done", error=str(error))
-            self.stop.wait(1)
+
+            while not self.stop.is_set():
+                if time.monotonic() >= next_lease_reconcile:
+                    lease_tasks = [
+                        ("lease", path, self._sync_filesystem_lease)
+                        for path in sorted((self.queue_root / "leased").glob("*.json"))
+                    ]
+                    # A restarted coordinator normalizes durable leases to queued. Reconcile
+                    # every lease before result/failure processing so valid completed work is
+                    # not rejected and deleted merely because its token has not been adopted yet.
+                    run_tasks(lease_tasks)
+                    next_lease_reconcile = time.monotonic() + 30
+                operations = (
+                    ("claim", self.queue_root / "claims", "*.json", self._sync_filesystem_claim),
+                    ("result", self.queue_root / "results", "*.result.json", self._sync_filesystem_result),
+                    ("failure", self.queue_root / "failures", "*.failure.json", self._sync_filesystem_failure),
+                )
+                groups = [
+                    [(kind, path, function) for path in sorted(directory.glob(pattern))]
+                    for kind, directory, pattern, function in operations
+                ]
+                tasks = []
+                for index in range(max((len(group) for group in groups), default=0)):
+                    for group in groups:
+                        if index < len(group):
+                            tasks.append(group[index])
+                run_tasks(tasks)
+                try:
+                    self._update_rendering_done()
+                except Exception as error:
+                    _json_line("filesystem_queue_retry", kind="done", error=str(error))
+                self.stop.wait(0.5)
 
     def upload(self) -> None:
         while not self.stop.is_set():
+            if not self._wait_for_drive_backoff():
+                return
             rows = self._claim_upload_batch()
             if not rows:
                 if self.is_terminal():
@@ -2192,9 +2219,21 @@ class CoordinatorState:
                 continue
             try:
                 self._upload_rows(rows)
+                with self.condition:
+                    if time.monotonic() >= self._drive_backoff_until:
+                        self._drive_rate_limit_streak = 0
             except PostCommitCleanupError:
                 raise
             except Exception as error:
+                if self._is_drive_rate_limit(error):
+                    retry_after = self._record_drive_rate_limit(rows, error)
+                    _json_line(
+                        "drive_rate_limited",
+                        count=len(rows),
+                        retryAfterSeconds=round(retry_after, 3),
+                        error=str(error),
+                    )
+                    continue
                 exhausted = self._record_upload_failure(rows, error)
                 attempts = max(int(row["upload_attempts"]) for row in rows)
                 _json_line(
@@ -2209,6 +2248,43 @@ class CoordinatorState:
                         f"Drive upload exhausted {self.upload_max_attempts} attempts: {error}"
                     ) from error
                 time.sleep(5)
+
+    @staticmethod
+    def _is_drive_rate_limit(error: Exception) -> bool:
+        message = str(error).lower()
+        return "ratelimitexceeded" in message or (
+            "quota exceeded" in message and "queries" in message
+        )
+
+    def _wait_for_drive_backoff(self) -> bool:
+        with self.condition:
+            while not self.stop.is_set():
+                remaining = self._drive_backoff_until - time.monotonic()
+                if remaining <= 0:
+                    return True
+                self.condition.wait(timeout=min(5, remaining))
+            return False
+
+    def _record_drive_rate_limit(
+        self, rows: list[sqlite3.Row], error: Exception
+    ) -> float:
+        with self.condition, self.db:
+            now = time.monotonic()
+            if now >= self._drive_backoff_until:
+                self._drive_rate_limit_streak += 1
+                delay = min(300.0, 60.0 * (2 ** (self._drive_rate_limit_streak - 1)))
+                self._drive_backoff_until = now + delay
+            else:
+                delay = self._drive_backoff_until - now
+            for row in rows:
+                self.db.execute(
+                    "UPDATE jobs SET status='complete', "
+                    "upload_attempts=MAX(0, upload_attempts-1), error=?, updated_at=? "
+                    "WHERE id=? AND status='uploading'",
+                    (str(error)[-4000:], time.time(), int(row["id"])),
+                )
+            self.condition.notify_all()
+            return max(0.0, self._drive_backoff_until - time.monotonic())
 
     def _record_upload_failure(
         self, rows: list[sqlite3.Row], error: Exception
@@ -2685,9 +2761,10 @@ class SharedQueueClient:
     after observing its token-specific grant.
     """
 
-    def __init__(self, root: Path, worker_id: str) -> None:
+    def __init__(self, root: Path, worker_id: str, worker_slot: int = 0) -> None:
         self.root = root
         self.worker_id = worker_id
+        self.worker_slot = max(0, worker_slot)
         for name in (
             "sources",
             "pending",
@@ -2705,9 +2782,9 @@ class SharedQueueClient:
         return f"{job_id:06d}-{lease_token}"
 
     def lease(self) -> tuple[dict | None, bool]:
-        pending = list((self.root / "pending").glob("*.json"))
+        pending = sorted((self.root / "pending").glob("*.json"))
         if pending:
-            offset = int.from_bytes(os.urandom(2), "big") % len(pending)
+            offset = self.worker_slot % len(pending)
             pending = pending[offset:] + pending[:offset]
         for pending_path in pending:
             try:
@@ -2841,10 +2918,12 @@ class SharedQueueClient:
         )
 
 
-def _worker_client(worker_id: str) -> CoordinatorClient | SharedQueueClient:
+def _worker_client(
+    worker_id: str, worker_slot: int = 0
+) -> CoordinatorClient | SharedQueueClient:
     queue_root = os.environ.get("SMASH_QUEUE_ROOT")
     if queue_root:
-        return SharedQueueClient(Path(queue_root), worker_id)
+        return SharedQueueClient(Path(queue_root), worker_id, worker_slot)
     return CoordinatorClient(
         os.environ["SMASH_COORDINATOR_URL"],
         os.environ["SMASH_COORDINATOR_TOKEN"],
@@ -3297,7 +3376,14 @@ def run_worker(worker_id: str, processes: int, result_batch_size: int) -> None:
                 completed.task_done()
 
     def renderer(index: int) -> None:
-        client = _worker_client(f"{worker_id}-{index}")
+        try:
+            sandbox_index = int(worker_id.rsplit("-", 1)[1])
+        except (IndexError, ValueError):
+            sandbox_index = 0
+        client = _worker_client(
+            f"{worker_id}-{index}",
+            worker_slot=sandbox_index * processes + index,
+        )
         lease_failures = 0
         while not stop.is_set():
             try:
