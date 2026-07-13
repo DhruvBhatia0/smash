@@ -3076,10 +3076,18 @@ def _worker_client(
     )
 
 
-def slp_frame_range(path: Path) -> tuple[int, int]:
+@dataclass(frozen=True)
+class _SlpRenderPlan:
+    raw_pos: int
+    first_frame: int
+    last_frame: int
+    selected_segment: int = 1
+    selected_chunks: tuple[tuple[int, int], ...] = ()
+
+
+def _slp_render_plan(data: bytes, path: Path) -> _SlpRenderPlan:
     import struct
 
-    data = path.read_bytes()
     if not data:
         raise ValueError(f"empty SLP: {path}")
     raw_pos = 0 if data[0] != ord("{") else 15
@@ -3087,37 +3095,150 @@ def slp_frame_range(path: Path) -> tuple[int, int]:
     if raw_len <= 0 or raw_pos + raw_len > len(data):
         raw_len = len(data) - raw_pos
     raw_end = raw_pos + raw_len
-    if raw_pos == 0:
-        sizes = {0x36: 0x140, 0x37: 0x6, 0x38: 0x46, 0x39: 0x1}
-    else:
-        if raw_pos + 2 > len(data) or data[raw_pos] != 0x35:
-            raise ValueError("SLP is missing message-size table")
-        payload_len = data[raw_pos + 1]
-        sizes = {0x35: payload_len}
-        size_bytes = data[raw_pos + 2 : raw_pos + 1 + payload_len]
-        for offset in range(0, len(size_bytes), 3):
-            if offset + 2 >= len(size_bytes):
-                break
-            sizes[size_bytes[offset]] = int.from_bytes(size_bytes[offset + 1 : offset + 3], "big")
-    first: int | None = None
-    last: int | None = None
+    if raw_pos != 0 and (raw_pos + 2 > len(data) or data[raw_pos] != 0x35):
+        raise ValueError("SLP is missing message-size table")
+    sizes = {0x36: 0x140, 0x37: 0x6, 0x38: 0x46, 0x39: 0x1} if raw_pos == 0 else {}
+    overall_first: int | None = None
+    overall_last: int | None = None
+    segment_first: int | None = None
+    segment_last: int | None = None
+    segment_start: int | None = None
+    segment_table: tuple[int, int] | None = None
+    last_table: tuple[int, int] | None = None
+    game_started = False
+    game_starts = 0
+    first_complete: tuple[
+        int, tuple[int, int] | None, int, int, int, int
+    ] | None = None
+    later_game_started = False
     position = raw_pos
     while position < raw_end:
         command = data[position]
+        if command == 0x35:
+            if position + 2 > raw_end:
+                break
+            payload_len = data[position + 1]
+            if payload_len < 1:
+                break
+            stop = position + payload_len + 1
+            if stop > raw_end:
+                break
+            refreshed = {0x35: payload_len}
+            size_bytes = data[position + 2 : position + 1 + payload_len]
+            for offset in range(0, len(size_bytes), 3):
+                if offset + 2 >= len(size_bytes):
+                    break
+                refreshed[size_bytes[offset]] = int.from_bytes(
+                    size_bytes[offset + 1 : offset + 3], "big"
+                )
+            sizes = refreshed
+            last_table = (position, stop)
+            position = stop
+            continue
         size = sizes.get(command)
         if size is None:
             break
         stop = position + size + 1
         if stop > raw_end:
             break
-        if command == 0x38 and stop - position >= 5:
+        if command == 0x36:
+            game_starts += 1
+            if first_complete is not None:
+                later_game_started = True
+            game_started = True
+            segment_start = position
+            segment_table = last_table
+            segment_first = None
+            segment_last = None
+        elif command == 0x38 and stop - position >= 5:
             frame = struct.unpack(">i", data[position + 1 : position + 5])[0]
-            first = frame if first is None else min(first, frame)
-            last = frame if last is None else max(last, frame)
+            overall_first = frame if overall_first is None else min(overall_first, frame)
+            overall_last = frame if overall_last is None else max(overall_last, frame)
+            if game_started:
+                segment_first = frame if segment_first is None else min(segment_first, frame)
+                segment_last = frame if segment_last is None else max(segment_last, frame)
+        elif command == 0x39:
+            if (
+                game_started
+                and first_complete is None
+                and segment_start is not None
+                and segment_first is not None
+                and segment_last is not None
+            ):
+                first_complete = (
+                    game_starts,
+                    segment_table,
+                    segment_start,
+                    stop,
+                    segment_first,
+                    segment_last,
+                )
+            game_started = False
         position = stop
-    if first is None or last is None:
+    if overall_first is None or overall_last is None:
         raise ValueError(f"SLP has no post-frame updates: {path}")
-    return first, last
+    if first_complete is None:
+        if game_starts > 1:
+            raise ValueError(f"SLP has multiple games but no complete game: {path}")
+        return _SlpRenderPlan(raw_pos, overall_first, overall_last)
+    segment_number, table, game_start, game_end, first, last = first_complete
+    if segment_number == 1 and not later_game_started:
+        return _SlpRenderPlan(raw_pos, overall_first, overall_last)
+    chunks: list[tuple[int, int]] = []
+    if table is not None:
+        chunks.append(table)
+    chunks.append((game_start, game_end))
+    return _SlpRenderPlan(raw_pos, first, last, segment_number, tuple(chunks))
+
+
+def slp_frame_range(path: Path) -> tuple[int, int]:
+    plan = _slp_render_plan(path.read_bytes(), path)
+    return plan.first_frame, plan.last_frame
+
+
+def _prepare_slp_render_input(
+    source: Path, normalized: Path
+) -> tuple[Path, tuple[int, int], dict | None]:
+    data = source.read_bytes()
+    plan = _slp_render_plan(data, source)
+    frame_range = (plan.first_frame, plan.last_frame)
+    if not plan.selected_chunks:
+        return source, frame_range, None
+    selected_raw = b"".join(data[start:stop] for start, stop in plan.selected_chunks)
+    if plan.raw_pos:
+        if not selected_raw or selected_raw[0] != 0x35:
+            raise ValueError("normalized UBJSON SLP is missing its message-size table")
+        prefix = bytearray(data[: plan.raw_pos])
+        prefix[plan.raw_pos - 4 : plan.raw_pos] = len(selected_raw).to_bytes(4, "big")
+        payload = bytes(prefix) + selected_raw + b"U\x08metadata{}}"
+    else:
+        payload = selected_raw
+    normalized.write_bytes(payload)
+    return (
+        normalized,
+        frame_range,
+        {
+            "policy": "first-complete-game-v1",
+            "selectedSegment": plan.selected_segment,
+            "firstFrame": plan.first_frame,
+            "lastFrame": plan.last_frame,
+            "renderInputBytes": len(payload),
+            "renderInputSha256": hashlib.sha256(payload).hexdigest(),
+        },
+    )
+
+
+def _annotate_replay_normalization(
+    metadata: dict, job: dict, replay_normalization: dict | None
+) -> None:
+    if replay_normalization is None:
+        return
+    metadata["file"] = {
+        "name": "input.slp",
+        "bytes": int(job["sourceBytes"]),
+        "sha256": str(job["sourceSha256"]),
+    }
+    metadata["replayNormalization"] = replay_normalization
 
 
 def _probe_video(path: Path) -> dict:
@@ -3231,14 +3352,17 @@ def render_job(
     render_dir.mkdir(parents=True)
     recording_dir.mkdir(parents=True)
     slp = job_dir / "input.slp"
+    normalized_slp = job_dir / "render-input.slp"
     playback = job_dir / "playback.json"
     client.download(job, slp)
-    source_first_frame, source_last_frame = slp_frame_range(slp)
+    render_slp, (source_first_frame, source_last_frame), replay_normalization = (
+        _prepare_slp_render_input(slp, normalized_slp)
+    )
     metadata_path = recording_dir / "metadata.json"
     _run(
         [
             "/opt/slippi-renderer/extract-slp-metadata.mjs",
-            str(slp),
+            str(render_slp),
             str(metadata_path),
             job["reference"],
             "gdrive",
@@ -3246,6 +3370,7 @@ def render_job(
         timeout=120,
     )
     metadata = json.loads(metadata_path.read_text())
+    _annotate_replay_normalization(metadata, job, replay_normalization)
     match_frames = ((metadata.get("match") or {}).get("frames") or {})
     first_playable_frame = int(match_frames.get("firstPlayable", -39))
     last_source_frame = int(match_frames.get("last", source_last_frame))
@@ -3263,7 +3388,7 @@ def render_job(
     playback.write_text(
         json.dumps(
             {
-                "replay": str(slp),
+                "replay": str(render_slp),
                 "commandId": f"daytona-{job['id']}",
                 "startFrame": render_start_frame,
                 "endFrame": render_end_frame,

@@ -226,6 +226,41 @@ class PipelineTests(unittest.TestCase):
             "cpuOnly": True,
         }
 
+    def _synthetic_slp(
+        self,
+        segments: list[tuple[list[int], bool, int]],
+        *,
+        wrapped: bool = True,
+        message_tables: bool = True,
+    ) -> bytes:
+        raw = bytearray()
+        for frames, complete, post_frame_size in segments:
+            if message_tables:
+                size_entries = b"".join(
+                    bytes([command]) + size.to_bytes(2, "big")
+                    for command, size in (
+                        (0x36, 0x140),
+                        (0x38, post_frame_size),
+                        (0x39, 0x1),
+                    )
+                )
+                raw.extend(bytes([0x35, len(size_entries) + 1]) + size_entries)
+            raw.extend(bytes([0x36]) + bytes(0x140))
+            for frame in frames:
+                raw.extend(
+                    bytes([0x38])
+                    + frame.to_bytes(4, "big", signed=True)
+                    + bytes(post_frame_size - 4)
+                )
+            if complete:
+                raw.extend(bytes([0x39, 0]))
+        if not wrapped:
+            return bytes(raw)
+        header = bytearray(15)
+        header[0] = ord("{")
+        header[11:15] = len(raw).to_bytes(4, "big")
+        return bytes(header + raw) + b"U\x08metadata{}}"
+
     def test_processed_sample_requires_slp_video_and_metadata(self):
         provider = MemoryProvider(
             ["raw/0.slp", "raw/1.slp"],
@@ -245,6 +280,124 @@ class PipelineTests(unittest.TestCase):
         )
         producer = models.SlpProducer(Queue(), location, desired_max=2, skip_existing_processed=True)
         self.assertEqual(producer._processed_ids(), {0})
+
+    def test_slp_render_input_selects_first_complete_before_appended_game(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "input.slp"
+            normalized = root / "render-input.slp"
+            original = self._synthetic_slp(
+                [([-123, 17755], True, 0x46), ([-123, 8054], False, 0x50)]
+            )
+            source.write_bytes(original)
+
+            render_input, frame_range, annotation = (
+                daytona_module._prepare_slp_render_input(source, normalized)
+            )
+
+            self.assertEqual(render_input, normalized)
+            self.assertEqual(frame_range, (-123, 17755))
+            self.assertEqual(daytona_module.slp_frame_range(source), (-123, 17755))
+            self.assertEqual(daytona_module.slp_frame_range(normalized), (-123, 17755))
+            self.assertEqual(source.read_bytes(), original)
+            expected = self._synthetic_slp([([-123, 17755], True, 0x46)])
+            self.assertEqual(normalized.read_bytes(), expected)
+            self.assertEqual(annotation["policy"], "first-complete-game-v1")
+            self.assertEqual(annotation["selectedSegment"], 1)
+            self.assertEqual(annotation["renderInputBytes"], len(expected))
+            self.assertEqual(
+                annotation["renderInputSha256"], hashlib.sha256(expected).hexdigest()
+            )
+            metadata = {"file": {"bytes": len(expected), "sha256": "normalized"}}
+            job = {"sourceBytes": len(original), "sourceSha256": "original-sha256"}
+            daytona_module._annotate_replay_normalization(metadata, job, annotation)
+            self.assertEqual(
+                metadata["file"],
+                {
+                    "name": "input.slp",
+                    "bytes": len(original),
+                    "sha256": "original-sha256",
+                },
+            )
+            self.assertEqual(metadata["replayNormalization"], annotation)
+
+    def test_slp_render_input_preserves_normal_single_game(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "input.slp"
+            normalized = root / "render-input.slp"
+            source.write_bytes(self._synthetic_slp([([-123, 2182], True, 0x46)]))
+
+            render_input, frame_range, annotation = (
+                daytona_module._prepare_slp_render_input(source, normalized)
+            )
+
+            self.assertEqual(render_input, source)
+            self.assertEqual(frame_range, (-123, 2182))
+            self.assertIsNone(annotation)
+            self.assertFalse(normalized.exists())
+
+    def test_slp_render_input_selects_complete_after_incomplete_and_refreshes_sizes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "input.slp"
+            normalized = root / "render-input.slp"
+            source.write_bytes(
+                self._synthetic_slp(
+                    [([-123, 100], False, 0x46), ([-123, 8054], True, 0x50)]
+                )
+            )
+
+            _, frame_range, annotation = daytona_module._prepare_slp_render_input(
+                source, normalized
+            )
+
+            expected = self._synthetic_slp([([-123, 8054], True, 0x50)])
+            self.assertEqual(frame_range, (-123, 8054))
+            self.assertEqual(annotation["selectedSegment"], 2)
+            self.assertEqual(normalized.read_bytes(), expected)
+            self.assertEqual(daytona_module.slp_frame_range(normalized), (-123, 8054))
+
+    def test_slp_render_input_normalizes_legacy_raw_and_empty_appended_game(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "input.slp"
+            normalized = root / "render-input.slp"
+            source.write_bytes(
+                self._synthetic_slp(
+                    [([-123, 17755], True, 0x46), ([], False, 0x46)],
+                    wrapped=False,
+                    message_tables=False,
+                )
+            )
+
+            _, frame_range, annotation = daytona_module._prepare_slp_render_input(
+                source, normalized
+            )
+
+            expected = self._synthetic_slp(
+                [([-123, 17755], True, 0x46)],
+                wrapped=False,
+                message_tables=False,
+            )
+            self.assertEqual(frame_range, (-123, 17755))
+            self.assertEqual(annotation["selectedSegment"], 1)
+            self.assertEqual(normalized.read_bytes(), expected)
+            self.assertEqual(daytona_module.slp_frame_range(normalized), (-123, 17755))
+
+    def test_slp_render_input_rejects_ambiguous_incomplete_games(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "input.slp"
+            source.write_bytes(
+                self._synthetic_slp(
+                    [([-123, 100], False, 0x46), ([-123, 8054], False, 0x46)]
+                )
+            )
+
+            with self.assertRaisesRegex(ValueError, "multiple games but no complete game"):
+                daytona_module._prepare_slp_render_input(
+                    source, Path(temporary) / "render-input.slp"
+                )
 
     def test_upload_does_not_block_next_render(self):
         queue = Queue()
