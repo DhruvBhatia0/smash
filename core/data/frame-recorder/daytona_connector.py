@@ -34,6 +34,7 @@ VIDEO_WIDTH = 252
 VIDEO_HEIGHT = 208
 VIDEO_FPS = 20
 SOURCE_FPS = 60
+UPLOAD_RETRY_SECONDS = 5.0
 DEFAULT_RENDERER_SNAPSHOT = "smash-cpu-renderer-e7711b1-v3"
 DEFAULT_ASSET_VOLUME = "smash-frame-assets-v1"
 DEFAULT_SOURCE_ROOT = "hal-fox-captain-falcon-battlefield"
@@ -1232,6 +1233,7 @@ class CoordinatorState:
                     result_token TEXT,
                     result_sha256 TEXT,
                     upload_attempts INTEGER NOT NULL DEFAULT 0,
+                    upload_not_before REAL,
                     error TEXT,
                     updated_at REAL NOT NULL
                 );
@@ -1257,6 +1259,8 @@ class CoordinatorState:
                 self.db.execute(
                     "ALTER TABLE jobs ADD COLUMN upload_attempts INTEGER NOT NULL DEFAULT 0"
                 )
+            if "upload_not_before" not in columns:
+                self.db.execute("ALTER TABLE jobs ADD COLUMN upload_not_before REAL")
 
     def initialize(self) -> None:
         references = self._source_references()
@@ -2256,7 +2260,6 @@ class CoordinatorState:
                     raise RuntimeError(
                         f"Drive upload exhausted {self.upload_max_attempts} attempts: {error}"
                     ) from error
-                time.sleep(5)
 
     @staticmethod
     def _is_drive_rate_limit(error: Exception) -> bool:
@@ -2268,52 +2271,81 @@ class CoordinatorState:
     def _wait_for_drive_backoff(self) -> bool:
         with self.condition:
             while not self.stop.is_set():
-                remaining = self._drive_backoff_until - time.monotonic()
+                remaining = self._upload_backoff_remaining()
                 if remaining <= 0:
                     return True
                 self.condition.wait(timeout=min(5, remaining))
             return False
 
+    def _upload_backoff_remaining(self) -> float:
+        persisted = self.db.execute(
+            "SELECT MAX(upload_not_before) FROM jobs WHERE status='complete'"
+        ).fetchone()[0]
+        return max(
+            0.0,
+            self._drive_backoff_until - time.monotonic(),
+            float(persisted or 0) - time.time(),
+        )
+
     def _record_drive_rate_limit(
         self, rows: list[sqlite3.Row], error: Exception
     ) -> float:
         with self.condition, self.db:
-            now = time.monotonic()
-            if now >= self._drive_backoff_until:
+            monotonic_now = time.monotonic()
+            if monotonic_now >= self._drive_backoff_until:
                 self._drive_rate_limit_streak += 1
                 delay = min(300.0, 60.0 * (2 ** (self._drive_rate_limit_streak - 1)))
-                self._drive_backoff_until = now + delay
-            else:
-                delay = self._drive_backoff_until - now
+                self._drive_backoff_until = monotonic_now + delay
+            remaining = max(0.0, self._drive_backoff_until - monotonic_now)
+            wall_now = time.time()
+            not_before = wall_now + remaining
             for row in rows:
                 self.db.execute(
                     "UPDATE jobs SET status='complete', "
-                    "upload_attempts=MAX(0, upload_attempts-1), error=?, updated_at=? "
+                    "upload_attempts=MAX(0, upload_attempts-1), "
+                    "upload_not_before=MAX(COALESCE(upload_not_before, 0), ?), "
+                    "error=?, updated_at=? "
                     "WHERE id=? AND status='uploading'",
-                    (str(error)[-4000:], time.time(), int(row["id"])),
+                    (not_before, str(error)[-4000:], wall_now, int(row["id"])),
                 )
             self.condition.notify_all()
-            return max(0.0, self._drive_backoff_until - time.monotonic())
+            return remaining
 
     def _record_upload_failure(
         self, rows: list[sqlite3.Row], error: Exception
     ) -> bool:
         exhausted = False
         with self.condition, self.db:
+            now = time.time()
+            not_before = now + UPLOAD_RETRY_SECONDS
             for row in rows:
                 attempts = int(row["upload_attempts"])
                 status = "failed" if attempts >= self.upload_max_attempts else "complete"
                 exhausted = exhausted or status == "failed"
                 self.db.execute(
-                    "UPDATE jobs SET status=?, error=?, updated_at=? "
+                    "UPDATE jobs SET status=?, "
+                    "upload_not_before=CASE WHEN ?='complete' "
+                    "THEN MAX(COALESCE(upload_not_before, 0), ?) ELSE NULL END, "
+                    "error=?, updated_at=? "
                     "WHERE id=? AND status='uploading'",
-                    (status, str(error)[-4000:], time.time(), int(row["id"])),
+                    (
+                        status,
+                        status,
+                        not_before,
+                        str(error)[-4000:],
+                        now,
+                        int(row["id"]),
+                    ),
                 )
             self.condition.notify_all()
         return exhausted
 
     def _claim_upload_batch(self) -> list[sqlite3.Row]:
         with self.condition, self.db:
+            # Recheck under the claim lock so a thread that passed the outer wait before another
+            # uploader failed cannot immediately reclaim that uploader's rows.
+            if self._upload_backoff_remaining() > 0:
+                return []
             exhausted = self.db.execute(
                 "SELECT id FROM jobs WHERE status='complete' AND upload_attempts>=? "
                 "ORDER BY id LIMIT 1",
@@ -2475,13 +2507,23 @@ class CoordinatorState:
             rclone_stderr = rclone.stderr.read().decode(errors="replace") if rclone.stderr else ""
             rclone_status = rclone.wait()
             if zstd_status or rclone_status:
-                raise RuntimeError(zstd_stderr.strip() or rclone_stderr.strip())
-        except BaseException:
-            with contextlib.suppress(Exception):
-                zstd.kill()
-                rclone.kill()
+                detail = "\n".join(
+                    part.strip() for part in (rclone_stderr, zstd_stderr) if part.strip()
+                )
+                raise RuntimeError(detail)
+        except BaseException as error:
+            for process in (zstd, rclone):
+                with contextlib.suppress(Exception):
+                    process.kill()
             zstd.wait()
             rclone.wait()
+            zstd_stderr = zstd.stderr.read().decode(errors="replace") if zstd.stderr else ""
+            rclone_stderr = rclone.stderr.read().decode(errors="replace") if rclone.stderr else ""
+            detail = "\n".join(
+                part.strip() for part in (rclone_stderr, zstd_stderr) if part.strip()
+            )
+            if isinstance(error, Exception) and detail:
+                raise RuntimeError(detail) from error
             raise
 
     def reap(self) -> None:

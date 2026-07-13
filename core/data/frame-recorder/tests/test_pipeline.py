@@ -1196,25 +1196,87 @@ class PipelineTests(unittest.TestCase):
 
     def test_upload_attempt_budget_persists_across_uploader_threads(self):
         with tempfile.TemporaryDirectory() as temporary:
-            state = self._state(
-                Path(temporary),
-                prefetch=1,
-                upload_batch_size=1,
-                upload_concurrency=8,
-                upload_max_attempts=3,
-            )
-            self.addCleanup(state.db.close)
-            self._insert_job(state, 0, "complete")
+            with mock.patch.object(daytona_module.time, "time", return_value=100.0) as clock:
+                state = self._state(
+                    Path(temporary),
+                    prefetch=1,
+                    upload_batch_size=1,
+                    upload_concurrency=8,
+                    upload_max_attempts=3,
+                )
+                self.addCleanup(state.db.close)
+                self._insert_job(state, 0, "complete")
 
-            for attempt in range(1, 4):
+                for attempt in range(1, 4):
+                    rows = state._claim_upload_batch()
+                    self.assertEqual(int(rows[0]["upload_attempts"]), attempt)
+                    exhausted = state._record_upload_failure(
+                        rows, RuntimeError("Drive failed")
+                    )
+                    self.assertEqual(exhausted, attempt == 3)
+                    status = state.db.execute(
+                        "SELECT status FROM jobs WHERE id=0"
+                    ).fetchone()[0]
+                    self.assertEqual(status, "failed" if attempt == 3 else "complete")
+                    if attempt < 3:
+                        self.assertEqual(state._claim_upload_batch(), [])
+                        clock.return_value += daytona_module.UPLOAD_RETRY_SECONDS + 0.001
+
+    def test_upload_failure_backoff_is_global_and_persists_across_restart(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spool = Path(temporary)
+            with mock.patch.object(daytona_module.time, "time", return_value=100.0) as clock:
+                state = self._state(
+                    spool,
+                    prefetch=4,
+                    upload_batch_size=2,
+                    upload_concurrency=4,
+                )
+                for job_id in range(4):
+                    self._insert_job(state, job_id, "complete")
+
                 rows = state._claim_upload_batch()
-                self.assertEqual(int(rows[0]["upload_attempts"]), attempt)
-                exhausted = state._record_upload_failure(rows, RuntimeError("Drive failed"))
-                self.assertEqual(exhausted, attempt == 3)
-                status = state.db.execute(
-                    "SELECT status FROM jobs WHERE id=0"
-                ).fetchone()[0]
-                self.assertEqual(status, "failed" if attempt == 3 else "complete")
+                self.assertEqual([int(row["id"]) for row in rows], [0, 1])
+                self.assertFalse(
+                    state._record_upload_failure(rows, RuntimeError("Drive failed"))
+                )
+                self.assertEqual(state._claim_upload_batch(), [])
+                attempts = list(
+                    state.db.execute(
+                        "SELECT id, upload_attempts FROM jobs ORDER BY id"
+                    )
+                )
+                self.assertEqual(
+                    [(int(row["id"]), int(row["upload_attempts"])) for row in attempts],
+                    [(0, 1), (1, 1), (2, 0), (3, 0)],
+                )
+                deadlines = {
+                    float(row[0])
+                    for row in state.db.execute(
+                        "SELECT upload_not_before FROM jobs "
+                        "WHERE upload_not_before IS NOT NULL"
+                    )
+                }
+                self.assertEqual(deadlines, {105.0})
+                state.db.close()
+
+                restarted = self._state(
+                    spool,
+                    prefetch=4,
+                    upload_batch_size=2,
+                    upload_concurrency=4,
+                )
+                try:
+                    clock.return_value = 104.999
+                    self.assertEqual(restarted._claim_upload_batch(), [])
+                    clock.return_value = 105.001
+                    claimed = restarted._claim_upload_batch()
+                    self.assertEqual([int(row["id"]) for row in claimed], [0, 1])
+                    self.assertEqual(
+                        [int(row["upload_attempts"]) for row in claimed], [2, 2]
+                    )
+                finally:
+                    restarted.db.close()
 
     def test_drive_query_rate_limit_refunds_attempt_and_stops_all_uploaders(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1233,18 +1295,84 @@ class PipelineTests(unittest.TestCase):
                 "Quota exceeded for quota metric 'Queries': rateLimitExceeded"
             )
 
-            with mock.patch.object(daytona_module.time, "monotonic", return_value=100.0):
+            with (
+                mock.patch.object(daytona_module.time, "monotonic", return_value=100.0),
+                mock.patch.object(daytona_module.time, "time", return_value=1000.0),
+            ):
                 retry_after = state._record_drive_rate_limit(rows, error)
+                self.assertEqual(state._claim_upload_batch(), [])
 
             row = state.db.execute("SELECT * FROM jobs WHERE id=0").fetchone()
             self.assertEqual(row["status"], "complete")
             self.assertEqual(int(row["upload_attempts"]), 0)
+            self.assertEqual(float(row["upload_not_before"]), 1060.0)
             self.assertEqual(retry_after, 60.0)
             self.assertTrue(state._is_drive_rate_limit(error))
             self.assertFalse(state._is_drive_rate_limit(RuntimeError("connection reset")))
 
             state.stop.set()
             self.assertFalse(state._wait_for_drive_backoff())
+
+    def test_stream_archive_surfaces_rclone_rate_limit_after_broken_pipe(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = self._state(Path(temporary))
+            self.addCleanup(state.db.close)
+            self._insert_job(state, 0, "complete")
+            row = state.db.execute("SELECT * FROM jobs WHERE id=0").fetchone()
+            rclone = mock.Mock(
+                stdin=io.BytesIO(),
+                stderr=io.BytesIO(b"googleapi: Error 403: rateLimitExceeded\n"),
+            )
+            rclone.wait.return_value = 1
+            zstd = mock.Mock(
+                stdin=io.BytesIO(),
+                stderr=io.BytesIO(b"zstd: Write error: Broken pipe\n"),
+            )
+            zstd.wait.return_value = 1
+            archive = mock.MagicMock()
+            archive.__enter__.return_value.add.side_effect = BrokenPipeError("broken pipe")
+
+            with (
+                mock.patch.object(
+                    daytona_module.subprocess, "Popen", side_effect=[rclone, zstd]
+                ),
+                mock.patch.object(daytona_module.tarfile, "open", return_value=archive),
+                self.assertRaises(RuntimeError) as raised,
+            ):
+                state._stream_result_archive([row], "target/archive.tar.zst")
+
+            self.assertIn("rateLimitExceeded", str(raised.exception))
+            self.assertTrue(state._is_drive_rate_limit(raised.exception))
+            rclone.kill.assert_called_once_with()
+            zstd.kill.assert_called_once_with()
+
+    def test_stream_archive_prefers_rclone_error_when_children_exit_nonzero(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = self._state(Path(temporary))
+            self.addCleanup(state.db.close)
+            rclone = mock.Mock(
+                stdin=io.BytesIO(),
+                stderr=io.BytesIO(b"googleapi: Error 403: rateLimitExceeded\n"),
+            )
+            rclone.wait.return_value = 1
+            zstd = mock.Mock(
+                stdin=io.BytesIO(),
+                stderr=io.BytesIO(b"zstd: Write error: Broken pipe\n"),
+            )
+            zstd.wait.return_value = 1
+            archive = mock.MagicMock()
+
+            with (
+                mock.patch.object(
+                    daytona_module.subprocess, "Popen", side_effect=[rclone, zstd]
+                ),
+                mock.patch.object(daytona_module.tarfile, "open", return_value=archive),
+                self.assertRaises(RuntimeError) as raised,
+            ):
+                state._stream_result_archive([], "target/archive.tar.zst")
+
+            self.assertIn("rateLimitExceeded", str(raised.exception))
+            self.assertTrue(state._is_drive_rate_limit(raised.exception))
 
     def test_committed_batch_cleans_local_files_before_releasing_capacity(self):
         with tempfile.TemporaryDirectory() as temporary:
