@@ -1874,7 +1874,7 @@ class PipelineTests(unittest.TestCase):
         daytona.run.assert_called_once_with(sample_limit=12, worker_count=34)
         self.assertFalse(hasattr(runner, "runpod"))
 
-    def test_coordinator_defaults_use_rate_safe_parallel_archives(self):
+    def test_coordinator_defaults_use_one_rate_safe_archive_stream(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             connector = daytona_module.DaytonaConnector()
         args = daytona_module.build_parser().parse_args(
@@ -1895,12 +1895,12 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(args.prefetch, 512)
         self.assertEqual(args.upload_batch_size, 100)
         self.assertEqual(args.upload_min_batch, 64)
-        self.assertEqual(args.upload_concurrency, 2)
+        self.assertEqual(args.upload_concurrency, 1)
         self.assertEqual(args.upload_tps_limit, 1)
         self.assertEqual(args.upload_max_bytes, 2 * 1024**3)
         self.assertEqual(connector.upload_batch_size, 100)
         self.assertEqual(connector.upload_min_batch, 64)
-        self.assertEqual(connector.upload_concurrency, 2)
+        self.assertEqual(connector.upload_concurrency, 1)
         self.assertEqual(connector.upload_max_bytes, 2 * 1024**3)
 
     def test_raw_packet_pts_bounds_preserve_a_head_gap(self):

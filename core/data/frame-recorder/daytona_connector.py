@@ -227,7 +227,7 @@ class DaytonaConnector:
         self.result_batch_size = max(1, int(os.environ.get("SMASH_WORKER_RESULT_BATCH", "10")))
         self.upload_batch_size = max(1, int(os.environ.get("SMASH_UPLOAD_BATCH_SIZE", "100")))
         self.upload_concurrency = max(
-            1, int(os.environ.get("SMASH_UPLOAD_CONCURRENCY", "2"))
+            1, int(os.environ.get("SMASH_UPLOAD_CONCURRENCY", "1"))
         )
         self.upload_tps_limit = max(
             1, int(os.environ.get("SMASH_UPLOAD_TPS_LIMIT", "1"))
@@ -3835,7 +3835,7 @@ def build_parser() -> argparse.ArgumentParser:
     coordinator.add_argument("--lease-seconds", type=int, default=300)
     coordinator.add_argument("--max-attempts", type=int, default=3)
     coordinator.add_argument("--upload-batch-size", type=int, default=100)
-    coordinator.add_argument("--upload-concurrency", type=int, default=2)
+    coordinator.add_argument("--upload-concurrency", type=int, default=1)
     coordinator.add_argument("--upload-tps-limit", type=int, default=1)
     coordinator.add_argument("--upload-min-batch", type=int, default=64)
     coordinator.add_argument("--upload-max-attempts", type=int, default=3)
