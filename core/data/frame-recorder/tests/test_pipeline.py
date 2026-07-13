@@ -1404,6 +1404,28 @@ class PipelineTests(unittest.TestCase):
         daytona.run.assert_called_once_with(sample_limit=12, worker_count=34)
         self.assertFalse(hasattr(runner, "runpod"))
 
+    def test_coordinator_defaults_use_rate_safe_parallel_archives(self):
+        args = daytona_module.build_parser().parse_args(
+            [
+                "coordinator",
+                "--remote",
+                "drive",
+                "--source-root",
+                "source",
+                "--target-root",
+                "target",
+                "--config",
+                "/tmp/rclone.conf",
+                "--spool",
+                "/tmp/spool",
+            ]
+        )
+        self.assertEqual(args.prefetch, 512)
+        self.assertEqual(args.upload_batch_size, 64)
+        self.assertEqual(args.upload_min_batch, 32)
+        self.assertEqual(args.upload_concurrency, 4)
+        self.assertEqual(args.upload_tps_limit, 1)
+
     def test_runner_rejects_non_drive_provider_without_constructing_daytona(self):
         with mock.patch.dict(
             os.environ, {"SMASH_STORAGE_PROVIDER": "hf"}, clear=True

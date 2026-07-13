@@ -34,10 +34,12 @@ VIDEO_WIDTH = 252
 VIDEO_HEIGHT = 208
 VIDEO_FPS = 20
 SOURCE_FPS = 60
-DEFAULT_RENDERER_SNAPSHOT = "smash-cpu-renderer-e7711b1-v1"
+DEFAULT_RENDERER_SNAPSHOT = "smash-cpu-renderer-e7711b1-v2"
 DEFAULT_ASSET_VOLUME = "smash-frame-assets-v1"
 DEFAULT_SOURCE_ROOT = "hal-fox-captain-falcon-battlefield"
-DEFAULT_TARGET_ROOT = "hal-fox-captain-falcon-battlefield/recordings-252x208-20fps"
+DEFAULT_TARGET_ROOT = (
+    "hal-fox-captain-falcon-battlefield/recordings-252x208-20fps-slippi-pts-v2"
+)
 VIDEO_SUFFIXES = (".avi", ".mkv", ".mp4", ".mov", ".nut")
 
 
@@ -193,15 +195,18 @@ class DaytonaConnector:
             1, int(os.environ.get("SMASH_PROCESSES_PER_SANDBOX", "4"))
         )
         self.result_batch_size = max(1, int(os.environ.get("SMASH_WORKER_RESULT_BATCH", "10")))
-        self.upload_batch_size = max(1, int(os.environ.get("SMASH_UPLOAD_BATCH_SIZE", "16")))
+        self.upload_batch_size = max(1, int(os.environ.get("SMASH_UPLOAD_BATCH_SIZE", "64")))
         self.upload_concurrency = max(
-            1, int(os.environ.get("SMASH_UPLOAD_CONCURRENCY", "8"))
+            1, int(os.environ.get("SMASH_UPLOAD_CONCURRENCY", "4"))
+        )
+        self.upload_tps_limit = max(
+            1, int(os.environ.get("SMASH_UPLOAD_TPS_LIMIT", "1"))
         )
         self.upload_min_batch = max(
             1,
             min(
                 self.upload_batch_size,
-                int(os.environ.get("SMASH_UPLOAD_MIN_BATCH", "16")),
+                int(os.environ.get("SMASH_UPLOAD_MIN_BATCH", "32")),
             ),
         )
         self.upload_max_attempts = max(
@@ -211,7 +216,7 @@ class DaytonaConnector:
             64 * 1024 * 1024,
             int(os.environ.get("SMASH_UPLOAD_BATCH_MAX_BYTES", str(1024 * 1024 * 1024))),
         )
-        self.prefetch = max(1, int(os.environ.get("SMASH_COORDINATOR_PREFETCH", "256")))
+        self.prefetch = max(1, int(os.environ.get("SMASH_COORDINATOR_PREFETCH", "512")))
         self.spool_max_bytes = max(
             1024 * 1024 * 1024,
             int(os.environ.get("SMASH_COORDINATOR_SPOOL_MAX_BYTES", str(6 * 1024**3))),
@@ -518,6 +523,7 @@ class DaytonaConnector:
             },
             env={
                 "SMASH_QUEUE_ROOT": self.queue_root,
+                "SMASH_RENDERER_SNAPSHOT": self.renderer_snapshot,
             },
             volume=f"{self.asset_volume}:/mnt/smash-assets",
         )
@@ -686,6 +692,8 @@ class DaytonaConnector:
             str(self.upload_batch_size),
             "--upload-concurrency",
             str(self.upload_concurrency),
+            "--upload-tps-limit",
+            str(self.upload_tps_limit),
             "--upload-min-batch",
             str(self.upload_min_batch),
             "--upload-max-attempts",
@@ -1143,6 +1151,7 @@ class CoordinatorState:
         upload_batch_size: int,
         upload_max_bytes: int,
         upload_concurrency: int = 1,
+        upload_tps_limit: int = 1,
         upload_min_batch: int = 1,
         upload_max_attempts: int = 3,
         spool_max_bytes: int = 6 * 1024**3,
@@ -1166,7 +1175,7 @@ class CoordinatorState:
         self.upload_concurrency = max(1, upload_concurrency)
         self.upload_min_batch = max(1, min(upload_batch_size, upload_min_batch))
         self.upload_max_attempts = max(1, upload_max_attempts)
-        self.upload_tps_limit = max(1, 8 // self.upload_concurrency)
+        self.upload_tps_limit = max(1, upload_tps_limit)
         self.spool_max_bytes = spool_max_bytes
         self.spool_headroom_bytes = min(512 * 1024**2, max(1, spool_max_bytes // 10))
         self._reserved_result_bytes = 0
@@ -3183,10 +3192,10 @@ def render_job(
         raise RuntimeError(
             f"unexpected raw resolution: {raw_probe['width']}x{raw_probe['height']}"
         )
-    if int(raw_probe["frames"]) > expected_raw_timeline_frames + SOURCE_FPS * 2:
+    if int(raw_probe["frames"]) > expected_raw_timeline_frames:
         raise RuntimeError(
-            "raw capture contains excessive frames after its stop endpoint: "
-            f"{raw_probe['frames']} > {expected_raw_timeline_frames + SOURCE_FPS * 2}"
+            "raw capture contains duplicate frames on its Slippi timeline: "
+            f"{raw_probe['frames']} > {expected_raw_timeline_frames}"
         )
     # Held images are represented as AVI packet-duration gaps. The `fps=60` filter below
     # materializes the authoritative game timeline, so stored packet count can be smaller than
@@ -3274,6 +3283,8 @@ def render_job(
         "height": output_probe["height"],
         "inputBytes": raw.stat().st_size,
         "outputBytes": target.stat().st_size,
+        "rawFrames": raw_probe["frames"],
+        "expectedRawTimelineFrames": expected_raw_timeline_frames,
         "sourceFps": SOURCE_FPS,
         "targetFps": VIDEO_FPS,
         "firstSelectedSlpFrame": first_playable_frame,
@@ -3286,6 +3297,7 @@ def render_job(
         "gameplaySeconds": duration,
         "realtimeFactor": round(duration / max(0.001, time.monotonic() - render_started), 4),
         "cpuOnly": True,
+        "rendererSnapshot": os.environ.get("SMASH_RENDERER_SNAPSHOT", "unknown"),
     }
     metadata["video"] = result
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
@@ -3489,6 +3501,7 @@ def coordinator_main(args: argparse.Namespace) -> None:
         upload_batch_size=args.upload_batch_size,
         upload_max_bytes=args.upload_max_bytes,
         upload_concurrency=args.upload_concurrency,
+        upload_tps_limit=args.upload_tps_limit,
         upload_min_batch=args.upload_min_batch,
         upload_max_attempts=args.upload_max_attempts,
         spool_max_bytes=args.spool_max_bytes,
@@ -3515,12 +3528,13 @@ def build_parser() -> argparse.ArgumentParser:
     coordinator.add_argument("--spool", required=True)
     coordinator.add_argument("--port", type=int, default=8765)
     coordinator.add_argument("--sample-limit", type=int, default=0)
-    coordinator.add_argument("--prefetch", type=int, default=256)
+    coordinator.add_argument("--prefetch", type=int, default=512)
     coordinator.add_argument("--lease-seconds", type=int, default=300)
     coordinator.add_argument("--max-attempts", type=int, default=3)
-    coordinator.add_argument("--upload-batch-size", type=int, default=16)
-    coordinator.add_argument("--upload-concurrency", type=int, default=8)
-    coordinator.add_argument("--upload-min-batch", type=int, default=16)
+    coordinator.add_argument("--upload-batch-size", type=int, default=64)
+    coordinator.add_argument("--upload-concurrency", type=int, default=4)
+    coordinator.add_argument("--upload-tps-limit", type=int, default=1)
+    coordinator.add_argument("--upload-min-batch", type=int, default=32)
     coordinator.add_argument("--upload-max-attempts", type=int, default=3)
     coordinator.add_argument("--upload-max-bytes", type=int, default=1024 * 1024 * 1024)
     coordinator.add_argument("--spool-max-bytes", type=int, default=6 * 1024**3)

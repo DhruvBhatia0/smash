@@ -45,7 +45,7 @@ The reproducible patch is
 `patches/ishiiruka-cpu-fast-frame-dump.patch`, based on Ishiiruka commit
 `e7711b104b339a99385f2bb12b472d46140a7bc7`.
 
-It contains four relevant changes:
+It contains five relevant changes:
 
 1. **Bounded owned frame queue.** Eight RGBA slots replace the single borrowed
    handoff. A backend may unmap/reuse its PBO immediately; the writer drains in
@@ -61,6 +61,10 @@ It contains four relevant changes:
 4. **Container-safe fastmem.** Linux uses `memfd_create` for Dolphin's 64.25 MiB
    shared arena, with the previous POSIX shared-memory path as fallback. This
    avoids a SIGBUS on Daytona's 64 MiB `/dev/shm` while preserving JIT fastmem.
+5. **Slippi-timeline AVI timestamps.** Playback AVI output accepts only strictly
+   increasing captured Slippi frame IDs and derives PTS from their 60 Hz deltas.
+   Repeated terminal VIs and rewind/savestate traffic are discarded before
+   scaling or encoding; non-playback dumps retain the original tick timestamps.
 
 The headless EGL initialization also sets explicit logical backbuffer dimensions;
 a surfaceless context otherwise reports 0x0 and falls into incorrect size/restart
@@ -111,6 +115,16 @@ The earlier 2,303 result was one missing timeline position, not the correct
 target. The old asynchronous writer could also produce 2,478 timeline frames by
 observing later global playback state. Capturing eligibility with the queued
 pixels fixes both errors.
+
+The production regression replay
+`c0934ba2773d518f__diamond-diamond-4000c2f74c02661b77738028.slp` exposed a
+second timestamp edge. Its semantic interval contains 4,131 frames, but the old
+AVI path emitted 4,375, 4,414, and 4,456 decoded frames across three runs while
+the LRAS terminal frame remained displayed during shutdown grace. Snapshot
+`smash-cpu-renderer-e7711b1-v2` fixes this at the AVI boundary by suppressing
+non-increasing Slippi IDs and assigning accepted frames frame-ID-based PTS. Core
+validation now rejects any raw packet count above the semantic interval rather
+than tolerating an extra two seconds.
 
 Validation performed:
 
