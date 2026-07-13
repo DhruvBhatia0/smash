@@ -1,141 +1,18 @@
 import json
 import os
-import threading
-import time
-from queue import Queue
 
-from .gdrive_connector import GDriveConnector
-from .models import FrameRecorder, SlpProducer, SlpSample, StorageLocation, log_event
-from .runpod_connector import RunpodConnector
+from .daytona_connector import DaytonaConnector
 
 
-class DatasetRunner:
-    def __init__(
-        self,
-        location: StorageLocation,
-        runpod: RunpodConnector,
-        desired_max: int,
-        recorder_count: int,
-        skip_existing_processed: bool = False,
-        startup_retry_seconds: float = 60,
-        startup_max_attempts: int = 0,
-    ):
-        """Create the bounded queue and the producer/consumer objects."""
-        self.queue: Queue[SlpSample | None] = Queue(maxsize=1000)
-        self.producer = SlpProducer(
-            self.queue,
-            location,
-            desired_max,
-            skip_existing_processed=skip_existing_processed,
-        )
-        self.location = location
-        self.runpod = runpod
-        self.recorder_count = recorder_count
-        self.startup_retry_seconds = startup_retry_seconds
-        self.startup_max_attempts = startup_max_attempts
-        self.recorders: list[FrameRecorder] = []
-        self.startup_errors: list[dict] = []
-        self.lock = threading.Lock()
-
-    def run(self) -> dict:
-        """Run one producer thread and N RunPod-backed recorder threads."""
-        started = time.monotonic()
-        producer = threading.Thread(target=self.producer.download, name="slp-producer")
-        consumers = [
-            threading.Thread(target=self._record, args=(index,), name=f"frame-recorder-{index}")
-            for index in range(self.recorder_count)
-        ]
-
-        for consumer in consumers:
-            consumer.start()
-        producer.start()
-
-        producer.join()
-        for _ in consumers:
-            self.queue.put(None, block=True)
-        for consumer in consumers:
-            consumer.join()
-
-        results = [result for recorder in self.recorders for result in recorder.results]
-        errors = [error for recorder in self.recorders for error in recorder.errors]
-        errors += self.startup_errors
-        if self.producer.error:
-            errors.append({"component": "SlpProducer", "error": self.producer.error})
-        return {
-            "queued": self.producer.count,
-            "recorders": len(self.recorders),
-            "processed": len(results),
-            "failed": len(errors),
-            "seconds": round(time.monotonic() - started, 3),
-            "results": sorted(results, key=lambda row: row["sample"]),
-            "errors": errors,
-        }
-
-    def _record(self, index: int):
-        attempt = 0
-        while True:
-            attempt += 1
-            recorder = None
-            try:
-                recorder = FrameRecorder(self.queue, self.location, self.runpod)
-                with self.lock:
-                    self.recorders.append(recorder)
-                recorder.record()
-                return
-            except Exception as error:
-                event = "recorder_startup_failed" if recorder is None else "recorder_failed"
-                log_event(event, index=index, attempt=attempt, error=str(error))
-                exhausted = self.startup_max_attempts and attempt >= self.startup_max_attempts
-                if recorder is not None or exhausted:
-                    with self.lock:
-                        self.startup_errors.append(
-                            {"component": "FrameRecorder", "index": index, "error": str(error)}
-                        )
-                    return
-                time.sleep(self.startup_retry_seconds)
-
-
-def build_runner() -> DatasetRunner:
-    """Build the RunPod-backed dataset runner from environment."""
-    provider_name = os.environ.get("SMASH_STORAGE_PROVIDER", "hf").lower()
-    if provider_name == "hf":
-        from .hf_connector import HfConnector
-
-        provider = HfConnector(expected_email=os.environ.get("SMASH_HF_EXPECTED_EMAIL"))
-        location = StorageLocation(
-            namespace=os.environ["SMASH_HF_REPO"],
-            provider=provider,
-            root=os.environ.get("SMASH_HF_ROOT", ""),
-            raw_slp_dir=os.environ.get("SMASH_HF_RAW_SLP_DIR", "raw_slp"),
-            recording_dir=os.environ.get("SMASH_HF_RECORDING_DIR", "slp_with_video"),
-        )
-    elif provider_name in {"gdrive", "google_drive"}:
-        provider = GDriveConnector()
-        location = StorageLocation(
-            namespace=os.environ.get("SMASH_GDRIVE_REMOTE", "smash-drive"),
-            provider=provider,
-            root=os.environ.get("SMASH_GDRIVE_ROOT", ""),
-            raw_slp_dir=os.environ.get("SMASH_GDRIVE_RAW_SLP_DIR", ""),
-            recording_dir=os.environ.get("SMASH_GDRIVE_RECORDING_DIR", "slp_with_video"),
-        )
-    else:
-        raise ValueError(f"unsupported SMASH_STORAGE_PROVIDER: {provider_name}")
-    return DatasetRunner(
-        location=location,
-        runpod=RunpodConnector(
-            name_prefix=os.environ.get("SMASH_RUNPOD_NAME_PREFIX", "smash-core-worker")
-        ),
-        desired_max=int(os.environ.get("SMASH_SAMPLE_LIMIT", "1")),
-        recorder_count=int(os.environ.get("SMASH_WORKER_COUNT", "1")),
-        skip_existing_processed=os.environ.get("SMASH_SKIP_EXISTING_PROCESSED", "") == "1",
-        startup_retry_seconds=float(os.environ.get("SMASH_RECORDER_STARTUP_RETRY_SECONDS", "60")),
-        startup_max_attempts=int(os.environ.get("SMASH_RECORDER_STARTUP_MAX_ATTEMPTS", "0")),
+def main() -> None:
+    provider = os.environ.get("SMASH_STORAGE_PROVIDER", "gdrive").lower()
+    if provider not in {"gdrive", "google_drive"}:
+        raise ValueError("Daytona frame capture requires Google Drive storage")
+    result = DaytonaConnector().run(
+        sample_limit=int(os.environ.get("SMASH_SAMPLE_LIMIT", "0")),
+        worker_count=int(os.environ.get("SMASH_WORKER_COUNT", "0")),
     )
-
-
-def main():
-    """CLI entrypoint for running the dataset pipeline."""
-    print(json.dumps(build_runner().run(), indent=2))
+    print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":
