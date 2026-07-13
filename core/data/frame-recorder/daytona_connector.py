@@ -9,6 +9,7 @@ import io
 import json
 import math
 import os
+import re
 import secrets
 import shlex
 import shutil
@@ -35,6 +36,8 @@ VIDEO_HEIGHT = 208
 VIDEO_FPS = 20
 SOURCE_FPS = 60
 UPLOAD_RETRY_SECONDS = 5.0
+NO_PLAYABLE_FRAMES = "no_playable_frames"
+SKIPPED_NO_PLAYABLE_FRAMES = f"skipped:{NO_PLAYABLE_FRAMES}"
 DEFAULT_RENDERER_SNAPSHOT = "smash-cpu-renderer-e7711b1-v3"
 DEFAULT_ASSET_VOLUME = "smash-frame-assets-v1"
 DEFAULT_SOURCE_ROOT = "hal-fox-captain-falcon-battlefield"
@@ -42,6 +45,31 @@ DEFAULT_TARGET_ROOT = (
     "hal-fox-captain-falcon-battlefield/recordings-252x208-20fps-slippi-pts-v3"
 )
 VIDEO_SUFFIXES = (".avi", ".mkv", ".mp4", ".mov", ".nut")
+
+_INVALID_PLAYABLE_MAPPING = re.compile(
+    r"(?:RuntimeError: )?invalid playable/render frame mapping: "
+    r"raw=-?\d+\.\.-?\d+, playable=(?P<first>-?\d+)\.\.(?P<last>-?\d+)"
+)
+
+
+def _is_no_playable_frames_error(error: str) -> bool:
+    match = _INVALID_PLAYABLE_MAPPING.fullmatch(error.strip())
+    return bool(match and int(match.group("last")) < int(match.group("first")))
+
+
+def _no_playable_frames_result_tar() -> bytes:
+    metadata = (
+        json.dumps({"skipReason": NO_PLAYABLE_FRAMES}, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode()
+    bundle = io.BytesIO()
+    with tarfile.open(fileobj=bundle, mode="w") as output:
+        member = tarfile.TarInfo("metadata.json")
+        member.mode = 0o644
+        member.mtime = 0
+        member.size = len(metadata)
+        output.addfile(member, io.BytesIO(metadata))
+    return bundle.getvalue()
 
 
 class PostCommitCleanupError(RuntimeError):
@@ -1715,6 +1743,9 @@ class CoordinatorState:
             return Path(row["source_path"])
 
     def fail_job(self, job_id: int, lease_token: str, error: str) -> None:
+        if _is_no_playable_frames_error(error):
+            self._complete_no_playable_frames(job_id, lease_token)
+            return
         retry = False
         with self.condition, self.db:
             row = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -1732,6 +1763,46 @@ class CoordinatorState:
             self.condition.notify_all()
         if retry:
             self._publish_pending(job_id)
+
+    def _complete_no_playable_frames(self, job_id: int, lease_token: str) -> None:
+        with self.lock:
+            row = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None or row["status"] != "leased" or row["lease_token"] != lease_token:
+                return
+        payload = _no_playable_frames_result_tar()
+        result_bytes = len(payload)
+        self._reserve_result_capacity(result_bytes)
+        target = self.results / f"{job_id:06d}.tar"
+        token_key = hashlib.sha256(lease_token.encode()).hexdigest()[:12]
+        temporary = self.results / f"{job_id:06d}.{token_key}.{secrets.token_hex(4)}.partial"
+        try:
+            temporary.write_bytes(payload)
+            result_sha256 = hashlib.sha256(payload).hexdigest()
+            with self.condition, self.db:
+                cursor = self.db.execute(
+                    """
+                    UPDATE jobs SET status='complete', result_path=?, result_bytes=?,
+                        result_token=?, result_sha256=?, lease_token=NULL,
+                        lease_deadline=NULL, worker_id=NULL, error=?, updated_at=?
+                    WHERE id=? AND status='leased' AND lease_token=?
+                    """,
+                    (
+                        str(target),
+                        result_bytes,
+                        lease_token,
+                        result_sha256,
+                        SKIPPED_NO_PLAYABLE_FRAMES,
+                        time.time(),
+                        job_id,
+                        lease_token,
+                    ),
+                )
+                if cursor.rowcount == 1:
+                    temporary.replace(target)
+                    self.condition.notify_all()
+        finally:
+            temporary.unlink(missing_ok=True)
+            self._release_result_capacity(result_bytes)
 
     def accept_result(
         self,
@@ -2300,13 +2371,18 @@ class CoordinatorState:
             wall_now = time.time()
             not_before = wall_now + remaining
             for row in rows:
+                stored_error = (
+                    SKIPPED_NO_PLAYABLE_FRAMES
+                    if row["error"] == SKIPPED_NO_PLAYABLE_FRAMES
+                    else str(error)[-4000:]
+                )
                 self.db.execute(
                     "UPDATE jobs SET status='complete', "
                     "upload_attempts=MAX(0, upload_attempts-1), "
                     "upload_not_before=MAX(COALESCE(upload_not_before, 0), ?), "
                     "error=?, updated_at=? "
                     "WHERE id=? AND status='uploading'",
-                    (not_before, str(error)[-4000:], wall_now, int(row["id"])),
+                    (not_before, stored_error, wall_now, int(row["id"])),
                 )
             self.condition.notify_all()
             return remaining
@@ -2322,6 +2398,11 @@ class CoordinatorState:
                 attempts = int(row["upload_attempts"])
                 status = "failed" if attempts >= self.upload_max_attempts else "complete"
                 exhausted = exhausted or status == "failed"
+                stored_error = (
+                    SKIPPED_NO_PLAYABLE_FRAMES
+                    if status == "complete" and row["error"] == SKIPPED_NO_PLAYABLE_FRAMES
+                    else str(error)[-4000:]
+                )
                 self.db.execute(
                     "UPDATE jobs SET status=?, "
                     "upload_not_before=CASE WHEN ?='complete' "
@@ -2332,7 +2413,7 @@ class CoordinatorState:
                         status,
                         status,
                         not_before,
-                        str(error)[-4000:],
+                        stored_error,
                         now,
                         int(row["id"]),
                     ),
@@ -2420,16 +2501,24 @@ class CoordinatorState:
         manifest = self.manifests / f"batch-{key}.manifest.jsonl"
         with manifest.open("w") as output:
             for row in rows:
+                entry = {
+                    "schemaVersion": 1,
+                    "status": "complete",
+                    "sample": int(row["id"]),
+                    "sourceReference": row["reference"],
+                    "sourceSha256": row["source_sha256"],
+                    "archive": archive_relative,
+                }
+                if row["error"] == SKIPPED_NO_PLAYABLE_FRAMES:
+                    entry.update(
+                        {
+                            "artifact": "skipped",
+                            "skipReason": NO_PLAYABLE_FRAMES,
+                        }
+                    )
                 output.write(
                     json.dumps(
-                        {
-                            "schemaVersion": 1,
-                            "status": "complete",
-                            "sample": int(row["id"]),
-                            "sourceReference": row["reference"],
-                            "sourceSha256": row["source_sha256"],
-                            "archive": archive_relative,
-                        },
+                        entry,
                         separators=(",", ":"),
                     )
                     + "\n"
@@ -2494,7 +2583,12 @@ class CoordinatorState:
                     prefix = f"slp_with_video/{int(row['id'])}"
                     output.add(row["source_path"], arcname=f"{prefix}/input.slp", recursive=False)
                     with tarfile.open(row["result_path"], "r") as result:
-                        for name in ("video.mp4", "metadata.json"):
+                        result_members = (
+                            ("metadata.json",)
+                            if row["error"] == SKIPPED_NO_PLAYABLE_FRAMES
+                            else ("video.mp4", "metadata.json")
+                        )
+                        for name in result_members:
                             member = result.getmember(name)
                             extracted = result.extractfile(member)
                             if extracted is None:

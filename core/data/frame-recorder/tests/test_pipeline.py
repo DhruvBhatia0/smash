@@ -481,6 +481,80 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(row["status"], "complete")
             self.assertEqual(Path(row["result_path"]).read_bytes(), bundle.read_bytes())
 
+    def test_no_playable_frames_classifier_requires_inverted_playable_mapping(self):
+        self.assertTrue(
+            daytona_module._is_no_playable_frames_error(
+                "RuntimeError: invalid playable/render frame mapping: "
+                "raw=-122..120, playable=-39..-40"
+            )
+        )
+        self.assertTrue(
+            daytona_module._is_no_playable_frames_error(
+                "invalid playable/render frame mapping: raw=-122..120, playable=50..49"
+            )
+        )
+        self.assertFalse(
+            daytona_module._is_no_playable_frames_error(
+                "RuntimeError: invalid playable/render frame mapping: "
+                "raw=-122..120, playable=-39..-39"
+            )
+        )
+        self.assertFalse(
+            daytona_module._is_no_playable_frames_error(
+                "RuntimeError: invalid playable/render frame mapping: "
+                "raw=-38..120, playable=-39..100"
+            )
+        )
+        self.assertFalse(
+            daytona_module._is_no_playable_frames_error(
+                "RuntimeError: renderer did not write manifest.json"
+            )
+        )
+
+    def test_fail_job_commits_idempotent_metadata_only_no_playable_result(self):
+        error = (
+            "RuntimeError: invalid playable/render frame mapping: "
+            "raw=-122..120, playable=-39..-40"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            state = self._state(Path(temporary))
+            self.addCleanup(state.db.close)
+            self._insert_job(state, 0, "queued")
+            lease = state.lease("worker")
+
+            state.fail_job(0, "stale-token", error)
+            stale = state.db.execute("SELECT * FROM jobs WHERE id=0").fetchone()
+            self.assertEqual(stale["status"], "leased")
+            self.assertFalse((state.results / "000000.tar").exists())
+
+            state.fail_job(0, lease["leaseToken"], error)
+            row = state.db.execute("SELECT * FROM jobs WHERE id=0").fetchone()
+            self.assertEqual(row["status"], "complete")
+            self.assertEqual(row["error"], "skipped:no_playable_frames")
+            self.assertEqual(row["result_token"], lease["leaseToken"])
+            self.assertIsNone(row["lease_token"])
+            self.assertIsNone(row["worker_id"])
+            result = Path(row["result_path"])
+            payload = result.read_bytes()
+            self.assertEqual(int(row["result_bytes"]), len(payload))
+            self.assertEqual(row["result_sha256"], hashlib.sha256(payload).hexdigest())
+            with tarfile.open(result, "r") as bundle:
+                self.assertEqual(
+                    [member.name for member in bundle.getmembers() if member.isfile()],
+                    ["metadata.json"],
+                )
+                metadata_file = bundle.extractfile("metadata.json")
+                self.assertIsNotNone(metadata_file)
+                self.assertEqual(
+                    json.load(metadata_file), {"skipReason": "no_playable_frames"}
+                )
+
+            before = dict(row)
+            state.fail_job(0, lease["leaseToken"], error)
+            after = dict(state.db.execute("SELECT * FROM jobs WHERE id=0").fetchone())
+            self.assertEqual(after, before)
+            self.assertEqual(result.read_bytes(), payload)
+
     def test_accept_result_rejects_stale_token_if_lease_changes_during_upload(self):
         class LeaseChangingStream(io.BytesIO):
             def __init__(self, payload: bytes, callback) -> None:
@@ -1373,6 +1447,105 @@ class PipelineTests(unittest.TestCase):
 
             self.assertIn("rateLimitExceeded", str(raised.exception))
             self.assertTrue(state._is_drive_rate_limit(raised.exception))
+
+    def test_stream_archive_omits_video_for_no_playable_result(self):
+        class Capture(io.BytesIO):
+            def close(self) -> None:
+                pass
+
+        error = (
+            "RuntimeError: invalid playable/render frame mapping: "
+            "raw=-122..120, playable=-39..-40"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = self._state(root / "spool")
+            self.addCleanup(state.db.close)
+            self._insert_job(state, 0, "complete")
+            normal_result = self._result_tar(root, {"video": self._valid_video_metadata()})
+            with state.db:
+                state.db.execute(
+                    "UPDATE jobs SET result_path=?, result_bytes=? WHERE id=0",
+                    (str(normal_result), normal_result.stat().st_size),
+                )
+            self._insert_job(state, 1, "queued")
+            lease = state.lease("worker")
+            state.fail_job(1, lease["leaseToken"], error)
+            rows = list(state.db.execute("SELECT * FROM jobs ORDER BY id"))
+
+            capture = Capture()
+            rclone = mock.Mock(stdin=io.BytesIO(), stderr=io.BytesIO())
+            rclone.wait.return_value = 0
+            zstd = mock.Mock(stdin=capture, stderr=io.BytesIO())
+            zstd.wait.return_value = 0
+            with mock.patch.object(
+                daytona_module.subprocess, "Popen", side_effect=[rclone, zstd]
+            ):
+                state._stream_result_archive(rows, "target/archive.tar.zst")
+
+            with tarfile.open(fileobj=io.BytesIO(capture.getvalue()), mode="r") as archive:
+                names = {member.name for member in archive.getmembers() if member.isfile()}
+                self.assertEqual(
+                    names,
+                    {
+                        "slp_with_video/0/input.slp",
+                        "slp_with_video/0/video.mp4",
+                        "slp_with_video/0/metadata.json",
+                        "slp_with_video/1/input.slp",
+                        "slp_with_video/1/metadata.json",
+                    },
+                )
+                metadata_file = archive.extractfile("slp_with_video/1/metadata.json")
+                self.assertIsNotNone(metadata_file)
+                self.assertEqual(
+                    json.load(metadata_file), {"skipReason": "no_playable_frames"}
+                )
+
+    def test_batch_manifest_marks_only_no_playable_result_as_skipped(self):
+        error = (
+            "RuntimeError: invalid playable/render frame mapping: "
+            "raw=-122..120, playable=-39..-40"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            state = self._state(Path(temporary))
+            self.addCleanup(state.db.close)
+            self._insert_job(state, 0, "complete")
+            self._insert_job(state, 1, "queued")
+            lease = state.lease("worker")
+            state.fail_job(1, lease["leaseToken"], error)
+            with state.db:
+                state.db.execute(
+                    "UPDATE jobs SET status='uploading', upload_attempts=1 WHERE id=1"
+                )
+            skipped_upload = state.db.execute("SELECT * FROM jobs WHERE id=1").fetchone()
+            self.assertFalse(
+                state._record_upload_failure(
+                    [skipped_upload], RuntimeError("transient Drive failure")
+                )
+            )
+            self.assertEqual(
+                state.db.execute("SELECT error FROM jobs WHERE id=1").fetchone()[0],
+                "skipped:no_playable_frames",
+            )
+            rows = list(state.db.execute("SELECT * FROM jobs ORDER BY id"))
+            state._stream_result_archive = mock.Mock()
+            state.drive.upload_file = mock.Mock()
+
+            state._upload_rows(rows)
+
+            manifest = next(state.manifests.glob("batch-*.manifest.jsonl"))
+            entries = {
+                int(entry["sample"]): entry
+                for entry in map(json.loads, manifest.read_text().splitlines())
+            }
+            self.assertEqual(entries[0]["status"], "complete")
+            self.assertNotIn("artifact", entries[0])
+            self.assertNotIn("skipReason", entries[0])
+            self.assertEqual(entries[1]["status"], "complete")
+            self.assertEqual(entries[1]["artifact"], "skipped")
+            self.assertEqual(entries[1]["skipReason"], "no_playable_frames")
+            state._stream_result_archive.assert_called_once()
+            state.drive.upload_file.assert_called_once()
 
     def test_committed_batch_cleans_local_files_before_releasing_capacity(self):
         with tempfile.TemporaryDirectory() as temporary:
