@@ -209,12 +209,13 @@ the dump-only, single-core, no-window, and 204x168 logical-backbuffer defaults.
 Replacing RunPod provisioning with Daytona CPU provisioning is a separate
 orchestration change from the emulator bottleneck fixed here.
 
-Live production measurements favor two Drive upload streams, 100-result batches
-with a 64-result flush floor, and a 2 GiB archive cap. The worst observed
-two-stream rate was 45.7 results/minute, still above the 38.6 results/minute
-renderer rate; contiguous 100-result batches were 1.54–1.59 GiB. A third stream
-adds no required throughput and risks the 6 GiB coordinator spool and Drive
-quota when several archives overlap.
+Live production measurements favor one Drive upload stream with 512 MiB chunks,
+100-result batches, a 64-result flush floor, a 2 GiB archive cap, and a 9 GiB
+logical spool guarded independently by physical free space. A 30-minute window
+rendered 38.85 results/minute and uploaded 39.88 results/minute, so the serial
+uploader drained backlog while minimizing requests against the shared Drive
+OAuth project's quota. The one observed quota pause recovered through the
+persisted 60-second global backoff without a failed batch.
 
 ## Cleanup
 
