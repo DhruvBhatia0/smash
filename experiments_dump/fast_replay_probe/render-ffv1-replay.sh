@@ -53,6 +53,7 @@ DUMP_CODEC="${SLIPPI_DUMP_CODEC:-}"
 DUMP_FORMAT="${SLIPPI_DUMP_FORMAT:-avi}"
 BITRATE_KBPS="${SLIPPI_BITRATE_KBPS:-2500}"
 DOLPHIN_BIN="${SLIPPI_DOLPHIN_BIN:-/opt/slippi/Slippi Dolphin}"
+MAX_RAW_BYTES="${SLIPPI_MAX_RAW_BYTES:-}"
 USE_XVFB="${USE_XVFB:-1}"
 export LD_LIBRARY_PATH="/opt/slippi:${LD_LIBRARY_PATH:-}"
 
@@ -92,6 +93,19 @@ from pathlib import Path
 
 try:
     value = json.loads(Path(sys.argv[1]).read_text()).get("endFrame")
+except Exception:
+    value = None
+print(value if isinstance(value, int) else "")
+PY
+)"
+TARGET_STOP_FRAME="$(python3 - <<'PY' "$REPLAY_JSON"
+import json
+import sys
+from pathlib import Path
+
+try:
+    replay = json.loads(Path(sys.argv[1]).read_text())
+    value = replay.get("stopFrame", replay.get("endFrame"))
 except Exception:
     value = None
 print(value if isinstance(value, int) else "")
@@ -205,13 +219,14 @@ command=(
 )
 
 END_WATCHER_PID=""
-if [[ "$TARGET_END_FRAME" =~ ^-?[0-9]+$ ]]; then
+if [[ "$TARGET_STOP_FRAME" =~ ^-?[0-9]+$ ]]; then
   (
     while true; do
       if [[ -f "$RUN_LOG" ]]; then
         last_frame="$({ grep -a '\[CURRENT_FRAME\]' "$RUN_LOG" 2>/dev/null || true; } | tail -1 | awk '{print $2}')"
-        if [[ "$last_frame" =~ ^-?[0-9]+$ && "$last_frame" -ge "$TARGET_END_FRAME" ]]; then
-          echo "[END_FRAME_REACHED] $last_frame >= $TARGET_END_FRAME" >> "$RUN_LOG"
+        if [[ "$last_frame" =~ ^-?[0-9]+$ && "$last_frame" -ge "$TARGET_STOP_FRAME" ]]; then
+          echo "[STOP_FRAME_REACHED] $last_frame >= $TARGET_STOP_FRAME" >> "$RUN_LOG"
+          sleep "${SLIPPI_END_FRAME_GRACE_SECONDS:-0.25}"
           ps -eo pid=,args= | while read -r pid args; do
             if [[ "$args" == "$DOLPHIN_BIN "* && "$args" == *"$USER_DIR"* && "$args" == *"$REPLAY_JSON"* ]]; then
               kill -TERM "$pid" 2>/dev/null || true
@@ -227,6 +242,11 @@ if [[ "$TARGET_END_FRAME" =~ ^-?[0-9]+$ ]]; then
 fi
 
 set +e
+if [[ "$MAX_RAW_BYTES" =~ ^[0-9]+$ && "$MAX_RAW_BYTES" -gt 0 ]]; then
+  # Linux bash expresses RLIMIT_FSIZE in 1 KiB blocks. Fail one malformed replay instead of
+  # allowing an unreachable stop condition to exhaust the whole worker's 10 GB disk.
+  ulimit -f "$(( (MAX_RAW_BYTES + 1023) / 1024 ))"
+fi
 if [[ "$USE_XVFB" == "1" ]]; then
   xvfb-run -a --server-args="-screen 0 960x720x24" timeout --preserve-status --kill-after="$TIMEOUT_KILL_AFTER_SECONDS" "$TIMEOUT_SECONDS" "${command[@]}" > "$RUN_LOG" 2>&1
 else
@@ -245,15 +265,15 @@ video_path="$(find "$raw_dir" -maxdepth 1 -type f \( -name 'framedump*.avi' -o -
 current_frame_count="$(grep -a '\[CURRENT_FRAME\]' "$RUN_LOG" 2>/dev/null | wc -l | tr -d ' ')"
 last_current_frame="$(grep -a '\[CURRENT_FRAME\]' "$RUN_LOG" 2>/dev/null | tail -1 | awk '{print $2}')"
 if [[ -n "$video_path" ]]; then
-  cp -p "$video_path" "$OUTPUT_DIR/"
+  mv -f "$video_path" "$OUTPUT_DIR/"
 fi
 cp -p "$USER_DIR/Logs/dolphin.log" "$OUTPUT_DIR/dolphin.log" 2>/dev/null || true
 
-if [[ "$status" -ne 0 && -n "$video_path" && "$TARGET_END_FRAME" =~ ^-?[0-9]+$ && "$last_current_frame" =~ ^-?[0-9]+$ && "$last_current_frame" -ge "$TARGET_END_FRAME" ]]; then
+if [[ "$status" -ne 0 && -n "$video_path" && "$TARGET_STOP_FRAME" =~ ^-?[0-9]+$ && "$last_current_frame" =~ ^-?[0-9]+$ && "$last_current_frame" -ge "$TARGET_STOP_FRAME" ]]; then
   status=0
 fi
 
-python3 - <<'PY' "$OUTPUT_DIR" "$REPLAY_JSON" "$status" "$current_frame_count" "$TIMEOUT_SECONDS" "$VIDEO_BACKEND" "$DOLPHIN_CPU_CORE" "$DOLPHIN_AUDIO_BACKEND" "$TARGET_END_FRAME" "$USE_FFV1" "$DUMP_CODEC" "$DUMP_FORMAT" "$BITRATE_KBPS" "$INTERNAL_RESOLUTION_FRAME_DUMPS" "$EFB_SCALE" "$DUMP_FRAMES" "$OVERCLOCK_FACTOR" "$CPU_THREAD" "$RENDER_TO_MAIN" "$RENDER_WIDTH" "$RENDER_HEIGHT"
+python3 - <<'PY' "$OUTPUT_DIR" "$REPLAY_JSON" "$status" "$current_frame_count" "$TIMEOUT_SECONDS" "$VIDEO_BACKEND" "$DOLPHIN_CPU_CORE" "$DOLPHIN_AUDIO_BACKEND" "$TARGET_END_FRAME" "$TARGET_STOP_FRAME" "$USE_FFV1" "$DUMP_CODEC" "$DUMP_FORMAT" "$BITRATE_KBPS" "$INTERNAL_RESOLUTION_FRAME_DUMPS" "$EFB_SCALE" "$DUMP_FRAMES" "$OVERCLOCK_FACTOR" "$CPU_THREAD" "$RENDER_TO_MAIN" "$RENDER_WIDTH" "$RENDER_HEIGHT"
 from pathlib import Path
 import json
 import re
@@ -287,17 +307,18 @@ manifest = {
     "dolphinCpuCore": sys.argv[7],
     "audioBackend": sys.argv[8],
     "targetEndFrame": int(sys.argv[9]) if sys.argv[9] else None,
-    "useFFV1": sys.argv[10],
-    "dumpCodec": sys.argv[11],
-    "dumpFormat": sys.argv[12],
-    "bitrateKbps": sys.argv[13],
-    "internalResolutionFrameDumps": sys.argv[14],
-    "efbScale": sys.argv[15],
-    "dumpFrames": sys.argv[16],
-    "overclockFactor": sys.argv[17],
-    "cpuThread": sys.argv[18],
-    "renderToMain": sys.argv[19],
-    "renderWindow": {"width": int(sys.argv[20]), "height": int(sys.argv[21])},
+    "targetStopFrame": int(sys.argv[10]) if sys.argv[10] else None,
+    "useFFV1": sys.argv[11],
+    "dumpCodec": sys.argv[12],
+    "dumpFormat": sys.argv[13],
+    "bitrateKbps": sys.argv[14],
+    "internalResolutionFrameDumps": sys.argv[15],
+    "efbScale": sys.argv[16],
+    "dumpFrames": sys.argv[17],
+    "overclockFactor": sys.argv[18],
+    "cpuThread": sys.argv[19],
+    "renderToMain": sys.argv[20],
+    "renderWindow": {"width": int(sys.argv[21]), "height": int(sys.argv[22])},
     "videos": [
         {"path": str(path), "bytes": path.stat().st_size}
         for path in videos
