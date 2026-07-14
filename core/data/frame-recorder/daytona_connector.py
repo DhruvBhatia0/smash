@@ -53,6 +53,14 @@ UPLOAD_CHUNK_SIZE = "64M"
 UPLOAD_IDLE_TIMEOUT = "10m"
 STATE_MISS_LIMIT = 6
 HEALTH_MISS_LIMIT = 2
+HEALTH_CHECK_INTERVAL = 60
+LOG_SNAPSHOT_INTERVAL = 120
+HEARTBEAT_INTERVAL = 10
+HEARTBEAT_STALE_SECONDS = 90
+NODE_GENERATION_LIMIT = 2
+PROCESS_START_ATTEMPTS = 3
+LOCAL_UPLOADER_RESTART_LIMIT = 2
+DRIVE_ATTEMPTS = 5
 COORDINATOR_INIT_TIMEOUT = 1800
 RECONCILE_WORKERS = 32
 
@@ -60,6 +68,21 @@ RECONCILE_WORKERS = 32
 def _event(event: str, **fields: object) -> None:
     print(json.dumps({"event": event, "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                       **fields}, separators=(",", ":"), sort_keys=True), flush=True)
+
+
+def _transient_daytona_failure(detail: str) -> bool:
+    lowered = detail.lower()
+    return any(token in lowered for token in (
+        "request timeout", "status 408", "timed out", "state change in progress",
+        "sandbox is being created", "temporarily unavailable",
+    ))
+
+
+def _heartbeat(path: Path, stop: threading.Event) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    while not stop.is_set():
+        path.touch()
+        stop.wait(HEARTBEAT_INTERVAL)
 
 
 def _run(command: list[str], *, timeout: int = 600, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -261,6 +284,7 @@ class DaytonaConnector:
     def _create(self, name: str, snapshot: str, role: str, **labels: str) -> Sandbox:
         if name in self._names():
             raise RuntimeError(f"refusing to reuse Daytona sandbox {name}")
+        _event("node_provision_started", node=name, role=role, snapshot=snapshot)
         command = ["create", "--name", name, "--snapshot", snapshot, "--target", self.region,
                    "--auto-stop", "720", "--auto-delete", "1440",
                    "--volume", f"{self.volume}:{MOUNT}"]
@@ -271,19 +295,30 @@ class DaytonaConnector:
             self.owned.append(name)
         deadline = time.monotonic() + 300
         sandbox: Sandbox | None = None
+        observed_state: str | None = None
+        poll_attempt = 0
         while time.monotonic() < deadline:
+            poll_attempt += 1
             result = self._daytona("info", name, "--format", "json", check=False)
             if not result.returncode:
                 sandbox = Sandbox.parse(json.loads(result.stdout))
+                if sandbox.state != observed_state:
+                    observed_state = sandbox.state
+                    _event("node_state_observed", node=name, role=role, state=sandbox.state,
+                           pollAttempt=poll_attempt)
                 if sandbox.state == "started":
                     break
+            else:
+                detail = (result.stderr.strip() or result.stdout.strip() or "info failed")[-2000:]
+                _event("node_state_poll_failed", node=name, role=role, pollAttempt=poll_attempt,
+                       transient=_transient_daytona_failure(detail), error=detail)
             time.sleep(1)
         if sandbox is None or sandbox.state != "started":
             raise TimeoutError(f"Daytona sandbox did not start: {name}")
         if sandbox.gpu:
             self._delete(name)
             raise RuntimeError(f"GPU sandbox forbidden: {name}")
-        print(json.dumps({"event": "sandbox_created", **asdict(sandbox)}), flush=True)
+        _event("node_ready", role=role, **asdict(sandbox))
         return sandbox
 
     def _deploy(self, sandbox: Sandbox) -> None:
@@ -309,16 +344,22 @@ class DaytonaConnector:
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
         expected_size, expected_hash = local.stat().st_size, _sha256(local)
         deadline = time.monotonic() + 900
+        poll_attempt = 0
         try:
             while time.monotonic() < deadline:
+                poll_attempt += 1
                 try:
                     size = self._exec(sandbox, ["stat", "-c%s", str(remote)], timeout=30).stdout.strip()
                     if size == str(expected_size):
                         observed = self._exec(sandbox, ["sha256sum", str(remote)], timeout=300).stdout.split()[0]
                         if observed == expected_hash:
+                            _event("node_file_transfer_completed", node=sandbox.name, file=local.name,
+                                   bytes=expected_size, pollAttempts=poll_attempt)
                             return remote
-                except Exception:
-                    pass
+                except Exception as error:
+                    _event("node_file_transfer_poll_failed", node=sandbox.name, file=local.name,
+                           pollAttempt=poll_attempt, transient=_transient_daytona_failure(str(error)),
+                           error=f"{type(error).__name__}: {error}"[-2000:])
                 if process.poll() is not None:
                     _, stderr = process.communicate()
                     raise RuntimeError(f"Daytona upload failed for {local}: {stderr.strip()}")
@@ -335,16 +376,21 @@ class DaytonaConnector:
 
     def _delete(self, name: str) -> None:
         deadline = time.monotonic() + 120
+        attempt = 0
         while True:
+            attempt += 1
             result = self._daytona("delete", name, timeout=300, check=False)
             detail = result.stderr.lower()
             if not result.returncode or "not found" in detail:
                 break
             if "state change in progress" not in detail or time.monotonic() >= deadline:
                 raise RuntimeError(result.stderr.strip())
+            _event("node_delete_retry", node=name, attempt=attempt,
+                   error=(result.stderr.strip() or result.stdout.strip())[-2000:])
             time.sleep(2)
         with self._lock, contextlib.suppress(ValueError):
             self.owned.remove(name)
+        _event("node_deleted", node=name, attempts=attempt)
 
     def _prepare_assets(self) -> None:
         volumes = json.loads(self._daytona("volume", "list", "--format", "json").stdout)
@@ -416,21 +462,24 @@ class DaytonaConnector:
             uploaded_bin = self._upload(sandbox, self.rclone_bin)
             self._exec(sandbox, ["install", "-m755", str(uploaded_bin), "/usr/local/bin/rclone"])
 
-    def _state(self, coordinator: Sandbox) -> dict | None:
+    def _state(self, coordinator: Sandbox, *, log_failure: bool = True) -> dict | None:
         try:
             result = self._exec(coordinator, ["cat", "/home/daytona/smash-coordinator/state.json"],
                                 timeout=15, check=False)
         except Exception as error:
-            _event("supervisor_state_read_failed", error=f"{type(error).__name__}: {error}")
+            if log_failure:
+                _event("supervisor_state_read_failed", error=f"{type(error).__name__}: {error}")
             return None
         if result.returncode:
             detail = (result.stderr.strip() or result.stdout.strip() or "state read failed")[-2000:]
-            _event("supervisor_state_read_failed", returnCode=result.returncode, error=detail)
+            if log_failure:
+                _event("supervisor_state_read_failed", returnCode=result.returncode, error=detail)
             return None
         try:
             return json.loads(result.stdout)
         except json.JSONDecodeError:
-            _event("supervisor_state_read_failed", error="invalid coordinator state JSON")
+            if log_failure:
+                _event("supervisor_state_read_failed", error="invalid coordinator state JSON")
             return None
 
     def _snapshot_logs(self, rows: list[tuple[Sandbox, str]], *, processes: bool = False) -> list[str]:
@@ -485,6 +534,81 @@ class DaytonaConnector:
                                  f"{shlex.quote(self.root + '/diagnostics/coordinator-state.json')}; fi"],
                    timeout=120, check=False)
 
+    def _start_managed_process(self, sandbox: Sandbox, *, role: str, index: int,
+                               command: list[str], local_log: str, shared_log: str) -> None:
+        pid_file = f"/tmp/smash-{role}.pid"
+        ready_file = f"/tmp/smash-{role}.ready"
+        heartbeat_file = f"/tmp/smash-{role}.heartbeat"
+        started = json.dumps({"event": "node_process_started", "role": role, "index": index},
+                             separators=(",", ":"), sort_keys=True)
+        exit_prefix = json.dumps({"event": "node_process_exited", "role": role, "index": index},
+                                 separators=(",", ":"), sort_keys=True)[:-1]
+        wrapper = (
+            f"mkdir -p {shlex.quote(str(Path(shared_log).parent))}; touch {shlex.quote(local_log)}; "
+            f"printf '%s\\n' {shlex.quote(started)} >>{shlex.quote(local_log)}; "
+            f"{shlex.join(command)} >>{shlex.quote(local_log)} 2>&1; status=$?; "
+            f"printf '%s,\"exitCode\":%s}}\\n' {shlex.quote(exit_prefix)} \"$status\" "
+            f">>{shlex.quote(local_log)}; "
+            f"cp -- {shlex.quote(local_log)} {shlex.quote(shared_log)} 2>/dev/null || true; exit $status"
+        )
+        start = (
+            f"if test -f {shlex.quote(pid_file)} && "
+            f"kill -0 $(cat {shlex.quote(pid_file)}) 2>/dev/null; then :; else "
+            f"rm -f {shlex.quote(ready_file)} {shlex.quote(heartbeat_file)}; "
+            f"nohup bash -lc {shlex.quote(wrapper)} >/dev/null 2>&1 & "
+            f"echo $! >{shlex.quote(pid_file)}; fi; "
+            "for attempt in $(seq 1 120); do "
+            f"if test -s {shlex.quote(ready_file)} && test -f {shlex.quote(heartbeat_file)} && "
+            f"kill -0 $(cat {shlex.quote(pid_file)}) 2>/dev/null; then exit 0; fi; "
+            f"if ! kill -0 $(cat {shlex.quote(pid_file)}) 2>/dev/null; then "
+            f"tail -n 40 {shlex.quote(local_log)} >&2; exit 70; fi; sleep 1; done; "
+            f"echo 'application readiness timeout' >&2; tail -n 40 {shlex.quote(local_log)} >&2; exit 124"
+        )
+        last_error = ""
+        for attempt in range(1, PROCESS_START_ATTEMPTS + 1):
+            _event("node_process_start_attempt", node=sandbox.name, role=role, index=index,
+                   attempt=attempt, maxAttempts=PROCESS_START_ATTEMPTS)
+            try:
+                result = self._exec(sandbox, ["bash", "-lc", start], timeout=150, check=False)
+                if not result.returncode:
+                    _event("node_application_ready", node=sandbox.name, role=role, index=index,
+                           attempt=attempt)
+                    return
+                last_error = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            except Exception as error:
+                last_error = f"{type(error).__name__}: {error}"
+            _event("node_process_start_failed", node=sandbox.name, role=role, index=index,
+                   attempt=attempt, maxAttempts=PROCESS_START_ATTEMPTS,
+                   transient=_transient_daytona_failure(last_error), error=last_error[-4000:])
+            if attempt < PROCESS_START_ATTEMPTS:
+                time.sleep(min(10, 2**attempt))
+        raise RuntimeError(f"{role} {index} did not become ready after "
+                           f"{PROCESS_START_ATTEMPTS} attempts: {last_error}")
+
+    def _node_health(self, sandbox: Sandbox, role: str) -> tuple[str, str]:
+        pid_file = f"/tmp/smash-{role}.pid"
+        heartbeat_file = f"/tmp/smash-{role}.heartbeat"
+        command = (
+            f"pid=$(cat {shlex.quote(pid_file)} 2>/dev/null) || "
+            "{ echo missing_pid; exit 10; }; "
+            "kill -0 $pid 2>/dev/null || { echo process_dead; exit 11; }; "
+            f"stamp=$(stat -c%Y {shlex.quote(heartbeat_file)} 2>/dev/null) || "
+            "{ echo missing_heartbeat; exit 12; }; "
+            f"age=$(($(date +%s)-stamp)); test $age -le {HEARTBEAT_STALE_SECONDS} || "
+            "{ echo stale_heartbeat:$age; exit 13; }; echo healthy"
+        )
+        try:
+            result = self._exec(sandbox, ["bash", "-lc", command], timeout=15, check=False)
+        except Exception as error:
+            detail = f"{type(error).__name__}: {error}"
+            return "unknown", detail
+        detail = (result.stdout.strip() or result.stderr.strip() or f"exit {result.returncode}")[-4000:]
+        if not result.returncode:
+            return "healthy", detail
+        if _transient_daytona_failure(detail):
+            return "unknown", detail
+        return "unhealthy", detail
+
     def _worker(self, index: int, generation: int, workers: int) -> Sandbox:
         suffix = f"{index:03d}" + (f"-r{generation}" if generation else "")
         sandbox = self._create(f"smash-worker-{self.run_id}-{suffix}", self.worker_snapshot, "worker",
@@ -492,17 +616,14 @@ class DaytonaConnector:
         self._deploy(sandbox)
         command = shlex.join(["python3", "/tmp/daytona_connector.py", "worker", "--root", self.root,
                               "--index", str(index), "--workers", str(workers), "--processes", str(self.processes),
-                              "--snapshot", self.worker_snapshot])
+                              "--snapshot", self.worker_snapshot,
+                              "--ready", "/tmp/smash-worker.ready",
+                              "--heartbeat", "/tmp/smash-worker.heartbeat"])
         local_log = "/tmp/smash-worker.log"
         shared_log = f"{self.root}/diagnostics/logs/{sandbox.name}.log"
-        supervisor = (
-            f"mkdir -p {shlex.quote(str(Path(shared_log).parent))}; : >{local_log}; "
-            f"while true; do {command} >>{local_log} 2>&1; s=$?; "
-            f"cp -- {local_log} {shlex.quote(shared_log)} 2>/dev/null || true; "
-            "[ $s -eq 0 ] && exit 0; sleep 5; done"
-        )
-        self._exec(sandbox, ["bash", "-lc", f"nohup bash -lc {shlex.quote(supervisor)} >/dev/null 2>&1 & "
-                             "echo $! >/tmp/smash-worker.pid"], timeout=30)
+        self._start_managed_process(sandbox, role="worker", index=index,
+                                    command=shlex.split(command), local_log=local_log,
+                                    shared_log=shared_log)
         return sandbox
 
     def _uploader(self, index: int, generation: int) -> Sandbox:
@@ -514,26 +635,72 @@ class DaytonaConnector:
         self._install_rclone(sandbox)
         command = shlex.join(["python3", "/tmp/daytona_connector.py", "uploader", "--root", self.root,
                               "--lane", str(lane), "--remote", self.remote, "--target", self.target,
-                              "--config", "/home/daytona/.config/rclone/rclone.conf"])
+                              "--config", "/home/daytona/.config/rclone/rclone.conf",
+                              "--ready", "/tmp/smash-uploader.ready",
+                              "--heartbeat", "/tmp/smash-uploader.heartbeat"])
         local_log = "/tmp/smash-uploader.log"
         shared_log = f"{self.root}/diagnostics/logs/{sandbox.name}.log"
-        supervisor = (
-            f"mkdir -p {shlex.quote(str(Path(shared_log).parent))}; : >{local_log}; "
-            f"while true; do {command} >>{local_log} 2>&1; s=$?; "
-            f"cp -- {local_log} {shlex.quote(shared_log)} 2>/dev/null || true; "
-            "[ $s -eq 0 ] && exit 0; sleep 5; done"
-        )
-        self._exec(sandbox, ["bash", "-lc", f"nohup bash -lc {shlex.quote(supervisor)} >/dev/null 2>&1 & "
-                             "echo $! >/tmp/smash-uploader.pid"], timeout=30)
+        self._start_managed_process(sandbox, role="uploader", index=lane,
+                                    command=shlex.split(command), local_log=local_log,
+                                    shared_log=shared_log)
         return sandbox
+
+    def _provision_worker(self, index: int, workers: int,
+                          start_generation: int = 0) -> tuple[int, int, Sandbox]:
+        last_error: BaseException | None = None
+        for generation in range(start_generation, NODE_GENERATION_LIMIT + 1):
+            suffix = f"{index:03d}" + (f"-r{generation}" if generation else "")
+            name = f"smash-worker-{self.run_id}-{suffix}"
+            try:
+                return index, generation, self._worker(index, generation, workers)
+            except BaseException as error:
+                last_error = error
+                _event("node_provision_failed", node=name, role="worker", index=index,
+                       generation=generation, error=f"{type(error).__name__}: {error}"[-4000:])
+                try:
+                    self._delete(name)
+                except Exception as cleanup_error:
+                    _event("node_cleanup_failed", node=name, role="worker", index=index,
+                           generation=generation,
+                           error=f"{type(cleanup_error).__name__}: {cleanup_error}"[-4000:])
+                if generation < NODE_GENERATION_LIMIT:
+                    time.sleep(min(10, 2**generation))
+        _event("node_recovery_exhausted", role="worker", index=index,
+               generation=NODE_GENERATION_LIMIT,
+               error=f"{type(last_error).__name__}: {last_error}"[-4000:])
+        raise RuntimeError(f"worker {index} exhausted node generation budget") from last_error
+
+    def _provision_uploader(self, index: int,
+                            start_generation: int = 0) -> tuple[int, int, Sandbox]:
+        last_error: BaseException | None = None
+        for generation in range(start_generation, NODE_GENERATION_LIMIT + 1):
+            suffix = f"{index:02d}" + (f"-r{generation}" if generation else "")
+            name = f"smash-uploader-{self.run_id}-{suffix}"
+            try:
+                return index, generation, self._uploader(index, generation)
+            except BaseException as error:
+                last_error = error
+                _event("node_provision_failed", node=name, role="uploader", index=index + 1,
+                       generation=generation, error=f"{type(error).__name__}: {error}"[-4000:])
+                try:
+                    self._delete(name)
+                except Exception as cleanup_error:
+                    _event("node_cleanup_failed", node=name, role="uploader", index=index + 1,
+                           generation=generation,
+                           error=f"{type(cleanup_error).__name__}: {cleanup_error}"[-4000:])
+                if generation < NODE_GENERATION_LIMIT:
+                    time.sleep(min(10, 2**generation))
+        _event("node_recovery_exhausted", role="uploader", index=index + 1,
+               generation=NODE_GENERATION_LIMIT,
+               error=f"{type(last_error).__name__}: {last_error}"[-4000:])
+        raise RuntimeError(f"uploader {index + 1} exhausted node generation budget") from last_error
 
     def _launch_workers(self, count: int) -> list[tuple[int, int, Sandbox]]:
         rows: list[tuple[int, int, Sandbox]] = []
         with ThreadPoolExecutor(max_workers=min(12, count)) as pool:
-            futures = {pool.submit(self._worker, index, 0, count): index for index in range(count)}
+            futures = {pool.submit(self._provision_worker, index, count): index for index in range(count)}
             for future in as_completed(futures):
-                index = futures[future]
-                rows.append((index, 0, future.result()))
+                rows.append(future.result())
         return sorted(rows)
 
     def _launch_uploaders(self, count: int) -> list[tuple[int, int, Sandbox]]:
@@ -541,10 +708,9 @@ class DaytonaConnector:
         if not count:
             return rows
         with ThreadPoolExecutor(max_workers=count) as pool:
-            futures = {pool.submit(self._uploader, index, 0): index for index in range(count)}
+            futures = {pool.submit(self._provision_uploader, index): index for index in range(count)}
             for future in as_completed(futures):
-                index = futures[future]
-                rows.append((index, 0, future.result()))
+                rows.append(future.result())
         return sorted(rows)
 
     def run(self, sample_limit: int = 0, worker_count: int = 0) -> dict:
@@ -559,14 +725,21 @@ class DaytonaConnector:
             coordinator = self._coordinator(sample_limit)
             deadline = time.monotonic() + COORDINATOR_INIT_TIMEOUT
             state = None
+            readiness_log = 0.0
+            _event("coordinator_readiness_started", node=coordinator.name,
+                   timeoutSeconds=COORDINATOR_INIT_TIMEOUT)
             while time.monotonic() < deadline:
-                with contextlib.suppress(Exception):
-                    state = self._state(coordinator)
+                state = self._state(coordinator, log_failure=False)
                 if state and state["state"] in {"ready", "complete", "failed"}:
                     break
+                if time.monotonic() - readiness_log >= 30:
+                    readiness_log = time.monotonic()
+                    _event("coordinator_readiness_waiting", node=coordinator.name)
                 time.sleep(2)
             if not state:
                 raise TimeoutError("Daytona coordinator did not initialize")
+            _event("coordinator_ready", node=coordinator.name, coordinatorState=state["state"],
+                   total=state.get("total"), remaining=state.get("remaining"))
             if state["state"] == "failed":
                 raise RuntimeError(state.get("error", "coordinator failed"))
             remaining = int(state["remaining"])
@@ -584,6 +757,7 @@ class DaytonaConnector:
                                      f"import json,pathlib; pathlib.Path({self.root!r}+'/fleet.json').write_text(json.dumps({fleet!r}))"])
             workers = self._launch_workers(count)
             last_check = time.monotonic()
+            last_snapshot = time.monotonic()
             state_misses = 0
             coordinator_health_misses = 0
             worker_health_misses: dict[int, int] = {}
@@ -603,21 +777,36 @@ class DaytonaConnector:
                     return {**state, "seconds": round(time.monotonic() - started, 3),
                             "workers": count, "processesPerWorker": self.processes,
                             "target": _remote(self.remote, self.target)}
-                if time.monotonic() - last_check >= 120:
+                now = time.monotonic()
+                if now - last_snapshot >= LOG_SNAPSHOT_INTERVAL:
                     snapshot_errors = self._snapshot_logs(
                         [(coordinator, "/home/daytona/smash-coordinator/run.log"),
                          *[(sandbox, "/tmp/smash-uploader.log") for _, _, sandbox in uploaders]]
                     )
                     if snapshot_errors:
-                        print(json.dumps({"event": "diagnostic_snapshot_failed",
-                                          "errors": snapshot_errors}), flush=True)
-                    coordinator_alive = self._exec(
-                        coordinator,
-                        ["bash", "-lc", "kill -0 $(cat /home/daytona/smash-coordinator/run.pid)"],
-                        timeout=30,
-                        check=False,
-                    )
-                    if coordinator_alive.returncode:
+                        _event("diagnostic_snapshot_failed", errors=snapshot_errors)
+                    last_snapshot = now
+                if now - last_check >= HEALTH_CHECK_INTERVAL:
+                    try:
+                        coordinator_alive = self._exec(
+                            coordinator,
+                            ["bash", "-lc", "kill -0 $(cat /home/daytona/smash-coordinator/run.pid)"],
+                            timeout=15,
+                            check=False,
+                        )
+                        coordinator_detail = (coordinator_alive.stderr.strip()
+                                              or coordinator_alive.stdout.strip()
+                                              or f"exit {coordinator_alive.returncode}")[-4000:]
+                        coordinator_unknown = (coordinator_alive.returncode
+                                               and _transient_daytona_failure(coordinator_detail))
+                    except Exception as error:
+                        coordinator_alive = None
+                        coordinator_detail = f"{type(error).__name__}: {error}"
+                        coordinator_unknown = True
+                    if coordinator_unknown:
+                        _event("node_health_unknown", node=coordinator.name, role="coordinator",
+                               error=coordinator_detail)
+                    elif coordinator_alive is not None and coordinator_alive.returncode:
                         latest = self._state(coordinator)
                         if latest and latest["state"] in {"complete", "failed"}:
                             state = latest
@@ -631,35 +820,82 @@ class DaytonaConnector:
                     else:
                         coordinator_health_misses = 0
                     for position, (index, generation, sandbox) in enumerate(workers):
-                        alive = self._exec(sandbox, ["bash", "-lc", "kill -0 $(cat /tmp/smash-worker.pid)"], timeout=30, check=False)
+                        health, detail = self._node_health(sandbox, "worker")
+                        if health == "unknown":
+                            _event("node_health_unknown", node=sandbox.name, role="worker", index=index,
+                                   generation=generation, error=detail)
+                            continue
+                        if health == "healthy":
+                            worker_health_misses[index] = 0
+                            continue
                         slot_files = " && ".join(
                             f"test -f {self.root}/workers/{slot:04d}.done"
                             for slot in range(index * self.processes, (index + 1) * self.processes)
                         )
-                        complete = self._exec(sandbox, ["bash", "-lc", slot_files], timeout=30, check=False)
-                        if alive.returncode and complete.returncode:
-                            worker_health_misses[index] = worker_health_misses.get(index, 0) + 1
-                            if worker_health_misses[index] < HEALTH_MISS_LIMIT:
-                                continue
-                            self._delete(sandbox.name)
-                            replacement = self._worker(index, generation + 1, count)
-                            workers[position] = (index, generation + 1, replacement)
+                        try:
+                            complete = self._exec(sandbox, ["bash", "-lc", slot_files],
+                                                  timeout=15, check=False)
+                        except Exception as error:
+                            _event("node_health_unknown", node=sandbox.name, role="worker", index=index,
+                                   generation=generation,
+                                   error=f"completion check: {type(error).__name__}: {error}")
+                            continue
+                        if not complete.returncode:
                             worker_health_misses[index] = 0
-                        else:
-                            worker_health_misses[index] = 0
+                            continue
+                        worker_health_misses[index] = worker_health_misses.get(index, 0) + 1
+                        _event("node_health_failed", node=sandbox.name, role="worker", index=index,
+                               generation=generation, consecutive=worker_health_misses[index], error=detail)
+                        if worker_health_misses[index] < HEALTH_MISS_LIMIT:
+                            continue
+                        if generation >= NODE_GENERATION_LIMIT:
+                            _event("node_recovery_exhausted", node=sandbox.name, role="worker",
+                                   index=index, generation=generation, error=detail)
+                            raise RuntimeError(f"worker {index} exhausted recovery budget: {detail}")
+                        snapshot_errors = self._snapshot_logs(
+                            [(sandbox, "/tmp/smash-worker.log")], processes=True)
+                        if snapshot_errors:
+                            _event("diagnostic_snapshot_failed", node=sandbox.name,
+                                   role="worker", errors=snapshot_errors)
+                        _event("node_replacement_started", node=sandbox.name, role="worker", index=index,
+                               generation=generation, reason=detail)
+                        self._delete(sandbox.name)
+                        replacement_row = self._provision_worker(index, count, generation + 1)
+                        workers[position] = replacement_row
+                        _event("node_replacement_completed", node=replacement_row[2].name,
+                               role="worker", index=index, generation=replacement_row[1])
+                        worker_health_misses[index] = 0
                     for position, (index, generation, sandbox) in enumerate(uploaders):
-                        alive = self._exec(sandbox, ["bash", "-lc", "kill -0 $(cat /tmp/smash-uploader.pid)"],
-                                           timeout=30, check=False)
-                        if alive.returncode:
-                            uploader_health_misses[index] = uploader_health_misses.get(index, 0) + 1
-                            if uploader_health_misses[index] < HEALTH_MISS_LIMIT:
-                                continue
-                            self._delete(sandbox.name)
-                            replacement = self._uploader(index, generation + 1)
-                            uploaders[position] = (index, generation + 1, replacement)
+                        health, detail = self._node_health(sandbox, "uploader")
+                        if health == "unknown":
+                            _event("node_health_unknown", node=sandbox.name, role="uploader", index=index + 1,
+                                   generation=generation, error=detail)
+                            continue
+                        if health == "healthy":
                             uploader_health_misses[index] = 0
-                        else:
-                            uploader_health_misses[index] = 0
+                            continue
+                        uploader_health_misses[index] = uploader_health_misses.get(index, 0) + 1
+                        _event("node_health_failed", node=sandbox.name, role="uploader", index=index + 1,
+                               generation=generation, consecutive=uploader_health_misses[index], error=detail)
+                        if uploader_health_misses[index] < HEALTH_MISS_LIMIT:
+                            continue
+                        if generation >= NODE_GENERATION_LIMIT:
+                            _event("node_recovery_exhausted", node=sandbox.name, role="uploader",
+                                   index=index + 1, generation=generation, error=detail)
+                            raise RuntimeError(f"uploader {index + 1} exhausted recovery budget: {detail}")
+                        snapshot_errors = self._snapshot_logs(
+                            [(sandbox, "/tmp/smash-uploader.log")], processes=True)
+                        if snapshot_errors:
+                            _event("diagnostic_snapshot_failed", node=sandbox.name,
+                                   role="uploader", errors=snapshot_errors)
+                        _event("node_replacement_started", node=sandbox.name, role="uploader", index=index + 1,
+                               generation=generation, reason=detail)
+                        self._delete(sandbox.name)
+                        replacement_row = self._provision_uploader(index, generation + 1)
+                        uploaders[position] = replacement_row
+                        _event("node_replacement_completed", node=replacement_row[2].name,
+                               role="uploader", index=index + 1, generation=replacement_row[1])
+                        uploader_health_misses[index] = 0
                     last_check = time.monotonic()
                 time.sleep(15)
         except BaseException as error:
@@ -714,11 +950,28 @@ class Drive:
         self.remote, self.config = remote, config
 
     def command(self, *args: str, timeout: int = 900) -> str:
-        command = ["rclone", *args, "--config", str(self.config), "--retries", "10",
-                   "--low-level-retries", "20"]
+        command = ["rclone", *args, "--config", str(self.config), "--retries", "1",
+                   "--low-level-retries", "1"]
         if "--tpslimit" not in args:
             command += ["--tpslimit", "8"]
-        return _run(command, timeout=timeout).stdout
+        operation = args[0] if args else "unknown"
+        last_error = ""
+        for attempt in range(1, DRIVE_ATTEMPTS + 1):
+            try:
+                result = _run(command, timeout=timeout, check=False)
+                if not result.returncode:
+                    return result.stdout
+                last_error = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            except Exception as error:
+                last_error = f"{type(error).__name__}: {error}"
+            if attempt == DRIVE_ATTEMPTS:
+                break
+            backoff = min(30, 2**(attempt - 1))
+            _event("drive_command_retry", operation=operation, attempt=attempt,
+                   nextAttempt=attempt + 1, maxAttempts=DRIVE_ATTEMPTS,
+                   retryAfterSeconds=backoff, error=last_error[-4000:])
+            time.sleep(backoff)
+        raise RuntimeError(f"Drive {operation} failed after {DRIVE_ATTEMPTS} attempts: {last_error}")
 
     def files(self, root: str) -> list[str]:
         try:
@@ -740,12 +993,26 @@ class Drive:
         return {path: int(size) for path, size in (line.rsplit("\t", 1) for line in output.splitlines())}
 
     def cat(self, path: str) -> bytes:
-        process = subprocess.run(["rclone", "cat", _remote(self.remote, path), "--config", str(self.config),
-                                  "--retries", "10", "--low-level-retries", "20", "--tpslimit", "8"],
-                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if process.returncode:
-            raise RuntimeError(process.stderr.decode(errors="replace"))
-        return process.stdout
+        command = ["rclone", "cat", _remote(self.remote, path), "--config", str(self.config),
+                   "--retries", "1", "--low-level-retries", "1", "--tpslimit", "8"]
+        last_error = ""
+        for attempt in range(1, DRIVE_ATTEMPTS + 1):
+            try:
+                process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                         timeout=900)
+                if not process.returncode:
+                    return process.stdout
+                last_error = process.stderr.decode(errors="replace").strip() or f"exit {process.returncode}"
+            except Exception as error:
+                last_error = f"{type(error).__name__}: {error}"
+            if attempt == DRIVE_ATTEMPTS:
+                break
+            backoff = min(30, 2**(attempt - 1))
+            _event("drive_cat_retry", path=path, attempt=attempt, nextAttempt=attempt + 1,
+                   maxAttempts=DRIVE_ATTEMPTS, retryAfterSeconds=backoff,
+                   error=last_error[-4000:])
+            time.sleep(backoff)
+        raise RuntimeError(f"Drive cat failed after {DRIVE_ATTEMPTS} attempts for {path}: {last_error}")
 
 
 def _jobs(drive: Drive, source: str, target: str, limit: int) -> tuple[list[dict], set[str]]:
@@ -808,9 +1075,11 @@ def _stream_sources(drive: Drive, source_root: str, root: Path, jobs: list[dict]
             for attempt in range(5):
                 failure: BaseException | None = None
                 detail = ""
+                _event("source_archive_attempt_started", archive=archive, attempt=attempt + 1,
+                       maxAttempts=5, remainingMembers=len(wanted))
                 with tempfile.TemporaryFile() as process_log:
                     rclone = subprocess.Popen(["rclone", "cat", _remote(drive.remote, f"{source_root}/{archive}"),
-                                               "--config", str(drive.config), "--retries", "10", "--low-level-retries", "20",
+                                               "--config", str(drive.config), "--retries", "1", "--low-level-retries", "1",
                                                "--tpslimit", "8"], stdout=subprocess.PIPE, stderr=process_log)
                     assert rclone.stdout
                     zstd = subprocess.Popen(["zstd", "-dc"], stdin=rclone.stdout, stdout=subprocess.PIPE, stderr=process_log)
@@ -850,12 +1119,22 @@ def _stream_sources(drive: Drive, source_root: str, root: Path, jobs: list[dict]
                     process_log.seek(0)
                     detail = process_log.read().decode(errors="replace").strip()
                 if failure is None or not wanted:
+                    _event("source_archive_attempt_completed", archive=archive, attempt=attempt + 1,
+                           remainingMembers=len(wanted))
                     break
                 if attempt == 4:
+                    _event("source_archive_failed", archive=archive, attempt=attempt + 1,
+                           remainingMembers=len(wanted), error=f"{type(failure).__name__}: {failure}"[-4000:],
+                           processDetail=detail[-4000:])
                     raise RuntimeError(
                         f"source archive failed after {attempt + 1} attempts: {archive}: {failure}; {detail}"
                     )
-                time.sleep(2**attempt)
+                backoff = 2**attempt
+                _event("source_archive_retry", archive=archive, attempt=attempt + 1,
+                       nextAttempt=attempt + 2, retryAfterSeconds=backoff,
+                       remainingMembers=len(wanted), error=f"{type(failure).__name__}: {failure}"[-4000:],
+                       processDetail=detail[-4000:])
+                time.sleep(backoff)
         (root / "producer.done").touch()
     except BaseException as error:
         errors.append(f"source producer: {type(error).__name__}: {error}")
@@ -943,7 +1222,7 @@ def _upload_batch(drive: Drive, root: Path, target: str, markers: list[Path], la
                 command = ["rclone", "copyto", str(path), _remote(drive.remote, destination),
                            "--tpslimit", "1", "--drive-chunk-size", UPLOAD_CHUNK_SIZE,
                            "--timeout", UPLOAD_IDLE_TIMEOUT, "--contimeout", "15s",
-                           "--config", str(drive.config), "--retries", "1", "--low-level-retries", "10",
+                           "--config", str(drive.config), "--retries", "1", "--low-level-retries", "1",
                            "--stats", "30s", "--stats-one-line", "--stats-log-level", "NOTICE"]
                 process = subprocess.Popen(command, text=True, stdout=subprocess.DEVNULL,
                                            stderr=subprocess.PIPE)
@@ -978,12 +1257,18 @@ def _upload_batch(drive: Drive, root: Path, target: str, markers: list[Path], la
                        mibPerSecond=round(size / max(seconds, .001) / 1024**2, 3))
                 return
             except Exception as error:
-                _event("upload_retry", lane=lane, stage=stage, batch=key, attempt=attempt + 1,
-                       seconds=round(time.monotonic() - started, 3),
-                       error=f"{type(error).__name__}: {error}")
+                detail = f"{type(error).__name__}: {error}"
                 if attempt == UPLOAD_ATTEMPTS - 1:
+                    _event("upload_failed", lane=lane, stage=stage, batch=key,
+                           attempt=attempt + 1, maxAttempts=UPLOAD_ATTEMPTS,
+                           seconds=round(time.monotonic() - started, 3), error=detail)
                     raise
-                time.sleep(min(120, 15 * 2**attempt))
+                backoff = min(120, 15 * 2**attempt)
+                _event("upload_retry", lane=lane, stage=stage, batch=key,
+                       attempt=attempt + 1, nextAttempt=attempt + 2,
+                       maxAttempts=UPLOAD_ATTEMPTS, retryAfterSeconds=backoff,
+                       seconds=round(time.monotonic() - started, 3), error=detail)
+                time.sleep(backoff)
 
     upload(archive_path, archive_relative, "archive")
     upload(manifest_path, f"{target}/batches/{manifest_path.name}", "manifest")
@@ -1131,12 +1416,19 @@ def _cleanup_upload(root: Path, job: dict) -> None:
 def uploader(args: argparse.Namespace) -> None:
     """Run one fixed upload lane; the coordinator is the only job scheduler."""
     root = Path(args.root)
-    for name in ("upload-queue", "upload-acks", "done", "failures"):
+    for name in ("upload-queue", "upload-acks", "done"):
         (root / name).mkdir(parents=True, exist_ok=True)
     lane = int(args.lane)
     job_path = root / "upload-queue" / f"{lane:03d}.json"
     ack_path = root / "upload-acks" / f"{lane:03d}.json"
     drive = Drive(args.remote, Path(args.config))
+    heartbeat_stop = threading.Event()
+    heartbeat_thread = threading.Thread(target=_heartbeat,
+                                        args=(Path(args.heartbeat), heartbeat_stop), daemon=True)
+    heartbeat_thread.start()
+    _json(Path(args.ready), {"status": "ready", "role": "uploader", "lane": lane,
+                             "pid": os.getpid()}, atomic=True)
+    _event("uploader_ready", lane=lane, pid=os.getpid())
     try:
         while not (root / "stop").exists():
             if not job_path.exists():
@@ -1160,10 +1452,13 @@ def uploader(args: argparse.Namespace) -> None:
         detail = {"error": f"uploader lane {lane}: {type(error).__name__}: {error}",
                   "lane": lane, "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                   "traceback": traceback.format_exc()}
-        _publish_json(root / "failures" / f"uploader-{lane:03d}.json", detail)
         _publish_json(root / "diagnostics" / "uploader-failures" /
                       f"lane-{lane:03d}-{time.time_ns()}.json", detail)
-        (root / "stop").touch()
+        _event("uploader_failed", lane=lane, error=detail["error"][-4000:])
+        raise
+    finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=HEARTBEAT_INTERVAL + 1)
 
 
 def coordinator(args: argparse.Namespace) -> None:
@@ -1196,9 +1491,27 @@ def coordinator(args: argparse.Namespace) -> None:
         errors: list[str] = []
         producer = threading.Thread(target=_stream_sources, args=(drive, args.source, root, jobs, errors), daemon=True)
         producer.start()
-        local_uploader = argparse.Namespace(root=str(root), lane=0, remote=args.remote,
-                                            target=args.target, config=args.config)
-        threading.Thread(target=uploader, args=(local_uploader,), daemon=True).start()
+        local_uploader_failures: list[tuple[int, str]] = []
+
+        def start_local_uploader(generation: int) -> None:
+            ready = Path(f"/tmp/smash-local-uploader-{generation}.ready")
+            heartbeat = Path(f"/tmp/smash-local-uploader-{generation}.heartbeat")
+            ready.unlink(missing_ok=True); heartbeat.unlink(missing_ok=True)
+            local_uploader = argparse.Namespace(root=str(root), lane=0, remote=args.remote,
+                                                target=args.target, config=args.config,
+                                                ready=str(ready), heartbeat=str(heartbeat))
+
+            def guarded_uploader() -> None:
+                try:
+                    uploader(local_uploader)
+                except BaseException as error:
+                    local_uploader_failures.append(
+                        (generation, f"{type(error).__name__}: {error}"))
+
+            _event("local_uploader_started", generation=generation)
+            threading.Thread(target=guarded_uploader, daemon=True).start()
+
+        start_local_uploader(0)
         assigned: dict[int, set[Path]] = {}
         for lane in range(lanes):
             lane_job = root / "upload-queue" / f"{lane:03d}.json"
@@ -1207,6 +1520,15 @@ def coordinator(args: argparse.Namespace) -> None:
                 assigned[lane] = {Path(path) for path in job["markers"]}
         last_done = -1
         while True:
+            if local_uploader_failures:
+                generation, local_error = local_uploader_failures.pop(0)
+                if generation >= LOCAL_UPLOADER_RESTART_LIMIT:
+                    _event("node_recovery_exhausted", role="local_uploader", index=0,
+                           generation=generation, error=local_error[-4000:])
+                    raise RuntimeError(f"local uploader exhausted restart budget: {local_error}")
+                _event("local_uploader_restart", generation=generation,
+                       nextGeneration=generation + 1, error=local_error[-4000:])
+                start_local_uploader(generation + 1)
             failures = sorted((root / "failures").glob("*.json"))
             if errors or failures:
                 detail = errors[0] if errors else failures[0].read_text()
@@ -1277,7 +1599,7 @@ def _skip_result(path: Path) -> None:
 
 def worker(args: argparse.Namespace) -> None:
     root = Path(args.root)
-    for name in ("results", "failures", "workers"):
+    for name in ("results", "workers"):
         (root / name).mkdir(parents=True, exist_ok=True)
     jobs = _read_json(root / "jobs.json")
     slots = args.workers * args.processes
@@ -1286,6 +1608,14 @@ def worker(args: argparse.Namespace) -> None:
         raise ValueError(f"{args.processes} processes exceed {cpu} CPUs")
     os.environ["SMASH_RENDERER_SNAPSHOT"] = args.snapshot
     errors: list[str] = []
+    cancel = threading.Event()
+    heartbeat_stop = threading.Event()
+    heartbeat_thread = threading.Thread(target=_heartbeat,
+                                        args=(Path(args.heartbeat), heartbeat_stop), daemon=True)
+    heartbeat_thread.start()
+    _json(Path(args.ready), {"status": "ready", "role": "worker", "index": args.index,
+                             "pid": os.getpid(), "processes": args.processes}, atomic=True)
+    _event("worker_ready", workerIndex=args.index, pid=os.getpid(), processes=args.processes)
 
     def slot(local_slot: int) -> None:
         slot_id = args.index * args.processes + local_slot
@@ -1301,7 +1631,7 @@ def worker(args: argparse.Namespace) -> None:
             raise ValueError("render retry settings must be positive")
         producer_finished_at = None
         while pending:
-            if (root / "stop").exists():
+            if cancel.is_set() or (root / "stop").exists():
                 return
             for job_id in list(pending):
                 marker = root / "results" / f"{job_id:06d}.json"
@@ -1400,18 +1730,26 @@ def worker(args: argparse.Namespace) -> None:
         except BaseException as error:
             message = f"slot {local_slot}: {type(error).__name__}: {error}"
             errors.append(message)
-            _publish_json(root / "failures" / f"{args.index:03d}-{local_slot}.json",
-                          {"error": message, "workerIndex": args.index, "localSlot": local_slot,
-                           "traceback": traceback.format_exc()})
-            (root / "stop").touch()
+            cancel.set()
+            detail = {"error": message, "workerIndex": args.index, "localSlot": local_slot,
+                      "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                      "traceback": traceback.format_exc()}
+            _publish_json(root / "diagnostics" / "worker-failures" /
+                          f"worker-{args.index:03d}-slot-{local_slot}-{time.time_ns()}.json", detail)
+            _event("worker_slot_failed", workerIndex=args.index, localSlot=local_slot,
+                   error=message[-4000:])
 
     threads = [threading.Thread(target=guarded, args=(index,)) for index in range(args.processes)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    if errors:
-        raise RuntimeError(errors[0])
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        if errors:
+            raise RuntimeError(errors[0])
+    finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=HEARTBEAT_INTERVAL + 1)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -1425,8 +1763,10 @@ def main(argv: list[str] | None = None) -> None:
     render.add_argument("--root", required=True); render.add_argument("--index", type=int, required=True)
     render.add_argument("--workers", type=int, required=True); render.add_argument("--processes", type=int, required=True)
     render.add_argument("--snapshot", required=True)
+    render.add_argument("--ready", required=True); render.add_argument("--heartbeat", required=True)
     upload = commands.add_parser("uploader")
     upload.add_argument("--root", required=True); upload.add_argument("--lane", type=int, required=True)
+    upload.add_argument("--ready", required=True); upload.add_argument("--heartbeat", required=True)
     for name in ("remote", "target", "config"):
         upload.add_argument(f"--{name}", required=True)
     args = parser.parse_args(argv)
