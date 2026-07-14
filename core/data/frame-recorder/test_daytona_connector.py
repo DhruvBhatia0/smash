@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -81,6 +82,26 @@ class ResumeReconciliationTest(unittest.TestCase):
             self.assertEqual(len(recovery), 1)
             self.assertEqual(json.loads(recovery[0].read_text())["previousFailures"][0]["file"],
                              "worker.json")
+
+
+class SupervisorStateTest(unittest.TestCase):
+    def test_transient_daytona_failure_is_a_missed_poll(self) -> None:
+        connector = object.__new__(daytona_connector.DaytonaConnector)
+        connector._exec = lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="request timeout"
+        )
+        coordinator = daytona_connector.Sandbox("id", "coordinator", 2, 4, 10, 0, "started")
+
+        self.assertIsNone(connector._state(coordinator))
+
+    def test_valid_state_is_returned(self) -> None:
+        connector = object.__new__(daytona_connector.DaytonaConnector)
+        connector._exec = lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=[], returncode=0, stdout='{"state":"running","uploaded":855}', stderr=""
+        )
+        coordinator = daytona_connector.Sandbox("id", "coordinator", 2, 4, 10, 0, "started")
+
+        self.assertEqual(connector._state(coordinator), {"state": "running", "uploaded": 855})
 
 
 if __name__ == "__main__":

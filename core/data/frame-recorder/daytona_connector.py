@@ -51,6 +51,8 @@ UPLOAD_ATTEMPTS = 8
 UPLOAD_RELAY_COUNT = 2
 UPLOAD_CHUNK_SIZE = "64M"
 UPLOAD_IDLE_TIMEOUT = "10m"
+STATE_MISS_LIMIT = 6
+HEALTH_MISS_LIMIT = 2
 
 
 def _event(event: str, **fields: object) -> None:
@@ -397,10 +399,20 @@ class DaytonaConnector:
             self._exec(sandbox, ["install", "-m755", str(uploaded_bin), "/usr/local/bin/rclone"])
 
     def _state(self, coordinator: Sandbox) -> dict | None:
-        result = self._exec(coordinator, ["cat", "/home/daytona/smash-coordinator/state.json"], timeout=30)
+        try:
+            result = self._exec(coordinator, ["cat", "/home/daytona/smash-coordinator/state.json"],
+                                timeout=15, check=False)
+        except Exception as error:
+            _event("supervisor_state_read_failed", error=f"{type(error).__name__}: {error}")
+            return None
+        if result.returncode:
+            detail = (result.stderr.strip() or result.stdout.strip() or "state read failed")[-2000:]
+            _event("supervisor_state_read_failed", returnCode=result.returncode, error=detail)
+            return None
         try:
             return json.loads(result.stdout)
         except json.JSONDecodeError:
+            _event("supervisor_state_read_failed", error="invalid coordinator state JSON")
             return None
 
     def _snapshot_logs(self, rows: list[tuple[Sandbox, str]], *, processes: bool = False) -> list[str]:
@@ -554,8 +566,19 @@ class DaytonaConnector:
                                      f"import json,pathlib; pathlib.Path({self.root!r}+'/fleet.json').write_text(json.dumps({fleet!r}))"])
             workers = self._launch_workers(count)
             last_check = time.monotonic()
+            state_misses = 0
+            coordinator_health_misses = 0
+            worker_health_misses: dict[int, int] = {}
+            uploader_health_misses: dict[int, int] = {}
             while True:
                 state = self._state(coordinator)
+                if state is None:
+                    state_misses += 1
+                    if state_misses >= STATE_MISS_LIMIT:
+                        raise RuntimeError(f"coordinator state unavailable for {state_misses} consecutive polls")
+                    time.sleep(15)
+                    continue
+                state_misses = 0
                 if state and state["state"] in {"complete", "failed"}:
                     if state["state"] == "failed":
                         raise RuntimeError(state.get("error", "Daytona pipeline failed"))
@@ -581,7 +604,14 @@ class DaytonaConnector:
                         if latest and latest["state"] in {"complete", "failed"}:
                             state = latest
                             continue
-                        raise RuntimeError("Daytona coordinator process exited before completion")
+                        coordinator_health_misses += 1
+                        _event("supervisor_health_check_failed", role="coordinator",
+                               consecutive=coordinator_health_misses,
+                               returnCode=coordinator_alive.returncode)
+                        if coordinator_health_misses >= HEALTH_MISS_LIMIT:
+                            raise RuntimeError("Daytona coordinator process exited before completion")
+                    else:
+                        coordinator_health_misses = 0
                     for position, (index, generation, sandbox) in enumerate(workers):
                         alive = self._exec(sandbox, ["bash", "-lc", "kill -0 $(cat /tmp/smash-worker.pid)"], timeout=30, check=False)
                         slot_files = " && ".join(
@@ -590,16 +620,28 @@ class DaytonaConnector:
                         )
                         complete = self._exec(sandbox, ["bash", "-lc", slot_files], timeout=30, check=False)
                         if alive.returncode and complete.returncode:
+                            worker_health_misses[index] = worker_health_misses.get(index, 0) + 1
+                            if worker_health_misses[index] < HEALTH_MISS_LIMIT:
+                                continue
                             self._delete(sandbox.name)
                             replacement = self._worker(index, generation + 1, count)
                             workers[position] = (index, generation + 1, replacement)
+                            worker_health_misses[index] = 0
+                        else:
+                            worker_health_misses[index] = 0
                     for position, (index, generation, sandbox) in enumerate(uploaders):
                         alive = self._exec(sandbox, ["bash", "-lc", "kill -0 $(cat /tmp/smash-uploader.pid)"],
                                            timeout=30, check=False)
                         if alive.returncode:
+                            uploader_health_misses[index] = uploader_health_misses.get(index, 0) + 1
+                            if uploader_health_misses[index] < HEALTH_MISS_LIMIT:
+                                continue
                             self._delete(sandbox.name)
                             replacement = self._uploader(index, generation + 1)
                             uploaders[position] = (index, generation + 1, replacement)
+                            uploader_health_misses[index] = 0
+                        else:
+                            uploader_health_misses[index] = 0
                     last_check = time.monotonic()
                 time.sleep(15)
         except BaseException as error:
