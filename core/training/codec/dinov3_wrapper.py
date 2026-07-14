@@ -1,5 +1,9 @@
-import torch
+import os
 from enum import Enum
+from pathlib import Path
+
+import torch
+from torch import Tensor
 
 
 class DinoV3_versions(Enum):
@@ -10,34 +14,76 @@ class DinoV3_versions(Enum):
     VIT_HP = "dinov3_vith16plus"
     VIT_7 = "dinov3_vit7b16"
 
+
 class DinoV3(torch.nn.Module):
-    '''loads a dinov3 model, provides a forward method that also returns intermediate layers'''
-    def __init__(self, desired_hidden_states: list, dino_version: DinoV3_versions = DinoV3_versions.VIT_SP):
+    """Load DINOv3 and expose its requested intermediate feature maps."""
+
+    def __init__(
+        self,
+        desired_hidden_states: list,
+        dino_version: DinoV3_versions = DinoV3_versions.VIT_SP,
+    ):
         super().__init__()
         self.desired_hidden_states = desired_hidden_states
         self.dino_version = dino_version
+        weights_path = self._weights_path(dino_version)
         self.model = torch.hub.load(
             repo_or_dir="facebookresearch/dinov3",
             model=dino_version.value,
             source="github",
             pretrained=True,
-            weights="/Users/dhruv/code/smash/.checkpoints/dinov3/dinov3_vits16plus_pretrain_lvd1689m-4057cbaa.pth",
+            weights=str(weights_path),
         )
 
         self.model.eval()
         self.model.requires_grad_(False)
-    
-    def forward(self, input_video: torch.tensor ):
-        B, T, C, H, W = input_video.shape
-        # flatten dim 0, 1
-        flattened_video = input_video.reshape(B*T, C, H, W)
 
-        hidden_states = self.model.get_intermediate_layers(
-            flattened_video,
-            n=self.desired_hidden_states,
-            reshape=True,
+    @staticmethod
+    def _weights_path(dino_version: DinoV3_versions) -> Path:
+        direct = os.environ.get("SMASH_DINO_WEIGHTS")
+        if direct:
+            path = Path(direct).expanduser()
+            if path.is_file():
+                return path
+            raise FileNotFoundError(f"SMASH_DINO_WEIGHTS does not exist: {path}")
+
+        roots = []
+        if directory := os.environ.get("SMASH_DINO_WEIGHTS_DIR"):
+            roots.append(Path(directory).expanduser())
+        roots.append(Path(torch.hub.get_dir()) / "checkpoints")
+        matches = [
+            match
+            for root in roots
+            for match in root.glob(f"{dino_version.value}_pretrain_*.pth")
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise RuntimeError(
+                "Multiple matching DINO weights found; set SMASH_DINO_WEIGHTS to the one to use"
+            )
+        raise FileNotFoundError(
+            f"No pretrained weights found for {dino_version.value}. Set SMASH_DINO_WEIGHTS "
+            "to the .pth file or SMASH_DINO_WEIGHTS_DIR to its directory."
         )
 
-        averaged_hidden_states = torch.stack(hidden_states).mean(dim=0)
-        # Output: (B, T, num_features, patch_h, patch_w); num_features is 384 for ViT-S+.
-        return averaged_hidden_states.reshape(B, T, *averaged_hidden_states.shape[1:])
+    def intermediate_layers(self, input_video: Tensor) -> tuple[Tensor, ...]:
+        batch, time, channels, height, width = input_video.shape
+        flattened_video = input_video.reshape(batch * time, channels, height, width)
+        hidden_states = tuple(
+            self.model.get_intermediate_layers(
+                flattened_video,
+                n=self.desired_hidden_states,
+                norm=True,
+                reshape=True,
+            )
+        )
+        return tuple(
+            features.reshape(batch, time, *features.shape[1:])
+            for features in hidden_states
+        )
+
+    def forward(self, input_video: Tensor) -> Tensor:
+        hidden_states = self.intermediate_layers(input_video)
+        # MIRA aggregates selected layers as mean(features) + features[-1].
+        return torch.stack(hidden_states).mean(dim=0) + hidden_states[-1]
