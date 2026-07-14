@@ -1,6 +1,6 @@
 # Native Battlefield conversion runbook
 
-Last updated: 2026-07-14T19:54:41Z
+Last updated: 2026-07-14T19:59:51Z
 
 ## Goal and non-negotiable output contract
 
@@ -25,7 +25,7 @@ Convert all 10,327 Falcon-versus-Fox Battlefield Slippi matches and commit them 
 - Fleet: 23 worker sandboxes, 4 render processes each, 92 render slots, one 2-CPU coordinator, two 1-CPU upload relays, 96 run CPUs, zero GPUs.
 - Renderer: `core/data/frame-recorder/replay_renderer.py`
 - Fleet/coordinator: `core/data/frame-recorder/daytona_connector.py`
-- Recurring heartbeat: `babysit-daytona-render-fleet`, every 15 minutes.
+- Monitoring: detached local Screen supervisor plus the coordinator state and shared run root above.
 
 ## Current checkpoint
 
@@ -39,6 +39,11 @@ Convert all 10,327 Falcon-versus-Fox Battlefield Slippi matches and commit them 
   and 23 four-CPU workers with 92 render slots. The run uses 96 CPUs and zero GPUs.
 - At 19:54:41Z, coordinator state was `running` from exactly 495 manifest-backed recordings with
   9,832 remaining, 23 sources ready, zero results, zero assigned uploads, and zero failures.
+- At 19:59:51Z, the shared queue held 12 completed results and 99 ready sources with zero failures.
+  A completed result was extracted from its result tar and independently probed: it contains exactly
+  one H.264 video stream at 642x528, yuv420p, and 20/1 fps. Its metadata reports
+  `spatialTransform: "none"` and `audio: false`. No upload has been assigned yet; the scheduler is
+  correctly waiting for its normal batch threshold or oldest-result flush.
 
 At 2026-07-14T11:13:09Z, immediately before the replacement launch:
 
