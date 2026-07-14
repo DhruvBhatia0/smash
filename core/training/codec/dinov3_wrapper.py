@@ -50,7 +50,7 @@ class DinoV3(torch.nn.Module):
         roots = []
         if directory := os.environ.get("SMASH_DINO_WEIGHTS_DIR"):
             roots.append(Path(directory).expanduser())
-        roots.append(Path(torch.hub.get_dir()).parent / "checkpoints")
+        roots.append(Path(torch.hub.get_dir()) / "checkpoints")
         matches = [
             match
             for root in roots
