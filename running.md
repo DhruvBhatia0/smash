@@ -1,6 +1,6 @@
 # Native Battlefield conversion runbook
 
-Last updated: 2026-07-14T19:59:51Z
+Last updated: 2026-07-14T20:05:31Z
 
 ## Goal and non-negotiable output contract
 
@@ -44,6 +44,11 @@ Convert all 10,327 Falcon-versus-Fox Battlefield Slippi matches and commit them 
   one H.264 video stream at 642x528, yuv420p, and 20/1 fps. Its metadata reports
   `spatialTransform: "none"` and `audio: false`. No upload has been assigned yet; the scheduler is
   correctly waiting for its normal batch threshold or oldest-result flush.
+- At 20:05:31Z, two disjoint nine-match production batches committed archive-first and manifest-last
+  on their first attempts. Their 460,143,115-byte and 486,161,556-byte archives uploaded at measured
+  rates of 28.690 and 29.073 MiB/s. A fresh local Drive audit found 20 matching nonempty
+  archive/manifest pairs, 513 manifest rows, 513 unique source references, zero duplicates, and zero
+  unpaired objects. The third startup lane remains in flight and the fleet has zero failures.
 
 At 2026-07-14T11:13:09Z, immediately before the replacement launch:
 
