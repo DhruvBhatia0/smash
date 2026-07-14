@@ -31,7 +31,7 @@ class TrainConfig:
     epochs: int = 7
     steps: int | None = None
     log_every: int = 100
-    batch_size: int = 4
+    batch_size: int = 18
     workers: int = 6
     learning_rate: float = 1e-4
     warmup_steps: int = 1_000
