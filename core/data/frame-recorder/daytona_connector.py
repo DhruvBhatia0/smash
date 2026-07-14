@@ -507,11 +507,13 @@ class DaytonaConnector:
                         except Exception as error:
                             cleanup_errors.append(f"{name}: {error}")
                 if coordinator is not None:
-                    if not cleanup_errors:
+                    if not cleanup_errors and primary_error is None:
                         try:
                             self._exec(coordinator, ["rm", "-rf", "--", self.root], timeout=300)
                         except Exception as error:
                             cleanup_errors.append(f"queue: {error}")
+                    elif primary_error is not None:
+                        print(json.dumps({"event": "queue_preserved", "root": self.root}), flush=True)
                     try:
                         self._delete(coordinator.name)
                     except Exception as error:
