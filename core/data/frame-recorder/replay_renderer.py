@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-WIDTH, HEIGHT, SOURCE_FPS, TARGET_FPS = 252, 208, 60, 20
+WIDTH, HEIGHT, SOURCE_FPS, TARGET_FPS = 642, 528, 60, 20
 
 
 class NoPlayableFrames(ValueError):
@@ -184,8 +184,8 @@ def render(job: dict, source: Path, work_root: Path, threads: int) -> Path:
     """Render one replay and return a tar containing video.mp4 and metadata.json."""
     work = work_root / f"{int(job['id']):06d}"
     shutil.rmtree(work, ignore_errors=True)
-    render_dir, output_dir = work / "render", work / "recording"
-    render_dir.mkdir(parents=True)
+    render_root, output_dir = work / "render", work / "recording"
+    render_root.mkdir(parents=True)
     output_dir.mkdir()
     render_input, plan, normalization = _normalize(source, work / "normalized.slp")
     metadata_path = output_dir / "metadata.json"
@@ -205,80 +205,158 @@ def render(job: dict, source: Path, work_root: Path, threads: int) -> Path:
         raise NoPlayableFrames(f"no playable frames: {first}..{last}")
     if not raw_first <= first <= last <= raw_last:
         raise RuntimeError(f"invalid playable/render frame mapping: raw={raw_first}..{raw_last}, playable={first}..{last}")
-    playback = work / "playback.json"
-    playback.write_text(json.dumps({
-        "replay": str(render_input), "commandId": f"daytona-{job['id']}",
-        "startFrame": plan.first, "endFrame": plan.last + 1, "stopFrame": last,
-    }))
-    environment = os.environ.copy()
-    raw_timeline = raw_last - raw_first + 1
+    requested_last = last
+    chunk_frames = int(os.environ.get("SMASH_RAW_CHUNK_SOURCE_FRAMES", "3600"))
+    if chunk_frames < 3:
+        raise ValueError("raw chunk must contain at least three 60 Hz source frames")
+    chunk_frames -= chunk_frames % 3
     minimum_stall = max(first + 600, first + math.ceil((last - first) * 0.75))
-    environment.update({
-        "LP_NUM_THREADS": str(threads), "LIBGL_ALWAYS_SOFTWARE": "1",
-        "EGL_PLATFORM": "surfaceless", "MESA_GLTHREAD": "false",
-        "SLIPPI_DOLPHIN_BIN": "/opt/slippi/dolphin-emu-nogui", "SLIPPI_DUMP_ONLY": "1",
-        "SLIPPI_DUMP_FRAMES": "True", "SLIPPI_USE_FFV1": "False",
-        "SLIPPI_DUMP_CODEC": "rawvideo", "SLIPPI_DUMP_FORMAT": "avi",
-        "SLIPPI_INTERNAL_RESOLUTION_FRAME_DUMPS": "True", "SLIPPI_EFB_SCALE": "0",
-        "SLIPPI_CPU_THREAD": "False", "SLIPPI_RENDER_TO_MAIN": "False",
-        "SLIPPI_RENDER_WIDTH": "204", "SLIPPI_RENDER_HEIGHT": "168",
-        "SLIPPI_END_FRAME_POLL_SECONDS": "0.05",
-        "SLIPPI_STALL_SECONDS": os.environ.get("SMASH_RENDER_STALL_SECONDS", "60"),
-        "SLIPPI_STALL_MIN_FRAME": str(minimum_stall),
-        "SLIPPI_MAX_RAW_BYTES": str(int(raw_timeline * 224 * 184 * 1.65) + 64 * 1024**2),
-    })
     timeout = int(os.environ.get("SMASH_RENDER_TIMEOUT_SECONDS", "1200"))
     started = time.monotonic()
-    _run([
-        "/tmp/render-ffv1-replay.sh", "--replay-json", str(playback), "--iso",
-        os.environ.get("SMASH_REMOTE_ISO", "/mnt/smash-assets/melee.iso"),
-        "--output-dir", str(render_dir), "--user-dir", str(work / "dolphin-user"),
-        "--timeout-seconds", str(timeout), "--video-backend", "OGL", "--cpu-core", "1",
-        "--audio-backend", "Null", "--no-xvfb",
-    ], timeout=timeout + 30, env=environment)
-    manifest = json.loads((render_dir / "manifest.json").read_text())
-    if manifest.get("targetEndFrame") != plan.last + 1 or manifest.get("targetStopFrame") != last:
-        raise RuntimeError("renderer changed the authoritative replay endpoint")
-    last, recovery = _recover_tail(manifest, first, last)
-    if recovery:
-        metadata["renderTailRecovery"] = recovery
-    raw_files = [path for path in render_dir.iterdir() if path.suffix.lower() in {".avi", ".mkv", ".mp4", ".mov", ".nut"}]
-    if len(raw_files) != 1:
-        raise RuntimeError(f"expected one raw capture, found {len(raw_files)}")
-    raw = raw_files[0]
-    raw_video = _probe(raw)
-    if (int(raw_video["width"]), int(raw_video["height"])) != (224, 184):
-        raise RuntimeError("raw capture is not 224x184")
-    if raw_video["frames"] > last - raw_first + 1:
-        raise RuntimeError("raw capture contains duplicate Slippi timeline frames")
-    first_pts, last_pts = _pts(raw)
-    if first_pts < -0.0001 or first_pts > 1 / SOURCE_FPS + 0.001 or abs(last_pts - (last - raw_first) / SOURCE_FPS) > 0.001:
-        raise RuntimeError("raw capture does not cover the authoritative Slippi timeline")
-    selected_last = first + ((last - first) // 3) * 3
-    expected_frames = (selected_last - first) // 3 + 1
+    parts: list[Path] = []
+    part_frames: list[int] = []
+    expected_frames = raw_frames = raw_bytes = 0
+    capture_first = first
+    segment = 0
+    while capture_first <= last:
+        capture_stop = min(requested_last, capture_first + chunk_frames - 1)
+        render_dir = render_root / f"{segment:04d}"
+        playback = work / f"playback-{segment:04d}.json"
+        playback.write_text(json.dumps({
+            "replay": str(render_input), "commandId": f"daytona-{job['id']}-{segment}",
+            "startFrame": capture_first - 1, "endFrame": plan.last + 1, "stopFrame": capture_stop,
+        }))
+        raw_timeline = capture_stop - capture_first + 1
+        environment = os.environ.copy()
+        environment.update({
+            "LP_NUM_THREADS": str(threads), "LIBGL_ALWAYS_SOFTWARE": "1",
+            "EGL_PLATFORM": "surfaceless", "MESA_GLTHREAD": "false",
+            "SLIPPI_DOLPHIN_BIN": "/opt/slippi/dolphin-emu-nogui", "SLIPPI_DUMP_ONLY": "1",
+            "SLIPPI_DUMP_FRAMES": "True", "SLIPPI_USE_FFV1": "False",
+            "SLIPPI_DUMP_CODEC": "rawvideo", "SLIPPI_DUMP_FORMAT": "avi",
+            "SLIPPI_INTERNAL_RESOLUTION_FRAME_DUMPS": "True", "SLIPPI_EFB_SCALE": "2",
+            "SLIPPI_CPU_THREAD": "False", "SLIPPI_RENDER_TO_MAIN": "False",
+            "SLIPPI_RENDER_WIDTH": "204", "SLIPPI_RENDER_HEIGHT": "168",
+            "SLIPPI_END_FRAME_POLL_SECONDS": "0.05",
+            "SLIPPI_STALL_SECONDS": os.environ.get("SMASH_RENDER_STALL_SECONDS", "60"),
+            "SLIPPI_STALL_MIN_FRAME": str(minimum_stall),
+            "SLIPPI_MAX_RAW_BYTES": str(int(raw_timeline * WIDTH * HEIGHT * 1.65) + 64 * 1024**2),
+        })
+        _run([
+            "/tmp/render-ffv1-replay.sh", "--replay-json", str(playback), "--iso",
+            os.environ.get("SMASH_REMOTE_ISO", "/mnt/smash-assets/melee.iso"),
+            "--output-dir", str(render_dir), "--user-dir", str(work / f"dolphin-user-{segment:04d}"),
+            "--timeout-seconds", str(timeout), "--video-backend", "OGL", "--cpu-core", "1",
+            "--audio-backend", "Null", "--no-xvfb",
+        ], timeout=timeout + 30, env=environment)
+        manifest = json.loads((render_dir / "manifest.json").read_text())
+        if manifest.get("targetEndFrame") != plan.last + 1 or manifest.get("targetStopFrame") != capture_stop:
+            raise RuntimeError("renderer changed an authoritative replay segment endpoint")
+        observed_value = (manifest.get("currentFrameRange") or {}).get("last")
+        observed_last = int(observed_value) if observed_value is not None else -10**9
+        if capture_stop == requested_last:
+            last, recovery = _recover_tail(manifest, first, requested_last)
+            if recovery:
+                metadata["renderTailRecovery"] = recovery
+        elif observed_last < capture_stop:
+            raise RuntimeError(f"render stopped before segment end: {observed_last} < {capture_stop}")
+        segment_last = last if capture_stop == requested_last else capture_stop
+        raw_files = [path for path in render_dir.iterdir()
+                     if path.suffix.lower() in {".avi", ".mkv", ".mp4", ".mov", ".nut"}]
+        if len(raw_files) != 1:
+            raise RuntimeError(f"expected one raw capture, found {len(raw_files)}")
+        raw = raw_files[0]
+        raw_video = _probe(raw)
+        if (int(raw_video["width"]), int(raw_video["height"])) != (WIDTH, HEIGHT):
+            raise RuntimeError(f"raw capture is not native {WIDTH}x{HEIGHT}")
+        first_pts, last_pts = _pts(raw)
+        last_offset = round(last_pts * SOURCE_FPS)
+        raw_last_frame = capture_first + last_offset
+        if (first_pts < -0.0001 or first_pts > 1 / SOURCE_FPS + 0.001
+                or abs(last_pts - last_offset / SOURCE_FPS) > 0.001
+                or raw_video["frames"] > last_offset + 1 or raw_last_frame < segment_last):
+            raise RuntimeError(
+                "raw capture does not cover the authoritative Slippi segment timeline: "
+                f"capture={capture_first}..{capture_stop}, observedLast={observed_last}, "
+                f"rawLast={raw_last_frame}, rawFrames={raw_video['frames']}, pts={first_pts}..{last_pts}"
+            )
+        chunk_selected_last = capture_first + ((segment_last - capture_first) // 3) * 3
+        chunk_expected = (chunk_selected_last - capture_first) // 3 + 1
+        part = output_dir / f"part-{segment:04d}.mp4"
+        filter_graph = (
+            f"fps=60:start_time=0,select='between(n\\,0\\,{chunk_selected_last - capture_first})*"
+            "not(mod(n\\,3))',setpts=N/(20*TB),format=yuv420p"
+        )
+        _run([
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(raw),
+            "-vf", filter_graph, "-vsync", "cfr", "-r", str(TARGET_FPS), "-an",
+            "-c:v", "libx264", "-preset", os.environ.get("SMASH_H264_PRESET", "veryfast"),
+            "-crf", os.environ.get("SMASH_H264_CRF", "18"), "-g", "40", "-bf", "2",
+            "-threads", str(threads), "-pix_fmt", "yuv420p", "-video_track_timescale", "20",
+            "-movflags", "+faststart", str(part),
+        ])
+        raw_frames += int(raw_video["frames"])
+        raw_bytes += raw.stat().st_size
+        expected_frames += chunk_expected
+        parts.append(part)
+        part_frames.append(chunk_expected)
+        shutil.rmtree(render_dir)
+        shutil.rmtree(work / f"dolphin-user-{segment:04d}")
+        if segment_last < capture_stop or capture_stop == requested_last:
+            break
+        capture_first += chunk_frames
+        segment += 1
+    selected_last = first + (expected_frames - 1) * 3
     target, temporary = output_dir / "video.mp4", output_dir / "video.partial.mp4"
-    filter_graph = (
-        f"fps=60:start_time=0,select='between(n\\,{first - raw_first}\\,{selected_last - raw_first})*"
-        f"not(mod(n-{first - raw_first}\\,3))',setpts=N/(20*TB),scale={WIDTH}:{HEIGHT}:flags=lanczos,format=yuv420p"
-    )
-    _run([
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(raw),
-        "-vf", filter_graph, "-vsync", "cfr", "-r", str(TARGET_FPS), "-an",
-        "-c:v", "libx264", "-preset", os.environ.get("SMASH_H264_PRESET", "veryfast"),
-        "-crf", os.environ.get("SMASH_H264_CRF", "18"), "-g", "40", "-bf", "2",
-        "-threads", str(threads), "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(temporary),
-    ])
-    video = _validate_output(temporary, expected_frames)
+    concat_reencoded = False
+    if len(parts) == 1:
+        parts[0].replace(temporary)
+    else:
+        concat = work / "parts.txt"
+        concat.write_text("".join(
+            f"file '{part}'\nduration {frames / TARGET_FPS:.9f}\n"
+            for part, frames in zip(parts, part_frames)
+        ))
+        _run([
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0",
+            "-i", str(concat), "-map", "0:v:0", "-c", "copy", "-an", "-movflags", "+faststart",
+            "-video_track_timescale", "20", str(temporary),
+        ])
+        try:
+            video = _validate_output(temporary, expected_frames)
+        except RuntimeError:
+            # A minority of MP4 chunk combinations retain one timestamp tick at
+            # a boundary when stream-copied.  Preserve the fast remux path for
+            # normal jobs, but normalize packet timestamps when that happens.
+            temporary.unlink(missing_ok=True)
+            _run([
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0",
+                "-i", str(concat), "-map", "0:v:0", "-vf", "setpts=N/(20*TB),format=yuv420p",
+                "-vsync", "cfr", "-r", str(TARGET_FPS), "-an", "-c:v", "libx264",
+                "-preset", os.environ.get("SMASH_H264_PRESET", "veryfast"),
+                "-crf", os.environ.get("SMASH_H264_CRF", "18"), "-g", "40", "-bf", "2",
+                "-threads", str(threads), "-pix_fmt", "yuv420p", "-video_track_timescale", "20",
+                "-movflags", "+faststart", str(temporary),
+            ])
+            concat_reencoded = True
+            video = _validate_output(temporary, expected_frames)
+        for part in parts:
+            part.unlink()
+    if len(parts) == 1:
+        video = _validate_output(temporary, expected_frames)
     temporary.replace(target)
     elapsed = time.monotonic() - started
     metadata["video"] = {
         "file": target.name, "container": "mp4", "codec": "h264", "pixelFormat": "yuv420p",
         "frames": expected_frames, "frameRate": "20/1", "width": WIDTH, "height": HEIGHT,
-        "inputBytes": raw.stat().st_size, "outputBytes": target.stat().st_size,
-        "rawFrames": raw_video["frames"], "sourceFps": SOURCE_FPS, "targetFps": TARGET_FPS,
+        "inputBytes": raw_bytes, "outputBytes": target.stat().st_size,
+        "rawFrames": raw_frames, "sourceFps": SOURCE_FPS, "targetFps": TARGET_FPS,
         "firstSelectedSlpFrame": first, "lastSourceSlpFrame": last,
         "lastSelectedSlpFrame": selected_last, "sourceFrameStep": 3,
-        "croppedTailSourceFrames": last - selected_last, "renderSeconds": round(elapsed, 3),
+        "unsampledTailSourceFrames": last - selected_last, "spatialTransform": "none",
+        "audio": False, "renderSeconds": round(elapsed, 3),
+        "rawChunkSourceFrames": chunk_frames, "rawChunks": len(parts),
+        "concatFallbackReencoded": concat_reencoded,
         "gameplaySeconds": expected_frames / TARGET_FPS, "cpuOnly": True,
         "rendererSnapshot": os.environ.get("SMASH_RENDERER_SNAPSHOT", "unknown"),
     }

@@ -2,8 +2,9 @@
 
 The coordinator streams each Drive source archive once into a bounded shared
 volume.  Fixed worker slots eliminate distributed locks: job ``id % slots``
-has exactly one owner.  One coordinator batches results back to Drive and
-uploads each manifest last as the commit record.
+has exactly one owner.  One central scheduler assigns disjoint result batches
+to fixed upload lanes; every lane uploads its manifest last as the commit
+record.
 """
 
 from __future__ import annotations
@@ -35,15 +36,25 @@ except ImportError:  # The same two files are executed directly inside Daytona.
 
 
 SOURCE_ROOT = "hal-fox-captain-falcon-battlefield"
-TARGET_ROOT = f"{SOURCE_ROOT}/recordings-252x208-20fps-slippi-pts-v3"
+TARGET_ROOT = f"{SOURCE_ROOT}/recordings-642x528-20fps-slippi-pts-v4"
 WORKER_SNAPSHOT = "smash-cpu-renderer-e7711b1-v3"
 COORDINATOR_SNAPSHOT = "smash-cpu-renderer-e7711b1-v3-2cpu-repair"
 ASSET_SNAPSHOT = "smash-cpu-renderer-e7711b1-1cpu-v1"
 ASSET_VOLUME = "smash-frame-assets-v1"
 MOUNT = "/mnt/smash-assets"
-PREFETCH = 256
+PREFETCH = 512
 BATCH_SIZE = 100
-BATCH_BYTES = 2 * 1024**3
+BATCH_MIN_SIZE = 20
+BATCH_BYTES = 1536 * 1024**2
+UPLOAD_ATTEMPTS = 8
+UPLOAD_RELAY_COUNT = 2
+UPLOAD_CHUNK_SIZE = "64M"
+UPLOAD_IDLE_TIMEOUT = "10m"
+
+
+def _event(event: str, **fields: object) -> None:
+    print(json.dumps({"event": event, "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                      **fields}, separators=(",", ":"), sort_keys=True), flush=True)
 
 
 def _run(command: list[str], *, timeout: int = 600, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -85,6 +96,23 @@ def _copy_verified(source: Path, target: Path, size: int, digest: str) -> None:
             pass
         if time.monotonic() >= deadline:
             raise RuntimeError(f"could not read complete shared file: {source}")
+        time.sleep(.25)
+
+
+def _publish_visible(source: Path, target: Path, size: int) -> None:
+    """Close one object-store write, then wait for that object to become visible."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.unlink(missing_ok=True)
+    shutil.copyfile(source, target)
+    deadline = time.monotonic() + 300
+    while True:
+        try:
+            if target.stat().st_size == size:
+                return
+        except OSError:
+            pass
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"published file did not become visible: {target}")
         time.sleep(.25)
 
 
@@ -163,6 +191,8 @@ class DaytonaConnector:
         self.default_workers = int(os.environ.get("SMASH_WORKER_COUNT", "23"))
         self.region = os.environ.get("SMASH_DAYTONA_REGION", "us")
         self.keep = os.environ.get("SMASH_KEEP_DAYTONA_RESOURCES") == "1"
+        rclone_bin = os.environ.get("SMASH_RCLONE_BIN")
+        self.rclone_bin = Path(rclone_bin).expanduser() if rclone_bin else None
         suffix = hashlib.sha256(os.urandom(16)).hexdigest()[:6]
         self.run_id = os.environ.get("SMASH_RUN_ID", time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-" + suffix)
         self.root = f"{MOUNT}/runs/{self.run_id}"
@@ -170,6 +200,8 @@ class DaytonaConnector:
         self._lock = threading.Lock()
         if not self.config.is_file() or not self.iso.is_file():
             raise FileNotFoundError(self.config if not self.config.is_file() else self.iso)
+        if self.rclone_bin is not None and not self.rclone_bin.is_file():
+            raise FileNotFoundError(self.rclone_bin)
 
     def _daytona(self, *args: str, timeout: int = 600, check: bool = True) -> subprocess.CompletedProcess[str]:
         return _run([self.daytona, *args], timeout=timeout, check=check)
@@ -307,18 +339,24 @@ class DaytonaConnector:
     def _coordinator(self, sample_limit: int) -> Sandbox:
         sandbox = self._create(f"smash-coord-{self.run_id}", self.coordinator_snapshot, "coordinator")
         self._deploy(sandbox)
-        with tempfile.TemporaryDirectory() as temporary:
-            config = Path(temporary) / "rclone.conf"
-            config.symlink_to(self.config)
-            uploaded = self._upload(sandbox, config)
-            self._exec(sandbox, ["bash", "-lc", f"mkdir -p /home/daytona/.config/rclone /home/daytona/smash-coordinator; install -m600 {shlex.quote(str(uploaded))} /home/daytona/.config/rclone/rclone.conf"])
+        self._install_rclone(sandbox)
         command = ["python3", "/tmp/daytona_connector.py", "coordinator", "--remote", self.remote,
                    "--source", self.source, "--target", self.target, "--root", self.root,
                    "--config", "/home/daytona/.config/rclone/rclone.conf", "--sample-limit", str(sample_limit),
                    "--state", "/home/daytona/smash-coordinator/state.json"]
         shell = shlex.join(command)
-        self._exec(sandbox, ["bash", "-lc", f"nohup {shell} >/home/daytona/smash-coordinator/run.log 2>&1 & echo $! >/home/daytona/smash-coordinator/run.pid"], timeout=30)
+        self._exec(sandbox, ["bash", "-lc", f"mkdir -p /home/daytona/smash-coordinator; nohup {shell} >/home/daytona/smash-coordinator/run.log 2>&1 & echo $! >/home/daytona/smash-coordinator/run.pid"], timeout=30)
         return sandbox
+
+    def _install_rclone(self, sandbox: Sandbox) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "rclone.conf"
+            config.symlink_to(self.config)
+            uploaded = self._upload(sandbox, config)
+            self._exec(sandbox, ["bash", "-lc", f"mkdir -p /home/daytona/.config/rclone; install -m600 {shlex.quote(str(uploaded))} /home/daytona/.config/rclone/rclone.conf"])
+        if self.rclone_bin is not None:
+            uploaded_bin = self._upload(sandbox, self.rclone_bin)
+            self._exec(sandbox, ["install", "-m755", str(uploaded_bin), "/usr/local/bin/rclone"])
 
     def _state(self, coordinator: Sandbox) -> dict | None:
         result = self._exec(coordinator, ["cat", "/home/daytona/smash-coordinator/state.json"], timeout=30)
@@ -339,6 +377,20 @@ class DaytonaConnector:
         self._exec(sandbox, ["bash", "-lc", f"nohup bash -lc {shlex.quote(supervisor)} >/tmp/smash-worker.log 2>&1 & echo $! >/tmp/smash-worker.pid"], timeout=30)
         return sandbox
 
+    def _uploader(self, index: int, generation: int) -> Sandbox:
+        lane = index + 1  # Lane zero runs inside the coordinator sandbox.
+        suffix = f"{index:02d}" + (f"-r{generation}" if generation else "")
+        sandbox = self._create(f"smash-uploader-{self.run_id}-{suffix}", self.asset_snapshot, "uploader",
+                               **{"smash-upload-lane": str(lane)})
+        self._deploy(sandbox)
+        self._install_rclone(sandbox)
+        command = shlex.join(["python3", "/tmp/daytona_connector.py", "uploader", "--root", self.root,
+                              "--lane", str(lane), "--remote", self.remote, "--target", self.target,
+                              "--config", "/home/daytona/.config/rclone/rclone.conf"])
+        supervisor = f"while true; do {command}; s=$?; [ $s -eq 0 ] && exit 0; sleep 5; done"
+        self._exec(sandbox, ["bash", "-lc", f"nohup bash -lc {shlex.quote(supervisor)} >/tmp/smash-uploader.log 2>&1 & echo $! >/tmp/smash-uploader.pid"], timeout=30)
+        return sandbox
+
     def _launch_workers(self, count: int) -> list[tuple[int, int, Sandbox]]:
         rows: list[tuple[int, int, Sandbox]] = []
         with ThreadPoolExecutor(max_workers=min(12, count)) as pool:
@@ -348,9 +400,21 @@ class DaytonaConnector:
                 rows.append((index, 0, future.result()))
         return sorted(rows)
 
+    def _launch_uploaders(self, count: int) -> list[tuple[int, int, Sandbox]]:
+        rows: list[tuple[int, int, Sandbox]] = []
+        if not count:
+            return rows
+        with ThreadPoolExecutor(max_workers=count) as pool:
+            futures = {pool.submit(self._uploader, index, 0): index for index in range(count)}
+            for future in as_completed(futures):
+                index = futures[future]
+                rows.append((index, 0, future.result()))
+        return sorted(rows)
+
     def run(self, sample_limit: int = 0, worker_count: int = 0) -> dict:
         coordinator: Sandbox | None = None
         workers: list[tuple[int, int, Sandbox]] = []
+        uploaders: list[tuple[int, int, Sandbox]] = []
         started = time.monotonic()
         primary_error: BaseException | None = None
         try:
@@ -375,7 +439,13 @@ class DaytonaConnector:
             count = worker_count or min(self.default_workers, math.ceil(remaining / self.processes))
             if count < 1:
                 raise ValueError("at least one worker is required")
-            self._exec(coordinator, ["python3", "-c", f"import json,pathlib; pathlib.Path({self.root!r}+'/fleet.json').write_text(json.dumps({{'workers':{count},'processes':{self.processes}}}))"])
+            uploader_count = int(os.environ.get("SMASH_UPLOAD_RELAY_COUNT", str(UPLOAD_RELAY_COUNT)))
+            if uploader_count < 0:
+                raise ValueError("upload relay count cannot be negative")
+            uploaders = self._launch_uploaders(uploader_count)
+            fleet = {"workers": count, "processes": self.processes, "uploaders": uploader_count}
+            self._exec(coordinator, ["python3", "-c",
+                                     f"import json,pathlib; pathlib.Path({self.root!r}+'/fleet.json').write_text(json.dumps({fleet!r}))"])
             workers = self._launch_workers(count)
             last_check = time.monotonic()
             while True:
@@ -410,6 +480,13 @@ class DaytonaConnector:
                             self._delete(sandbox.name)
                             replacement = self._worker(index, generation + 1, count)
                             workers[position] = (index, generation + 1, replacement)
+                    for position, (index, generation, sandbox) in enumerate(uploaders):
+                        alive = self._exec(sandbox, ["bash", "-lc", "kill -0 $(cat /tmp/smash-uploader.pid)"],
+                                           timeout=30, check=False)
+                        if alive.returncode:
+                            self._delete(sandbox.name)
+                            replacement = self._uploader(index, generation + 1)
+                            uploaders[position] = (index, generation + 1, replacement)
                     last_check = time.monotonic()
                 time.sleep(15)
         except BaseException as error:
@@ -532,58 +609,77 @@ def _stream_sources(drive: Drive, source_root: str, root: Path, jobs: list[dict]
         for job in jobs:
             by_archive.setdefault(job["archive"], {})[job["member"].removeprefix("./")] = job
         for archive, wanted in sorted(by_archive.items()):
-            with tempfile.TemporaryFile() as process_log:
-                rclone = subprocess.Popen(["rclone", "cat", _remote(drive.remote, f"{source_root}/{archive}"),
-                                           "--config", str(drive.config), "--retries", "10", "--low-level-retries", "20",
-                                           "--tpslimit", "8"], stdout=subprocess.PIPE, stderr=process_log)
-                assert rclone.stdout
-                zstd = subprocess.Popen(["zstd", "-dc"], stdin=rclone.stdout, stdout=subprocess.PIPE, stderr=process_log)
-                rclone.stdout.close()
-                assert zstd.stdout
-                try:
-                    with tarfile.open(fileobj=zstd.stdout, mode="r|") as stream:
-                        for member in stream:
-                            job = wanted.get(member.name.removeprefix("./"))
-                            if not job or not member.isfile():
-                                continue
-                            while len(list((root / "ready").glob("*.json"))) >= PREFETCH:
-                                if (root / "stop").exists():
-                                    return
-                                time.sleep(1)
-                            extracted = stream.extractfile(member)
-                            if extracted is None:
-                                raise RuntimeError(f"cannot extract {member.name}")
-                            path = root / "sources" / f"{job['id']:06d}.slp"
-                            digest, size = hashlib.sha256(), 0
-                            with path.open("wb") as output:
-                                while chunk := extracted.read(1024 * 1024):
-                                    output.write(chunk); digest.update(chunk); size += len(chunk)
-                            _json(root / "ready" / f"{job['id']:06d}.json",
-                                  {**job, "sourcePath": str(path), "sourceBytes": size, "sourceSha256": digest.hexdigest()})
-                            wanted.pop(member.name.removeprefix("./"), None)
-                    zstd_status, rclone_status = zstd.wait(), rclone.wait()
-                except BaseException:
-                    zstd.kill(); rclone.kill(); zstd.wait(); rclone.wait()
-                    raise
-                process_log.seek(0)
-                detail = process_log.read().decode(errors="replace")
-                if zstd_status or rclone_status or wanted:
-                    raise RuntimeError(detail or f"missing source members: {list(wanted)[:3]}")
+            for attempt in range(5):
+                failure: BaseException | None = None
+                detail = ""
+                with tempfile.TemporaryFile() as process_log:
+                    rclone = subprocess.Popen(["rclone", "cat", _remote(drive.remote, f"{source_root}/{archive}"),
+                                               "--config", str(drive.config), "--retries", "10", "--low-level-retries", "20",
+                                               "--tpslimit", "8"], stdout=subprocess.PIPE, stderr=process_log)
+                    assert rclone.stdout
+                    zstd = subprocess.Popen(["zstd", "-dc"], stdin=rclone.stdout, stdout=subprocess.PIPE, stderr=process_log)
+                    rclone.stdout.close()
+                    assert zstd.stdout
+                    try:
+                        with tarfile.open(fileobj=zstd.stdout, mode="r|") as stream:
+                            for member in stream:
+                                key = member.name.removeprefix("./")
+                                job = wanted.get(key)
+                                if not job or not member.isfile():
+                                    continue
+                                while len(list((root / "ready").glob("*.json"))) >= PREFETCH:
+                                    if (root / "stop").exists():
+                                        return
+                                    time.sleep(1)
+                                extracted = stream.extractfile(member)
+                                if extracted is None:
+                                    raise RuntimeError(f"cannot extract {member.name}")
+                                path = root / "sources" / f"{job['id']:06d}.slp"
+                                path.unlink(missing_ok=True)
+                                digest, size = hashlib.sha256(), 0
+                                with path.open("wb") as output:
+                                    while chunk := extracted.read(1024 * 1024):
+                                        output.write(chunk); digest.update(chunk); size += len(chunk)
+                                _json(root / "ready" / f"{job['id']:06d}.json",
+                                      {**job, "sourcePath": str(path), "sourceBytes": size,
+                                       "sourceSha256": digest.hexdigest()})
+                                wanted.pop(key, None)
+                        zstd_status, rclone_status = zstd.wait(), rclone.wait()
+                        if zstd_status or rclone_status or wanted:
+                            raise RuntimeError(f"stream statuses zstd={zstd_status}, rclone={rclone_status}; "
+                                               f"missing source members: {list(wanted)[:3]}")
+                    except BaseException as error:
+                        failure = error
+                        zstd.kill(); rclone.kill(); zstd.wait(); rclone.wait()
+                    process_log.seek(0)
+                    detail = process_log.read().decode(errors="replace").strip()
+                if failure is None or not wanted:
+                    break
+                if attempt == 4:
+                    raise RuntimeError(
+                        f"source archive failed after {attempt + 1} attempts: {archive}: {failure}; {detail}"
+                    )
+                time.sleep(2**attempt)
         (root / "producer.done").touch()
     except BaseException as error:
         errors.append(f"source producer: {type(error).__name__}: {error}")
         (root / "stop").touch()
 
 
-def _batch_archive(drive: Drive, root: Path, target: str, rows: list[dict], key: str) -> None:
-    remote_path = _remote(drive.remote, f"{target}/batches/batch-{key}.tar.zst")
+def _batch_archive(rows: list[dict], key: str) -> Path:
+    """Build one seekable local archive so Drive retries never rebuild the stream."""
+    started = time.monotonic()
+    input_bytes = sum(int(row["sourceBytes"]) + int(row["resultBytes"]) for row in rows)
+    _event("archive_build_started", batch=key, count=len(rows), inputBytes=input_bytes)
+    upload_root = Path(tempfile.gettempdir()) / "smash-upload"
+    upload_root.mkdir(parents=True, exist_ok=True)
+    archive_path = upload_root / f"batch-{key}.tar.zst"
+    partial = archive_path.with_suffix(archive_path.suffix + ".partial")
+    partial.unlink(missing_ok=True)
     with tempfile.TemporaryFile() as process_log:
-        rclone = subprocess.Popen(["rclone", "rcat", remote_path, "--config", str(drive.config), "--retries", "10",
-                                   "--low-level-retries", "20", "--drive-chunk-size", "512M", "--tpslimit", "1",
-                                   "--tpslimit-burst", "1"], stdin=subprocess.PIPE, stderr=process_log)
-        assert rclone.stdin
-        zstd = subprocess.Popen(["zstd", "-T1", "-1", "-c"], stdin=subprocess.PIPE, stdout=rclone.stdin, stderr=process_log)
-        rclone.stdin.close()
+        archive_output = partial.open("wb")
+        zstd = subprocess.Popen(["zstd", "-T1", "-1", "-c"], stdin=subprocess.PIPE,
+                                stdout=archive_output, stderr=process_log)
         assert zstd.stdin
         try:
             with tarfile.open(fileobj=zstd.stdin, mode="w|") as output:
@@ -599,22 +695,34 @@ def _batch_archive(drive: Drive, root: Path, target: str, rows: list[dict], key:
                             member.name = f"{prefix}/{name}"
                             output.addfile(member, extracted)
             zstd.stdin.close()
-            zstd_status, rclone_status = zstd.wait(), rclone.wait()
+            zstd_status = zstd.wait()
         except BaseException:
-            zstd.kill(); rclone.kill(); zstd.wait(); rclone.wait()
+            zstd.kill(); zstd.wait()
             raise
+        finally:
+            archive_output.close()
         process_log.seek(0)
         detail = process_log.read().decode(errors="replace")
-        if zstd_status or rclone_status:
+        if zstd_status:
+            partial.unlink(missing_ok=True)
             raise RuntimeError(detail)
+    partial.replace(archive_path)
+    _event("archive_build_completed", batch=key, count=len(rows), inputBytes=input_bytes,
+           archiveBytes=archive_path.stat().st_size, seconds=round(time.monotonic() - started, 3))
+    return archive_path
 
 
-def _upload_batch(drive: Drive, root: Path, target: str, markers: list[Path]) -> None:
+def _upload_batch(drive: Drive, root: Path, target: str, markers: list[Path], lane: int) -> None:
     rows = [_read_json(path) for path in markers]
     rows.sort(key=lambda row: row["id"])
+    preflight_started = time.monotonic()
+    _event("upload_preflight_started", lane=lane, count=len(rows),
+           bytes=sum(int(row["sourceBytes"]) + int(row["resultBytes"]) for row in rows))
     for row in rows:
         _wait_file(Path(row["resultPath"]), int(row["resultBytes"]), row["resultSha256"])
         _wait_file(Path(row["sourcePath"]), int(row["sourceBytes"]), row["sourceSha256"])
+    _event("upload_preflight_completed", lane=lane, count=len(rows),
+           seconds=round(time.monotonic() - preflight_started, 3))
     key = hashlib.sha256("\n".join(row["reference"] for row in rows).encode()).hexdigest()[:20]
     manifest_path = root / f"batch-{key}.manifest.jsonl"
     archive_relative = f"{target}/batches/batch-{key}.tar.zst"
@@ -627,25 +735,143 @@ def _upload_batch(drive: Drive, root: Path, target: str, markers: list[Path]) ->
             entry.update({"artifact": "skipped", "skipReason": row["skipReason"]})
         lines.append(json.dumps(entry, separators=(",", ":")))
     manifest_path.write_text("\n".join(lines) + "\n")
-    for attempt in range(3):
-        try:
-            _batch_archive(drive, root, target, rows, key)
-            drive.command("copyto", str(manifest_path), _remote(drive.remote, f"{target}/batches/{manifest_path.name}"),
-                          "--tpslimit", "1", "--drive-chunk-size", "512M", timeout=1800)
+    archive_path = _batch_archive(rows, key)
+
+    def upload(path: Path, destination: str, stage: str) -> None:
+        for attempt in range(UPLOAD_ATTEMPTS):
+            started = time.monotonic()
+            size = path.stat().st_size
+            _event("upload_started", lane=lane, stage=stage, batch=key, attempt=attempt + 1,
+                   bytes=size, destination=destination)
+            try:
+                command = ["rclone", "copyto", str(path), _remote(drive.remote, destination),
+                           "--tpslimit", "1", "--drive-chunk-size", UPLOAD_CHUNK_SIZE,
+                           "--timeout", UPLOAD_IDLE_TIMEOUT, "--contimeout", "15s",
+                           "--config", str(drive.config), "--retries", "1", "--low-level-retries", "10",
+                           "--stats", "30s", "--stats-one-line", "--stats-log-level", "NOTICE"]
+                process = subprocess.Popen(command, text=True, stdout=subprocess.DEVNULL,
+                                           stderr=subprocess.PIPE)
+                messages: list[str] = []
+
+                def relay() -> None:
+                    assert process.stderr
+                    for line in process.stderr:
+                        message = line.rstrip()
+                        if not message:
+                            continue
+                        messages.append(message)
+                        del messages[:-20]
+                        _event("upload_progress", lane=lane, stage=stage, batch=key,
+                               attempt=attempt + 1, message=message)
+
+                reader = threading.Thread(target=relay, daemon=True)
+                reader.start()
+                try:
+                    status = process.wait(timeout=3600)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                    raise RuntimeError("rclone copy timed out after 3600 seconds")
+                finally:
+                    reader.join(timeout=10)
+                if status:
+                    raise RuntimeError("; ".join(messages[-5:]) or f"rclone exited {status}")
+                seconds = time.monotonic() - started
+                _event("upload_completed", lane=lane, stage=stage, batch=key, attempt=attempt + 1,
+                       bytes=size, seconds=round(seconds, 3),
+                       mibPerSecond=round(size / max(seconds, .001) / 1024**2, 3))
+                return
+            except Exception as error:
+                _event("upload_retry", lane=lane, stage=stage, batch=key, attempt=attempt + 1,
+                       seconds=round(time.monotonic() - started, 3),
+                       error=f"{type(error).__name__}: {error}")
+                if attempt == UPLOAD_ATTEMPTS - 1:
+                    raise
+                time.sleep(min(120, 15 * 2**attempt))
+
+    upload(archive_path, archive_relative, "archive")
+    upload(manifest_path, f"{target}/batches/{manifest_path.name}", "manifest")
+    archive_path.unlink(missing_ok=True)
+
+
+def _publish_json(path: Path, value: dict | list) -> None:
+    """Publish one closed JSON object to the shared object-store volume."""
+    with tempfile.NamedTemporaryFile("w", delete=False) as output:
+        temporary = Path(output.name)
+        output.write(json.dumps(value, separators=(",", ":"), sort_keys=True) + "\n")
+    try:
+        _publish_visible(temporary, path, temporary.stat().st_size)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _choose_batch(markers: list[Path], limit: int) -> tuple[list[Path], int, list[dict]]:
+    chosen: list[Path] = []
+    rows: list[dict] = []
+    size = 0
+    for marker in markers[:limit]:
+        row = _read_json(marker)
+        item_size = int(row["sourceBytes"]) + int(row["resultBytes"])
+        if chosen and size + item_size > BATCH_BYTES:
             break
-        except Exception:
-            if attempt == 2:
-                raise
-            time.sleep(60 * 2**attempt)
-    for marker, row in zip(markers, rows):
-        _json(root / "done" / f"{row['id']:06d}.json", {"id": row["id"], "reference": row["reference"]})
-        for path in (marker, Path(row["resultPath"]), Path(row["sourcePath"]), root / "ready" / f"{row['id']:06d}.json"):
+        chosen.append(marker)
+        rows.append(row)
+        size += item_size
+    return chosen, size, rows
+
+
+def _cleanup_upload(root: Path, job: dict) -> None:
+    """Idempotently retire the shared inputs after a manifest-last commit."""
+    records = job.get("records", [])
+    for record in records:
+        job_id = int(record["id"])
+        _json(root / "done" / f"{job_id:06d}.json",
+              {"id": job_id, "reference": record["reference"]})
+        for path in (root / "results" / f"{job_id:06d}.json",
+                     root / "results" / f"{job_id:06d}.tar",
+                     root / "sources" / f"{job_id:06d}.slp",
+                     root / "ready" / f"{job_id:06d}.json"):
             path.unlink(missing_ok=True)
+
+
+def uploader(args: argparse.Namespace) -> None:
+    """Run one fixed upload lane; the coordinator is the only job scheduler."""
+    root = Path(args.root)
+    for name in ("upload-queue", "upload-acks", "done", "failures"):
+        (root / name).mkdir(parents=True, exist_ok=True)
+    lane = int(args.lane)
+    job_path = root / "upload-queue" / f"{lane:03d}.json"
+    ack_path = root / "upload-acks" / f"{lane:03d}.json"
+    drive = Drive(args.remote, Path(args.config))
+    try:
+        while not (root / "stop").exists():
+            if not job_path.exists():
+                time.sleep(.25)
+                continue
+            job = _read_json(job_path)
+            token = str(job["token"])
+            ack = _published_json(ack_path)
+            if not ack or ack.get("token") != token:
+                markers = [Path(path) for path in job["markers"]]
+                _upload_batch(drive, root, args.target, markers, lane)
+                _publish_json(ack_path, {"token": token})
+            cleanup_started = time.monotonic()
+            _event("upload_cleanup_started", lane=lane, count=len(job.get("records", [])))
+            _cleanup_upload(root, job)
+            job_path.unlink(missing_ok=True)
+            ack_path.unlink(missing_ok=True)
+            _event("upload_cleanup_completed", lane=lane, count=len(job.get("records", [])),
+                   seconds=round(time.monotonic() - cleanup_started, 3))
+    except BaseException as error:
+        _publish_json(root / "failures" / f"uploader-{lane:03d}.json",
+                      {"error": f"uploader lane {lane}: {type(error).__name__}: {error}"})
+        (root / "stop").touch()
 
 
 def coordinator(args: argparse.Namespace) -> None:
     root, state_path = Path(args.root), Path(args.state)
-    for name in ("sources", "ready", "results", "done", "failures", "workers"):
+    for name in ("sources", "ready", "results", "done", "failures", "workers",
+                 "upload-queue", "upload-acks"):
         (root / name).mkdir(parents=True, exist_ok=True)
     drive = Drive(args.remote, Path(args.config))
     try:
@@ -663,33 +889,65 @@ def coordinator(args: argparse.Namespace) -> None:
             time.sleep(1)
         fleet = _read_json(root / "fleet.json")
         slots = int(fleet["workers"]) * int(fleet["processes"])
-        state["state"] = "running"; state["slots"] = slots
+        lanes = 1 + int(fleet.get("uploaders", 0))
+        state["state"] = "running"; state["slots"] = slots; state["uploadLanes"] = lanes
         _json(state_path, state, atomic=True)
         errors: list[str] = []
         producer = threading.Thread(target=_stream_sources, args=(drive, args.source, root, jobs, errors), daemon=True)
         producer.start()
+        local_uploader = argparse.Namespace(root=str(root), lane=0, remote=args.remote,
+                                            target=args.target, config=args.config)
+        threading.Thread(target=uploader, args=(local_uploader,), daemon=True).start()
+        assigned: dict[int, set[Path]] = {}
+        for lane in range(lanes):
+            lane_job = root / "upload-queue" / f"{lane:03d}.json"
+            if lane_job.exists():
+                job = _read_json(lane_job)
+                assigned[lane] = {Path(path) for path in job["markers"]}
+        last_done = -1
         while True:
             failures = sorted((root / "failures").glob("*.json"))
             if errors or failures:
                 detail = errors[0] if errors else failures[0].read_text()
                 raise RuntimeError(detail)
+            for lane, claimed in list(assigned.items()):
+                lane_job = root / "upload-queue" / f"{lane:03d}.json"
+                if not lane_job.exists() and all(not path.exists() for path in claimed):
+                    assigned.pop(lane)
+            claimed = set().union(*assigned.values()) if assigned else set()
             markers = [path for path in sorted((root / "results").glob("*.json"))
-                       if _published_json(path) is not None]
+                       if path not in claimed and _published_json(path) is not None]
             terminal = (root / "producer.done").exists() and len(list((root / "workers").glob("*.done"))) == slots
-            old = markers and time.time() - markers[0].stat().st_mtime >= 300
-            if markers and (len(markers) >= BATCH_SIZE or terminal or old):
-                chosen, size = [], 0
-                for marker in markers[:BATCH_SIZE]:
-                    row = _read_json(marker)
-                    item_size = int(row["sourceBytes"]) + int(row["resultBytes"])
-                    if chosen and size + item_size > BATCH_BYTES:
-                        break
-                    chosen.append(marker); size += item_size
-                _upload_batch(drive, root, args.target, chosen)
-                state["uploaded"] = len(uploaded) + len(list((root / "done").glob("*.json")))
+            old = markers and time.time() - min(path.stat().st_mtime for path in markers) >= 300
+            done = len(list((root / "done").glob("*.json")))
+            if done != last_done:
+                last_done = done
+                state["uploaded"] = len(uploaded) + done
                 state["remaining"] = len(all_jobs) - state["uploaded"]
+                state["uploading"] = sum(len(batch) for batch in assigned.values())
                 _json(state_path, state, atomic=True)
-            elif terminal:
+            free = [lane for lane in range(lanes) if lane not in assigned]
+            enough_for_lanes = len(markers) >= BATCH_MIN_SIZE * len(free)
+            if free and markers and (len(markers) >= BATCH_SIZE or enough_for_lanes or terminal or old):
+                while free and markers:
+                    lane = free.pop(0)
+                    per_lane = min(BATCH_SIZE, max(1, math.ceil(len(markers) / (len(free) + 1))))
+                    chosen, size, rows = _choose_batch(markers, per_lane)
+                    if not chosen:
+                        raise RuntimeError("could not form a non-empty upload batch")
+                    token = hashlib.sha256(
+                        ("\n".join(row["reference"] for row in rows) + f"\n{time.time_ns()}").encode()
+                    ).hexdigest()[:24]
+                    job = {"token": token, "lane": lane, "count": len(chosen), "bytes": size,
+                           "markers": [str(path) for path in chosen],
+                           "records": [{"id": row["id"], "reference": row["reference"]} for row in rows]}
+                    _publish_json(root / "upload-queue" / f"{lane:03d}.json", job)
+                    assigned[lane] = set(chosen)
+                    chosen_set = set(chosen)
+                    markers = [path for path in markers if path not in chosen_set]
+                state["uploading"] = sum(len(batch) for batch in assigned.values())
+                _json(state_path, state, atomic=True)
+            elif terminal and not markers and not assigned:
                 if list((root / "ready").glob("*.json")):
                     raise RuntimeError("workers exited with unprocessed sources")
                 state.update({"state": "complete", "uploaded": len(all_jobs), "remaining": 0})
@@ -713,6 +971,8 @@ def _skip_result(path: Path) -> None:
 
 def worker(args: argparse.Namespace) -> None:
     root = Path(args.root)
+    for name in ("results", "failures", "workers"):
+        (root / name).mkdir(parents=True, exist_ok=True)
     jobs = _read_json(root / "jobs.json")
     slots = args.workers * args.processes
     cpu = _cpus()
@@ -767,9 +1027,10 @@ def worker(args: argparse.Namespace) -> None:
                         raise
                     time.sleep(2**attempt)
             shared = root / "results" / f"{job['id']:06d}.tar"
-            shutil.copyfile(result, shared)
-            row = {**job, "resultPath": str(shared), "resultBytes": shared.stat().st_size,
-                   "resultSha256": _sha256(shared)}
+            result_bytes, result_sha256 = result.stat().st_size, _sha256(result)
+            _publish_visible(result, shared, result_bytes)
+            row = {**job, "resultPath": str(shared), "resultBytes": result_bytes,
+                   "resultSha256": result_sha256}
             if skip:
                 row["skipReason"] = skip
             _json(root / "results" / f"{job['id']:06d}.json", row)
@@ -806,8 +1067,17 @@ def main(argv: list[str] | None = None) -> None:
     render.add_argument("--root", required=True); render.add_argument("--index", type=int, required=True)
     render.add_argument("--workers", type=int, required=True); render.add_argument("--processes", type=int, required=True)
     render.add_argument("--snapshot", required=True)
+    upload = commands.add_parser("uploader")
+    upload.add_argument("--root", required=True); upload.add_argument("--lane", type=int, required=True)
+    for name in ("remote", "target", "config"):
+        upload.add_argument(f"--{name}", required=True)
     args = parser.parse_args(argv)
-    coordinator(args) if args.command == "coordinator" else worker(args)
+    if args.command == "coordinator":
+        coordinator(args)
+    elif args.command == "worker":
+        worker(args)
+    else:
+        uploader(args)
 
 
 if __name__ == "__main__":
