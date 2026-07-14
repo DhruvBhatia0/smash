@@ -381,6 +381,7 @@ class DaytonaConnector:
             f"cp -- {shlex.quote(local_log)} {shlex.quote(shared_log)} 2>/dev/null || true; exit $status"
         )
         self._exec(sandbox, ["bash", "-lc",
+                             "mkdir -p /home/daytona/smash-coordinator; "
                              f"nohup bash -lc {shlex.quote(wrapper)} >/dev/null 2>&1 & "
                              "echo $! >/home/daytona/smash-coordinator/run.pid"], timeout=30)
         return sandbox
