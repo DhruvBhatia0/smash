@@ -269,7 +269,17 @@ class DaytonaConnector:
         self._daytona(*command)
         with self._lock:
             self.owned.append(name)
-        sandbox = Sandbox.parse(json.loads(self._daytona("info", name, "--format", "json").stdout))
+        deadline = time.monotonic() + 300
+        sandbox: Sandbox | None = None
+        while time.monotonic() < deadline:
+            result = self._daytona("info", name, "--format", "json", check=False)
+            if not result.returncode:
+                sandbox = Sandbox.parse(json.loads(result.stdout))
+                if sandbox.state == "started":
+                    break
+            time.sleep(1)
+        if sandbox is None or sandbox.state != "started":
+            raise TimeoutError(f"Daytona sandbox did not start: {name}")
         if sandbox.gpu:
             self._delete(name)
             raise RuntimeError(f"GPU sandbox forbidden: {name}")
@@ -324,9 +334,15 @@ class DaytonaConnector:
                     process.communicate()
 
     def _delete(self, name: str) -> None:
-        result = self._daytona("delete", name, timeout=300, check=False)
-        if result.returncode and "not found" not in result.stderr.lower():
-            raise RuntimeError(result.stderr.strip())
+        deadline = time.monotonic() + 120
+        while True:
+            result = self._daytona("delete", name, timeout=300, check=False)
+            detail = result.stderr.lower()
+            if not result.returncode or "not found" in detail:
+                break
+            if "state change in progress" not in detail or time.monotonic() >= deadline:
+                raise RuntimeError(result.stderr.strip())
+            time.sleep(2)
         with self._lock, contextlib.suppress(ValueError):
             self.owned.remove(name)
 
