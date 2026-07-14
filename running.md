@@ -1,6 +1,6 @@
 # Native Battlefield conversion runbook
 
-Last updated: 2026-07-14T20:47:06Z
+Last updated: 2026-07-14T21:03:06Z
 
 ## Goal and non-negotiable output contract
 
@@ -19,8 +19,8 @@ Convert all 10,327 Falcon-versus-Fox Battlefield Slippi matches and commit them 
 - Drive source root: `smash-drive:hal-fox-captain-falcon-battlefield`
 - Drive output root: `smash-drive:hal-fox-captain-falcon-battlefield/recordings-642x528-20fps-slippi-pts-v4`
 - Live run ID: `native-642x528-20260714-195112`
-- Local supervisor log: `/tmp/smash-native-642x528-20260714-195112.log`
-- Local Screen supervisor: `smash-native-642x528-v8`
+- Local supervisor log: `/tmp/smash-native-642x528-20260714-195112-recovery-2.log`
+- Local Screen supervisor: `smash-native-642x528-v10`
 - Live coordinator: `smash-coord-native-642x528-20260714-195112`
 - Fleet: 23 worker sandboxes, 4 render processes each, 92 render slots, one 2-CPU coordinator, two 1-CPU upload relays, 96 run CPUs, zero GPUs.
 - Renderer: `core/data/frame-recorder/replay_renderer.py`
@@ -63,6 +63,19 @@ Convert all 10,327 Falcon-versus-Fox Battlefield Slippi matches and commit them 
   diagnostics before teardown. Same-run reconciliation uses Drive manifests as authority, retires
   committed files, preserves valid staged results and ready sources, and clears only stale scheduling
   markers. A failing render job is deferred while its slot processes other jobs before a final failure.
+- At 20:52:55Z, same-run reconciliation restarted from 606 Drive-backed references, preserved 48
+  genuinely uncommitted rendered results and 171 ready sources, removed zero invalid artifacts, and
+  retired 111 old done markers plus the stale failure and upload job. All 23 workers and both upload
+  relays were live again by 20:54Z.
+- At 20:55:53Z, the first recovered 16-match batch committed archive-first and manifest-last. Its
+  930,623,291-byte archive uploaded on the first attempt at 38.382 MiB/s. The next recovered batch
+  uploaded at 34.259 MiB/s, again on its first attempt. Periodic shared-volume logs for the coordinator
+  and both relays are present and readable.
+- At 21:03:06Z, coordinator state was 658 uploaded, 9,669 remaining, 60 assigned to the three upload
+  lanes, and zero fatal failures. The shared root had 64 result markers, leaving only about four
+  unassigned results rather than an upload stockpile. Four different jobs recorded recoverable first-
+  attempt Dolphin dump diagnostics; their disk measurements ruled out worker disk exhaustion, and
+  those retries no longer stop unrelated render slots or uploads.
 
 At 2026-07-14T11:13:09Z, immediately before the replacement launch:
 
