@@ -53,6 +53,7 @@ UPLOAD_CHUNK_SIZE = "64M"
 UPLOAD_IDLE_TIMEOUT = "10m"
 STATE_MISS_LIMIT = 6
 HEALTH_MISS_LIMIT = 2
+COORDINATOR_INIT_TIMEOUT = 1800
 
 
 def _event(event: str, **fields: object) -> None:
@@ -539,7 +540,7 @@ class DaytonaConnector:
             self._snapshots()
             self._prepare_assets()
             coordinator = self._coordinator(sample_limit)
-            deadline = time.monotonic() + 900
+            deadline = time.monotonic() + COORDINATOR_INIT_TIMEOUT
             state = None
             while time.monotonic() < deadline:
                 with contextlib.suppress(Exception):
