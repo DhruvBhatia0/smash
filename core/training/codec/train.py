@@ -25,15 +25,20 @@ from .data import TarZstdClipDataset, committed_archives, split_archives
 class TrainConfig:
     data_dir: Path
     checkpoint_dir: Path = Path("checkpoints/codec")
-    steps: int = 250_000
-    save_every: int = 5_000
-    log_every: int = 10
+    steps: int = 250_001
+    save_every: int = 12_500
+    eval_every: int = 5_000
+    log_every: int = 2_500
     batch_size: int = 4
     workers: int = 6
     learning_rate: float = 1e-4
+    warmup_steps: int = 1_000
+    min_learning_rate: float = 1e-6
+    model_ema_decay: float = 0.9999
+    latent_ema_decay: float = 0.99
     train_fraction: float = 0.9
     split_seed: int = 28
-    eval_batches: int = 32
+    eval_samples: int = 1_024
     frames: int = 40
     height: int = 208
     width: int = 252
@@ -54,13 +59,24 @@ class TrainConfig:
         parser.add_argument("--checkpoint-dir", type=Path, default=cls.checkpoint_dir)
         parser.add_argument("--steps", type=int, default=cls.steps)
         parser.add_argument("--save-every", type=int, default=cls.save_every)
+        parser.add_argument("--eval-every", type=int, default=cls.eval_every)
         parser.add_argument("--log-every", type=int, default=cls.log_every)
         parser.add_argument("--batch-size", type=int, default=cls.batch_size)
         parser.add_argument("--workers", type=int, default=cls.workers)
         parser.add_argument("--learning-rate", type=float, default=cls.learning_rate)
+        parser.add_argument("--warmup-steps", type=int, default=cls.warmup_steps)
+        parser.add_argument(
+            "--min-learning-rate", type=float, default=cls.min_learning_rate
+        )
+        parser.add_argument(
+            "--model-ema-decay", type=float, default=cls.model_ema_decay
+        )
+        parser.add_argument(
+            "--latent-ema-decay", type=float, default=cls.latent_ema_decay
+        )
         parser.add_argument("--train-fraction", type=float, default=cls.train_fraction)
         parser.add_argument("--split-seed", type=int, default=cls.split_seed)
-        parser.add_argument("--eval-batches", type=int, default=cls.eval_batches)
+        parser.add_argument("--eval-samples", type=int, default=cls.eval_samples)
         parser.add_argument("--prefetch-factor", type=int, default=cls.prefetch_factor)
         parser.add_argument("--spool-mb", type=int, default=cls.spool_mb)
         parser.add_argument("--decoder-threads", type=int, default=cls.decoder_threads)
@@ -78,16 +94,39 @@ class TrainConfig:
             default=cls.wandb_mode,
         )
         arguments = parser.parse_args()
-        if arguments.batch_size < 1:
-            parser.error("--batch-size must be positive")
-        if arguments.workers < 0 or arguments.loader_benchmark_batches < 0:
-            parser.error("--workers and --loader-benchmark-batches cannot be negative")
+        if (
+            min(
+                arguments.steps,
+                arguments.save_every,
+                arguments.eval_every,
+                arguments.log_every,
+                arguments.batch_size,
+                arguments.eval_samples,
+            )
+            < 1
+        ):
+            parser.error(
+                "steps, intervals, batch size, and evaluation samples must be positive"
+            )
+        if (
+            arguments.workers < 0
+            or arguments.loader_benchmark_batches < 0
+            or arguments.warmup_steps < 0
+        ):
+            parser.error(
+                "workers, benchmark batches, and warmup steps cannot be negative"
+            )
         if (
             arguments.prefetch_factor < 1
             or arguments.spool_mb < 1
             or arguments.decoder_threads < 1
         ):
             parser.error("prefetch, spool size, and decoder threads must be positive")
+        if (
+            not 0 <= arguments.model_ema_decay < 1
+            or not 0 <= arguments.latent_ema_decay < 1
+        ):
+            parser.error("EMA decay values must be in [0, 1)")
         return cls(**vars(arguments))
 
 
@@ -98,6 +137,8 @@ class CodecTrainer:
 
     def __init__(self, config: TrainConfig):
         from .codec import Codec, CodecDecoder
+        from .loss import ReconstructionLoss
+        from .optimization import ModelEMA, ScalarEMA, WarmupCosineLR
 
         self.config = config
         self.rank = int(os.environ.get("RANK", 0))
@@ -139,10 +180,19 @@ class CodecTrainer:
         self.optimizer = torch.optim.AdamW(
             parameters, lr=config.learning_rate, betas=(0.9, 0.95), weight_decay=0.1
         )
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=config.steps, eta_min=1e-6
+        self.scheduler = WarmupCosineLR(
+            self.optimizer,
+            warmup_steps=config.warmup_steps,
+            decay_steps=max(0, config.steps - config.warmup_steps - 1),
+            min_lr=config.min_learning_rate,
         )
-        self.loss = nn.L1Loss()
+        self.loss = ReconstructionLoss(
+            dino=self.raw_model.encoder.dinov3,
+            last_layer=self.raw_model.decoder.last_layer_weight,
+        ).to(self.device)
+        self.model_ema = ModelEMA(self.raw_model, decay=config.model_ema_decay)
+        self.latent_mean = ScalarEMA(config.latent_ema_decay)
+        self.latent_std = ScalarEMA(config.latent_ema_decay, initial_value=1.0)
         self.mean = torch.tensor(self.DINO_MEAN, device=self.device).view(1, 1, 3, 1, 1)
         self.std = torch.tensor(self.DINO_STD, device=self.device).view(1, 1, 3, 1, 1)
         self.wandb: Any | None = None
@@ -170,7 +220,9 @@ class CodecTrainer:
             return torch.autocast("cuda", dtype=torch.bfloat16)
         return nullcontext()
 
-    def _reconstruct(self, video: Tensor) -> tuple[Tensor, Tensor]:
+    def _reconstruct(
+        self, video: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, tuple[Tensor, ...]]:
         target = video.mul(2).sub(1)
         model_input = (video - self.mean) / self.std
         alignment = 2 * self.raw_model.decoder.patch_size
@@ -179,73 +231,123 @@ class CodecTrainer:
         model_input = F.pad(
             model_input, (0, pad_width, 0, pad_height, 0, 0), mode="replicate"
         )
-        prediction = self.model(model_input)[..., : video.shape[-2], : video.shape[-1]]
-        return prediction, target
+        output = self.model(model_input, return_dino_features=True)
+        assert isinstance(output, tuple)
+        padded_prediction, latent, dino_features = output
+        prediction = padded_prediction[..., : video.shape[-2], : video.shape[-1]]
+        return prediction, target, padded_prediction, latent, dino_features
 
-    def _train_step(self, video: Tensor) -> Tensor:
+    def _train_step(self, video: Tensor) -> dict[str, Tensor]:
         video = video.to(self.device, non_blocking=True).float().div_(255)
         self.optimizer.zero_grad(set_to_none=True)
         with self._autocast():
-            prediction, target = self._reconstruct(video)
-            loss = self.loss(prediction, target)
-        loss.backward()
+            prediction, target, dino_prediction, latent, dino_features = (
+                self._reconstruct(video)
+            )
+            losses = self.loss(
+                prediction,
+                target,
+                dino_prediction=dino_prediction,
+                target_dino_features=dino_features,
+            )
+        losses["loss_total"].backward()
         self.optimizer.step()
         self.scheduler.step()
-        return loss.detach()
+        self.model_ema.step()
+        self.latent_mean.update(latent)
+        self.latent_std.update(latent.float().std(keepdim=True))
+        return {name: value.detach() for name, value in losses.items()}
 
     @torch.inference_mode()
-    def _evaluate(self) -> tuple[float, tuple[Tensor, Tensor]]:
+    def _evaluate(self) -> tuple[dict[str, float], tuple[Tensor, Tensor]]:
         self.model.eval()
-        totals = torch.zeros(2, device=self.device)
+        totals: dict[str, Tensor] = {}
+        samples = torch.zeros((), device=self.device)
         sample: tuple[Tensor, Tensor] | None = None
+        eval_batches = max(
+            1,
+            self.config.eval_samples // (self.config.batch_size * self.world_size),
+        )
         for batch, video in enumerate(self.eval_loader):
-            if batch == self.config.eval_batches:
+            if batch == eval_batches:
                 break
             video = video.to(self.device, non_blocking=True).float().div_(255)
             with self._autocast():
-                prediction, target = self._reconstruct(video)
-            totals[0] += nn.functional.l1_loss(
-                prediction.float(), target, reduction="sum"
-            )
-            totals[1] += target.numel()
-            sample = sample or (prediction[0].float().cpu(), target[0].cpu())
+                prediction, target, dino_prediction, _, dino_features = (
+                    self._reconstruct(video)
+                )
+                losses = self.loss(
+                    prediction,
+                    target,
+                    dino_prediction=dino_prediction,
+                    target_dino_features=dino_features,
+                )
+            for name, value in losses.items():
+                totals[name] = totals.get(name, torch.zeros_like(value)) + value * len(
+                    video
+                )
+            samples += len(video)
+            if sample is None:
+                sample = (prediction[0].float().cpu(), target[0].cpu())
         if self.distributed:
-            dist.all_reduce(totals)
+            for value in (*totals.values(), samples):
+                dist.all_reduce(value)
         self.model.train()
         self.raw_model.encoder.dinov3.eval()
         assert sample is not None
-        return (totals[0] / totals[1]).item(), sample
+        return (
+            {name: (value / samples).item() for name, value in totals.items()},
+            sample,
+        )
 
-    def _save_and_log(self, step: int) -> None:
-        eval_loss, (prediction, target) = self._evaluate()
-        if not self.rank:
-            self.config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            checkpoint_path = self.config.checkpoint_dir / f"step-{step:07d}.pt"
-            torch.save(
-                {
-                    "step": step,
-                    "model": self.raw_model.state_dict(),
-                    "optimizer": self.optimizer.state_dict(),
-                    "scheduler": self.scheduler.state_dict(),
-                    "config": asdict(self.config),
-                },
-                checkpoint_path,
-            )
-            comparison = torch.cat((target, prediction), dim=-1).add(1).div(2)
-            comparison = comparison.clamp(0, 1).mul(255).byte()
-            video_path = checkpoint_path.with_suffix(".mp4")
-            self._write_video(comparison, video_path)
-            if self.wandb:
-                self.wandb.log(
+    def _evaluate_and_log(self, step: int) -> None:
+        with self.model_ema.average_parameters():
+            eval_losses, (prediction, target) = self._evaluate()
+            if not self.rank:
+                self.config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                comparison = torch.cat((target, prediction), dim=-1).add(1).div(2)
+                comparison = comparison.clamp(0, 1).mul(255).byte()
+                video_path = self.config.checkpoint_dir / f"eval-step-{step:07d}.mp4"
+                self._write_video(comparison, video_path)
+                if self.wandb:
+                    self.wandb.log(
+                        {
+                            **{
+                                f"eval/{name}": value
+                                for name, value in eval_losses.items()
+                            },
+                            "eval/reconstruction": self.wandb.Video(
+                                str(video_path),
+                                format="mp4",
+                                caption="target | reconstruction",
+                            ),
+                        },
+                        step=step,
+                    )
+        if self.distributed:
+            dist.barrier()
+
+    def _save(self, step: int) -> None:
+        self.latent_mean.synchronize(self.device)
+        self.latent_std.synchronize(self.device)
+        with self.model_ema.average_parameters():
+            if not self.rank:
+                self.config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                checkpoint_path = self.config.checkpoint_dir / f"step-{step:07d}.pt"
+                torch.save(
                     {
-                        "eval/loss": eval_loss,
-                        "eval/reconstruction": self.wandb.Video(
-                            str(video_path),
-                            format="mp4",
-                            caption="target | reconstruction",
-                        ),
+                        "step": step,
+                        # Downstream consumers get MIRA's EMA weights.
+                        "model": self.raw_model.state_dict(),
+                        "optimizer": self.optimizer.state_dict(),
+                        "scheduler": self.scheduler.state_dict(),
+                        "config": asdict(self.config),
+                        "latent_mean_std": [
+                            self.latent_mean.value,
+                            self.latent_std.value,
+                        ],
                     },
-                    step=step,
+                    checkpoint_path,
                 )
         if self.distributed:
             dist.barrier()
@@ -267,23 +369,38 @@ class CodecTrainer:
         self.raw_model.encoder.dinov3.eval()
         step = 0
         try:
+            self._evaluate_and_log(step)
             for video in self.train_loader:
                 step += 1
-                train_loss = self._train_step(video)
-                if step % self.config.log_every == 0:
+                train_losses = self._train_step(video)
+                if (
+                    step <= 10
+                    or step % self.config.log_every == 0
+                    or step == self.config.steps
+                ):
                     if self.distributed:
-                        dist.all_reduce(train_loss)
-                        train_loss /= self.world_size
+                        for value in train_losses.values():
+                            dist.all_reduce(value)
+                            value /= self.world_size
+                    self.latent_mean.synchronize(self.device)
+                    self.latent_std.synchronize(self.device)
                     if self.wandb:
                         self.wandb.log(
                             {
-                                "train/loss": train_loss.item(),
+                                **{
+                                    f"train/{name}": value.item()
+                                    for name, value in train_losses.items()
+                                },
                                 "train/learning_rate": self.scheduler.get_last_lr()[0],
+                                "train/latent_mean": self.latent_mean.value,
+                                "train/latent_std": self.latent_std.value,
                             },
                             step=step,
                         )
+                if step % self.config.eval_every == 0 or step == self.config.steps:
+                    self._evaluate_and_log(step)
                 if step % self.config.save_every == 0 or step == self.config.steps:
-                    self._save_and_log(step)
+                    self._save(step)
                 if step == self.config.steps:
                     return
         finally:
