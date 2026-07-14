@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
+import queue
+import threading
 import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import av
 import torch
@@ -25,10 +28,9 @@ from .data import TarZstdClipDataset, committed_archives, split_archives
 class TrainConfig:
     data_dir: Path
     checkpoint_dir: Path = Path("checkpoints/codec")
-    steps: int = 250_001
-    save_every: int = 12_500
-    eval_every: int = 5_000
-    log_every: int = 2_500
+    epochs: int = 7
+    steps: int | None = None
+    log_every: int = 100
     batch_size: int = 4
     workers: int = 6
     learning_rate: float = 1e-4
@@ -36,14 +38,17 @@ class TrainConfig:
     min_learning_rate: float = 1e-6
     model_ema_decay: float = 0.9999
     latent_ema_decay: float = 0.99
-    train_fraction: float = 0.9
+    train_fraction: float = 0.95
     split_seed: int = 28
     eval_samples: int = 1_024
     frames: int = 40
+    stride_frames: int = 10
     height: int = 208
     width: int = 252
     fps: int = 20
-    prefetch_factor: int = 1
+    prefetch_factor: int = 4
+    video_prefetch: int = 4
+    batch_prefetch: int = 4
     spool_mb: int = 64
     decoder_threads: int = 1
     loader_benchmark_batches: int = 0
@@ -51,15 +56,20 @@ class TrainConfig:
     wandb_project: str = "smash-codec"
     wandb_name: str | None = None
     wandb_mode: str = "online"
+    hf_repo: str | None = None
+    hf_private: bool = True
 
     @classmethod
     def from_cli(cls) -> TrainConfig:
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("data_dir", type=Path)
         parser.add_argument("--checkpoint-dir", type=Path, default=cls.checkpoint_dir)
-        parser.add_argument("--steps", type=int, default=cls.steps)
-        parser.add_argument("--save-every", type=int, default=cls.save_every)
-        parser.add_argument("--eval-every", type=int, default=cls.eval_every)
+        parser.add_argument("--epochs", type=int, default=cls.epochs)
+        parser.add_argument(
+            "--steps",
+            type=int,
+            help="Override the epoch-derived step count (intended for smoke tests)",
+        )
         parser.add_argument("--log-every", type=int, default=cls.log_every)
         parser.add_argument("--batch-size", type=int, default=cls.batch_size)
         parser.add_argument("--workers", type=int, default=cls.workers)
@@ -77,7 +87,10 @@ class TrainConfig:
         parser.add_argument("--train-fraction", type=float, default=cls.train_fraction)
         parser.add_argument("--split-seed", type=int, default=cls.split_seed)
         parser.add_argument("--eval-samples", type=int, default=cls.eval_samples)
+        parser.add_argument("--stride-frames", type=int, default=cls.stride_frames)
         parser.add_argument("--prefetch-factor", type=int, default=cls.prefetch_factor)
+        parser.add_argument("--video-prefetch", type=int, default=cls.video_prefetch)
+        parser.add_argument("--batch-prefetch", type=int, default=cls.batch_prefetch)
         parser.add_argument("--spool-mb", type=int, default=cls.spool_mb)
         parser.add_argument("--decoder-threads", type=int, default=cls.decoder_threads)
         parser.add_argument(
@@ -93,21 +106,27 @@ class TrainConfig:
             choices=("online", "offline", "disabled"),
             default=cls.wandb_mode,
         )
+        parser.add_argument("--hf-repo")
+        parser.add_argument(
+            "--hf-private",
+            action=argparse.BooleanOptionalAction,
+            default=cls.hf_private,
+        )
         arguments = parser.parse_args()
-        if (
-            min(
-                arguments.steps,
-                arguments.save_every,
-                arguments.eval_every,
-                arguments.log_every,
-                arguments.batch_size,
-                arguments.eval_samples,
-            )
-            < 1
-        ):
-            parser.error(
-                "steps, intervals, batch size, and evaluation samples must be positive"
-            )
+        positive = (
+            arguments.epochs,
+            arguments.log_every,
+            arguments.batch_size,
+            arguments.eval_samples,
+            arguments.stride_frames,
+            arguments.prefetch_factor,
+            arguments.video_prefetch,
+            arguments.batch_prefetch,
+            arguments.spool_mb,
+            arguments.decoder_threads,
+        )
+        if min(positive) < 1 or (arguments.steps is not None and arguments.steps < 1):
+            parser.error("epochs, steps, sizes, and prefetch values must be positive")
         if (
             arguments.workers < 0
             or arguments.loader_benchmark_batches < 0
@@ -116,12 +135,8 @@ class TrainConfig:
             parser.error(
                 "workers, benchmark batches, and warmup steps cannot be negative"
             )
-        if (
-            arguments.prefetch_factor < 1
-            or arguments.spool_mb < 1
-            or arguments.decoder_threads < 1
-        ):
-            parser.error("prefetch, spool size, and decoder threads must be positive")
+        if not 0 < arguments.train_fraction < 1:
+            parser.error("train fraction must be strictly between zero and one")
         if (
             not 0 <= arguments.model_ema_decay < 1
             or not 0 <= arguments.latent_ema_decay < 1
@@ -156,9 +171,10 @@ class CodecTrainer:
 
         torch.manual_seed(28 + self.rank)
         torch.set_float32_matmul_precision("high")
-        self.train_loader, self.eval_loader = _loaders(
+        self.train_loader, self.eval_loader, self.steps_per_epoch = _loaders(
             config, rank=self.rank, world_size=self.world_size
         )
+        self.total_steps = config.steps or config.epochs * self.steps_per_epoch
 
         self.raw_model = Codec(
             desired_hidden_states=list(self.DINO_LAYERS),
@@ -183,7 +199,7 @@ class CodecTrainer:
         self.scheduler = WarmupCosineLR(
             self.optimizer,
             warmup_steps=config.warmup_steps,
-            decay_steps=max(0, config.steps - config.warmup_steps - 1),
+            decay_steps=max(0, self.total_steps - config.warmup_steps - 1),
             min_lr=config.min_learning_rate,
         )
         self.loss = ReconstructionLoss(
@@ -196,7 +212,10 @@ class CodecTrainer:
         self.mean = torch.tensor(self.DINO_MEAN, device=self.device).view(1, 1, 3, 1, 1)
         self.std = torch.tensor(self.DINO_STD, device=self.device).view(1, 1, 3, 1, 1)
         self.wandb: Any | None = None
+        self.hf_api: Any | None = None
+        self.hf_uploads: list[Any] = []
         self._start_wandb()
+        self._start_huggingface()
 
     def _start_wandb(self) -> None:
         if self.rank or self.config.wandb_mode == "disabled":
@@ -208,12 +227,28 @@ class CodecTrainer:
             for key, value in asdict(self.config).items()
         }
         self.wandb = wandb
-        wandb.init(
+        run = wandb.init(
             project=self.config.wandb_project,
             name=self.config.wandb_name,
             mode=self.config.wandb_mode,
             config=config,
         )
+        if run.url:
+            print(f"Weights & Biases: {run.url}", flush=True)
+
+    def _start_huggingface(self) -> None:
+        if self.rank or not self.config.hf_repo:
+            return
+        from huggingface_hub import HfApi
+
+        self.hf_api = HfApi()
+        repo = self.hf_api.create_repo(
+            repo_id=self.config.hf_repo,
+            repo_type="model",
+            private=self.config.hf_private,
+            exist_ok=True,
+        )
+        print(f"Hugging Face checkpoints: {repo}", flush=True)
 
     def _autocast(self):
         if self.device.type == "cuda":
@@ -221,7 +256,7 @@ class CodecTrainer:
         return nullcontext()
 
     def _reconstruct(
-        self, video: Tensor
+        self, video: Tensor, *, model: nn.Module | None = None
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, tuple[Tensor, ...]]:
         target = video.mul(2).sub(1)
         model_input = (video - self.mean) / self.std
@@ -231,7 +266,7 @@ class CodecTrainer:
         model_input = F.pad(
             model_input, (0, pad_width, 0, pad_height, 0, 0), mode="replicate"
         )
-        output = self.model(model_input, return_dino_features=True)
+        output = (model or self.model)(model_input, return_dino_features=True)
         assert isinstance(output, tuple)
         padded_prediction, latent, dino_features = output
         prediction = padded_prediction[..., : video.shape[-2], : video.shape[-1]]
@@ -260,21 +295,17 @@ class CodecTrainer:
 
     @torch.inference_mode()
     def _evaluate(self) -> tuple[dict[str, float], tuple[Tensor, Tensor]]:
-        self.model.eval()
+        if self.rank or self.eval_loader is None:
+            raise RuntimeError("Evaluation is owned by rank zero")
+        self.raw_model.eval()
         totals: dict[str, Tensor] = {}
-        samples = torch.zeros((), device=self.device)
+        samples = 0
         sample: tuple[Tensor, Tensor] | None = None
-        eval_batches = max(
-            1,
-            self.config.eval_samples // (self.config.batch_size * self.world_size),
-        )
-        for batch, video in enumerate(self.eval_loader):
-            if batch == eval_batches:
-                break
+        for video in self.eval_loader:
             video = video.to(self.device, non_blocking=True).float().div_(255)
             with self._autocast():
                 prediction, target, dino_prediction, _, dino_features = (
-                    self._reconstruct(video)
+                    self._reconstruct(video, model=self.raw_model)
                 )
                 losses = self.loss(
                     prediction,
@@ -289,21 +320,22 @@ class CodecTrainer:
             samples += len(video)
             if sample is None:
                 sample = (prediction[0].float().cpu(), target[0].cpu())
-        if self.distributed:
-            for value in (*totals.values(), samples):
-                dist.all_reduce(value)
-        self.model.train()
+            if samples >= self.config.eval_samples:
+                break
+        self.raw_model.train()
         self.raw_model.encoder.dinov3.eval()
-        assert sample is not None
+        assert sample is not None and samples
         return (
             {name: (value / samples).item() for name, value in totals.items()},
             sample,
         )
 
     def _evaluate_and_log(self, step: int) -> None:
-        with self.model_ema.average_parameters():
-            eval_losses, (prediction, target) = self._evaluate()
-            if not self.rank:
+        if self.distributed:
+            dist.barrier()
+        if not self.rank:
+            with self.model_ema.average_parameters():
+                eval_losses, (prediction, target) = self._evaluate()
                 self.config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
                 comparison = torch.cat((target, prediction), dim=-1).add(1).div(2)
                 comparison = comparison.clamp(0, 1).mul(255).byte()
@@ -330,13 +362,15 @@ class CodecTrainer:
     def _save(self, step: int) -> None:
         self.latent_mean.synchronize(self.device)
         self.latent_std.synchronize(self.device)
-        with self.model_ema.average_parameters():
-            if not self.rank:
+        if not self.rank:
+            with self.model_ema.average_parameters():
                 self.config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
                 checkpoint_path = self.config.checkpoint_dir / f"step-{step:07d}.pt"
                 torch.save(
                     {
                         "step": step,
+                        "epoch": math.ceil(step / self.steps_per_epoch),
+                        "steps_per_epoch": self.steps_per_epoch,
                         # Downstream consumers get MIRA's EMA weights.
                         "model": self.raw_model.state_dict(),
                         "optimizer": self.optimizer.state_dict(),
@@ -349,8 +383,27 @@ class CodecTrainer:
                     },
                     checkpoint_path,
                 )
+            self._upload_checkpoint(checkpoint_path)
         if self.distributed:
             dist.barrier()
+
+    def _upload_checkpoint(self, checkpoint_path: Path) -> None:
+        if self.hf_api is None or self.config.hf_repo is None:
+            return
+        future = self.hf_api.upload_file(
+            path_or_fileobj=checkpoint_path,
+            path_in_repo=f"checkpoints/{checkpoint_path.name}",
+            repo_id=self.config.hf_repo,
+            repo_type="model",
+            commit_message=f"Upload codec {checkpoint_path.stem}",
+            run_as_future=True,
+        )
+        self.hf_uploads.append(future)
+        print(f"Queued Hugging Face upload: {checkpoint_path.name}", flush=True)
+
+    def _finish_uploads(self) -> None:
+        for future in self.hf_uploads:
+            print(f"Hugging Face upload complete: {future.result()}", flush=True)
 
     def _write_video(self, video: Tensor, path: Path) -> None:
         frames = video.permute(0, 2, 3, 1).contiguous().numpy()
@@ -364,46 +417,121 @@ class CodecTrainer:
                 )
             container.mux(stream.encode())
 
+    def _log_train(
+        self,
+        step: int,
+        losses: dict[str, Tensor],
+        *,
+        data_wait_seconds: float,
+        maximum_data_wait_seconds: float,
+        measured_steps: int,
+        elapsed_seconds: float,
+    ) -> None:
+        if self.distributed:
+            for value in losses.values():
+                dist.all_reduce(value)
+                value /= self.world_size
+        wait_total = torch.tensor(
+            data_wait_seconds, dtype=torch.float64, device=self.device
+        )
+        wait_max = torch.tensor(
+            maximum_data_wait_seconds, dtype=torch.float64, device=self.device
+        )
+        measured = torch.tensor(measured_steps, dtype=torch.float64, device=self.device)
+        elapsed = torch.tensor(elapsed_seconds, dtype=torch.float64, device=self.device)
+        if self.distributed:
+            dist.all_reduce(wait_total)
+            dist.all_reduce(measured)
+            dist.all_reduce(wait_max, op=dist.ReduceOp.MAX)
+            dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+        self.latent_mean.synchronize(self.device)
+        self.latent_std.synchronize(self.device)
+        mean_wait_ms = (wait_total / measured).item() * 1_000
+        maximum_wait_ms = wait_max.item() * 1_000
+        throughput = (
+            measured_steps * self.config.batch_size / elapsed_seconds
+            if not self.distributed
+            else measured * self.config.batch_size / elapsed
+        )
+        throughput_value = (
+            throughput if isinstance(throughput, float) else throughput.item()
+        )
+        if not self.rank:
+            epoch = step / self.steps_per_epoch
+            print(
+                f"step={step}/{self.total_steps} epoch={epoch:.4f} "
+                f"loss={losses['loss_total'].item():.5f} "
+                f"data_wait_mean_ms={mean_wait_ms:.2f} "
+                f"data_wait_max_ms={maximum_wait_ms:.2f} "
+                f"clips_per_second={throughput_value:.2f}",
+                flush=True,
+            )
+            if self.wandb:
+                self.wandb.log(
+                    {
+                        **{
+                            f"train/{name}": value.item()
+                            for name, value in losses.items()
+                        },
+                        "train/learning_rate": self.scheduler.get_last_lr()[0],
+                        "train/latent_mean": self.latent_mean.value,
+                        "train/latent_std": self.latent_std.value,
+                        "performance/data_wait_mean_ms": mean_wait_ms,
+                        "performance/data_wait_max_ms": maximum_wait_ms,
+                        "performance/clips_per_second": throughput_value,
+                        "progress/epoch": epoch,
+                    },
+                    step=step,
+                )
+
     def run(self) -> None:
         self.model.train()
         self.raw_model.encoder.dinov3.eval()
         step = 0
+        wait_total = 0.0
+        wait_max = 0.0
+        measured_steps = 0
+        interval_started = time.monotonic()
+        iterator = iter(self.train_loader)
         try:
-            self._evaluate_and_log(step)
-            for video in self.train_loader:
+            while step < self.total_steps:
+                wait_started = time.monotonic()
+                video = next(iterator)
+                data_wait = time.monotonic() - wait_started
+                wait_total += data_wait
+                wait_max = max(wait_max, data_wait)
+                measured_steps += 1
+
                 step += 1
                 train_losses = self._train_step(video)
-                if (
+                should_log = (
                     step <= 10
                     or step % self.config.log_every == 0
-                    or step == self.config.steps
-                ):
-                    if self.distributed:
-                        for value in train_losses.values():
-                            dist.all_reduce(value)
-                            value /= self.world_size
-                    self.latent_mean.synchronize(self.device)
-                    self.latent_std.synchronize(self.device)
-                    if self.wandb:
-                        self.wandb.log(
-                            {
-                                **{
-                                    f"train/{name}": value.item()
-                                    for name, value in train_losses.items()
-                                },
-                                "train/learning_rate": self.scheduler.get_last_lr()[0],
-                                "train/latent_mean": self.latent_mean.value,
-                                "train/latent_std": self.latent_std.value,
-                            },
-                            step=step,
-                        )
-                if step % self.config.eval_every == 0 or step == self.config.steps:
+                    or step == self.total_steps
+                )
+                if should_log:
+                    now = time.monotonic()
+                    self._log_train(
+                        step,
+                        train_losses,
+                        data_wait_seconds=wait_total,
+                        maximum_data_wait_seconds=wait_max,
+                        measured_steps=measured_steps,
+                        elapsed_seconds=now - interval_started,
+                    )
+                    wait_total = 0.0
+                    wait_max = 0.0
+                    measured_steps = 0
+                    interval_started = now
+
+                epoch_finished = step % self.steps_per_epoch == 0
+                training_finished = step == self.total_steps
+                if epoch_finished or training_finished:
                     self._evaluate_and_log(step)
-                if step % self.config.save_every == 0 or step == self.config.steps:
                     self._save(step)
-                if step == self.config.steps:
-                    return
         finally:
+            if not self.rank:
+                self._finish_uploads()
             if self.wandb:
                 self.wandb.finish()
             if self.distributed:
@@ -412,39 +540,81 @@ class CodecTrainer:
 
 def _loaders(
     config: TrainConfig, *, rank: int, world_size: int
-) -> tuple[_BatchLoader, _BatchLoader]:
+) -> tuple[_BatchLoader, _BatchLoader | None, int]:
     if dist.is_initialized():
-        payload = [committed_archives(config.data_dir) if not rank else None]
+        payload = [
+            committed_archives(
+                config.data_dir,
+                frames=config.frames,
+                stride_frames=config.stride_frames,
+                require_index=True,
+            )
+            if not rank
+            else None
+        ]
         dist.broadcast_object_list(payload, src=0)
         archives = payload[0]
         assert archives is not None
     else:
-        archives = committed_archives(config.data_dir)
+        archives = committed_archives(
+            config.data_dir,
+            frames=config.frames,
+            stride_frames=config.stride_frames,
+            require_index=True,
+        )
     train_archives, eval_archives = split_archives(
-        archives, config.train_fraction, config.split_seed, minimum=world_size
+        archives, config.train_fraction, config.split_seed
     )
-    common = {
-        "frames": config.frames,
-        "fps": config.fps,
-        "size": (config.height, config.width),
-        "rank": rank,
-        "world_size": world_size,
-        "seed": config.split_seed,
-        "spool_bytes": config.spool_mb * 1024**2,
-        "decoder_threads": config.decoder_threads,
-    }
-    train_dataset = TarZstdClipDataset(train_archives, training=True, **common)
-    eval_dataset = TarZstdClipDataset(eval_archives, training=False, **common)
+    train_clips = sum(archive.clips or 0 for archive in train_archives)
+    eval_clips = sum(archive.clips or 0 for archive in eval_archives)
+    global_batch = config.batch_size * world_size
+    steps_per_epoch = train_clips // global_batch
+    if steps_per_epoch < 1:
+        raise ValueError(
+            f"Only {train_clips} train clips for global batch {global_batch}"
+        )
+
+    train_dataset = TarZstdClipDataset(
+        train_archives,
+        frames=config.frames,
+        stride_frames=config.stride_frames,
+        fps=config.fps,
+        size=(config.height, config.width),
+        training=True,
+        rank=rank,
+        world_size=world_size,
+        seed=config.split_seed,
+        spool_bytes=config.spool_mb * 1024**2,
+        decoder_threads=config.decoder_threads,
+        video_prefetch=config.video_prefetch,
+    )
+    eval_loader = None
     if not rank:
+        eval_dataset = TarZstdClipDataset(
+            eval_archives,
+            frames=config.frames,
+            stride_frames=config.stride_frames,
+            fps=config.fps,
+            size=(config.height, config.width),
+            training=False,
+            seed=config.split_seed,
+            spool_bytes=config.spool_mb * 1024**2,
+            decoder_threads=config.decoder_threads,
+            video_prefetch=config.video_prefetch,
+        )
+        eval_loader = _data_loader(config, eval_dataset, training=False)
         print(
-            f"{len(train_archives)} train archives / "
-            f"{sum(item.samples for item in train_archives):,} manifest rows; "
-            f"{len(eval_archives)} eval archives / "
-            f"{sum(item.samples for item in eval_archives):,} manifest rows"
+            f"{len(train_archives)} train archives / {train_clips:,} clips; "
+            f"{len(eval_archives)} eval archives / {eval_clips:,} clips; "
+            f"{steps_per_epoch:,} steps/epoch at global batch {global_batch}; "
+            f"clips are {config.frames / config.fps:g}s with "
+            f"{config.stride_frames / config.fps:g}s stride",
+            flush=True,
         )
     return (
         _data_loader(config, train_dataset, training=True),
-        _data_loader(config, eval_dataset, training=False),
+        eval_loader,
+        steps_per_epoch,
     )
 
 
@@ -470,11 +640,20 @@ def _data_loader(
         batch_size=config.batch_size,
         drop_last=training,
         pin_memory=torch.cuda.is_available(),
+        batches_ahead=config.batch_prefetch,
     )
 
 
+@dataclass(frozen=True)
+class _LoaderFailure:
+    error: BaseException
+
+
+_LOADER_END = object()
+
+
 class _BatchLoader:
-    """Collate in the parent process to avoid large worker shared-memory batches."""
+    """Collate in the rank process and keep complete pinned batches ahead of the GPU."""
 
     def __init__(
         self,
@@ -483,15 +662,64 @@ class _BatchLoader:
         batch_size: int,
         drop_last: bool,
         pin_memory: bool,
+        batches_ahead: int,
     ) -> None:
         self.samples = samples
         self.batch_size = batch_size
         self.drop_last = drop_last
         self.pin_memory = pin_memory
+        self.batches_ahead = batches_ahead
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[Tensor]:
+        sample_iterator = iter(self.samples)
+        if self.batches_ahead == 1:
+            yield from self._batches(sample_iterator)
+            return
+
+        ready: queue.Queue[Tensor | _LoaderFailure | object] = queue.Queue(
+            maxsize=self.batches_ahead
+        )
+        stop = threading.Event()
+
+        def put(item: Tensor | _LoaderFailure | object) -> bool:
+            while not stop.is_set():
+                try:
+                    ready.put(item, timeout=0.1)
+                    return True
+                except queue.Full:
+                    pass
+            return False
+
+        def produce() -> None:
+            try:
+                for batch in self._batches(sample_iterator):
+                    if not put(batch):
+                        return
+            except BaseException as error:
+                put(_LoaderFailure(error))
+            finally:
+                put(_LOADER_END)
+
+        producer = threading.Thread(
+            target=produce, name="codec-batch-producer", daemon=True
+        )
+        producer.start()
+        try:
+            while True:
+                item = ready.get()
+                if item is _LOADER_END:
+                    return
+                if isinstance(item, _LoaderFailure):
+                    raise item.error
+                assert isinstance(item, Tensor)
+                yield item
+        finally:
+            stop.set()
+            producer.join(timeout=5)
+
+    def _batches(self, samples: Iterator[Tensor]) -> Iterator[Tensor]:
         batch: list[Tensor] = []
-        for sample in self.samples:
+        for sample in samples:
             batch.append(sample)
             if len(batch) == self.batch_size:
                 yield self._stack(batch)
@@ -515,12 +743,14 @@ def _benchmark_loader(config: TrainConfig) -> None:
     dataset = TarZstdClipDataset(
         archives,
         frames=config.frames,
+        stride_frames=config.stride_frames,
         fps=config.fps,
         size=(config.height, config.width),
         training=True,
         seed=config.split_seed,
         spool_bytes=config.spool_mb * 1024**2,
         decoder_threads=config.decoder_threads,
+        video_prefetch=config.video_prefetch,
     )
     train_loader = _data_loader(config, dataset, training=True)
     print(
