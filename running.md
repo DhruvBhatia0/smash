@@ -1,6 +1,6 @@
 # Native Battlefield conversion runbook
 
-Last updated: 2026-07-14T20:05:31Z
+Last updated: 2026-07-14T20:47:06Z
 
 ## Goal and non-negotiable output contract
 
@@ -49,6 +49,20 @@ Convert all 10,327 Falcon-versus-Fox Battlefield Slippi matches and commit them 
   rates of 28.690 and 29.073 MiB/s. A fresh local Drive audit found 20 matching nonempty
   archive/manifest pairs, 513 manifest rows, 513 unique source references, zero duplicates, and zero
   unpaired objects. The third startup lane remains in flight and the fleet has zero failures.
+- Uploading continued normally through 20:13Z. At 20:14:45Z, worker 13 slot 1 stopped the fleet after
+  three attempts at job 237 reached a replay chunk boundary but produced no video dump. This was a
+  renderer failure, not a Drive/GCP sync failure. The supervisor deleted the paid fleet and preserved
+  the complete 3.2 GiB shared run root as designed.
+- The post-failure audit found 26 matching nonempty Drive archive/manifest pairs, 606 manifest rows,
+  606 unique source references, zero duplicates, and zero unpaired objects. The stopped root contains
+  111 completed cleanup records, exactly matching the 111 new Drive commits, plus 97 complete
+  uncommitted results and 219 prefetched sources. The result backlog is recoverable and was not large
+  enough to indicate the previous Google API quota bottleneck.
+- Recovery now snapshots coordinator and uploader logs to the shared volume every two minutes and
+  copies all coordinator, worker, uploader, process-list, state, supervisor, and per-render-attempt
+  diagnostics before teardown. Same-run reconciliation uses Drive manifests as authority, retires
+  committed files, preserves valid staged results and ready sources, and clears only stale scheduling
+  markers. A failing render job is deferred while its slot processes other jobs before a final failure.
 
 At 2026-07-14T11:13:09Z, immediately before the replacement launch:
 

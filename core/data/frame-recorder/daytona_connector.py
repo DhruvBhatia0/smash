@@ -24,6 +24,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import traceback
 import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
@@ -142,6 +143,33 @@ def _published_json(path: Path) -> dict | None:
         return value if isinstance(value, dict) else None
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def _matching_shared_marker(marker: Path, job: dict, path_key: str, size_key: str) -> dict | None:
+    """Return a marker only when its referenced shared object is fully visible."""
+    row = _published_json(marker)
+    if not row or row.get("id") != job["id"] or row.get("reference") != job["reference"]:
+        return None
+    try:
+        path = Path(str(row[path_key]))
+        expected = int(row[size_key])
+        if expected <= 0 or path.stat().st_size != expected:
+            return None
+    except (KeyError, OSError, TypeError, ValueError):
+        return None
+    return row
+
+
+def _matching_result(marker: Path, job: dict) -> dict | None:
+    row = _matching_shared_marker(marker, job, "resultPath", "resultBytes")
+    if not row:
+        return None
+    try:
+        if Path(str(row["sourcePath"])).stat().st_size != int(row["sourceBytes"]):
+            return None
+    except (KeyError, OSError, TypeError, ValueError):
+        return None
+    return row
 
 
 def _remote(name: str, path: str) -> str:
@@ -345,7 +373,16 @@ class DaytonaConnector:
                    "--config", "/home/daytona/.config/rclone/rclone.conf", "--sample-limit", str(sample_limit),
                    "--state", "/home/daytona/smash-coordinator/state.json"]
         shell = shlex.join(command)
-        self._exec(sandbox, ["bash", "-lc", f"mkdir -p /home/daytona/smash-coordinator; nohup {shell} >/home/daytona/smash-coordinator/run.log 2>&1 & echo $! >/home/daytona/smash-coordinator/run.pid"], timeout=30)
+        local_log = "/home/daytona/smash-coordinator/run.log"
+        shared_log = f"{self.root}/diagnostics/logs/{sandbox.name}.log"
+        wrapper = (
+            f"mkdir -p /home/daytona/smash-coordinator {shlex.quote(str(Path(shared_log).parent))}; "
+            f": >{shlex.quote(local_log)}; {shell} >{shlex.quote(local_log)} 2>&1; status=$?; "
+            f"cp -- {shlex.quote(local_log)} {shlex.quote(shared_log)} 2>/dev/null || true; exit $status"
+        )
+        self._exec(sandbox, ["bash", "-lc",
+                             f"nohup bash -lc {shlex.quote(wrapper)} >/dev/null 2>&1 & "
+                             "echo $! >/home/daytona/smash-coordinator/run.pid"], timeout=30)
         return sandbox
 
     def _install_rclone(self, sandbox: Sandbox) -> None:
@@ -365,6 +402,58 @@ class DaytonaConnector:
         except json.JSONDecodeError:
             return None
 
+    def _snapshot_logs(self, rows: list[tuple[Sandbox, str]], *, processes: bool = False) -> list[str]:
+        """Copy local sandbox logs to the durable run root before a sandbox is removed."""
+        if not rows:
+            return []
+        errors: list[str] = []
+
+        def snapshot(sandbox: Sandbox, source: str) -> None:
+            log_root = f"{self.root}/diagnostics/logs"
+            destination = f"{log_root}/{sandbox.name}.log"
+            commands = [
+                f"mkdir -p {shlex.quote(log_root)}",
+                f"if test -f {shlex.quote(source)}; then cp -- {shlex.quote(source)} {shlex.quote(destination)}; fi",
+            ]
+            if processes:
+                process_log = f"/tmp/{sandbox.name}.processes.txt"
+                process_destination = f"{log_root}/{sandbox.name}.processes.txt"
+                commands += [f"ps auxww >{shlex.quote(process_log)}",
+                             f"cp -- {shlex.quote(process_log)} {shlex.quote(process_destination)}"]
+            result = self._exec(sandbox, ["bash", "-lc", "; ".join(commands)], timeout=120, check=False)
+            if result.returncode:
+                raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "log snapshot failed")
+
+        with ThreadPoolExecutor(max_workers=min(8, len(rows))) as pool:
+            futures = {pool.submit(snapshot, sandbox, source): sandbox.name for sandbox, source in rows}
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as error:
+                    errors.append(f"{futures[future]}: {error}")
+        return errors
+
+    def _write_supervisor_diagnostic(self, coordinator: Sandbox, error: BaseException) -> None:
+        payload = {
+            "event": "supervisor_failure",
+            "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "runId": self.run_id,
+            "error": f"{type(error).__name__}: {error}",
+            "traceback": "".join(traceback.format_exception(error)),
+        }
+        path = f"{self.root}/diagnostics/supervisor-failure.json"
+        script = (
+            "import pathlib; "
+            f"p=pathlib.Path({path!r}); p.parent.mkdir(parents=True,exist_ok=True); "
+            f"p.write_text({(json.dumps(payload, separators=(',', ':'), sort_keys=True) + chr(10))!r})"
+        )
+        self._exec(coordinator, ["python3", "-c", script], timeout=120)
+        self._exec(coordinator, ["bash", "-lc",
+                                 f"if test -f /home/daytona/smash-coordinator/state.json; then "
+                                 f"cp -- /home/daytona/smash-coordinator/state.json "
+                                 f"{shlex.quote(self.root + '/diagnostics/coordinator-state.json')}; fi"],
+                   timeout=120, check=False)
+
     def _worker(self, index: int, generation: int, workers: int) -> Sandbox:
         suffix = f"{index:03d}" + (f"-r{generation}" if generation else "")
         sandbox = self._create(f"smash-worker-{self.run_id}-{suffix}", self.worker_snapshot, "worker",
@@ -373,8 +462,16 @@ class DaytonaConnector:
         command = shlex.join(["python3", "/tmp/daytona_connector.py", "worker", "--root", self.root,
                               "--index", str(index), "--workers", str(workers), "--processes", str(self.processes),
                               "--snapshot", self.worker_snapshot])
-        supervisor = f"while true; do {command}; s=$?; [ $s -eq 0 ] && exit 0; sleep 5; done"
-        self._exec(sandbox, ["bash", "-lc", f"nohup bash -lc {shlex.quote(supervisor)} >/tmp/smash-worker.log 2>&1 & echo $! >/tmp/smash-worker.pid"], timeout=30)
+        local_log = "/tmp/smash-worker.log"
+        shared_log = f"{self.root}/diagnostics/logs/{sandbox.name}.log"
+        supervisor = (
+            f"mkdir -p {shlex.quote(str(Path(shared_log).parent))}; : >{local_log}; "
+            f"while true; do {command} >>{local_log} 2>&1; s=$?; "
+            f"cp -- {local_log} {shlex.quote(shared_log)} 2>/dev/null || true; "
+            "[ $s -eq 0 ] && exit 0; sleep 5; done"
+        )
+        self._exec(sandbox, ["bash", "-lc", f"nohup bash -lc {shlex.quote(supervisor)} >/dev/null 2>&1 & "
+                             "echo $! >/tmp/smash-worker.pid"], timeout=30)
         return sandbox
 
     def _uploader(self, index: int, generation: int) -> Sandbox:
@@ -387,8 +484,16 @@ class DaytonaConnector:
         command = shlex.join(["python3", "/tmp/daytona_connector.py", "uploader", "--root", self.root,
                               "--lane", str(lane), "--remote", self.remote, "--target", self.target,
                               "--config", "/home/daytona/.config/rclone/rclone.conf"])
-        supervisor = f"while true; do {command}; s=$?; [ $s -eq 0 ] && exit 0; sleep 5; done"
-        self._exec(sandbox, ["bash", "-lc", f"nohup bash -lc {shlex.quote(supervisor)} >/tmp/smash-uploader.log 2>&1 & echo $! >/tmp/smash-uploader.pid"], timeout=30)
+        local_log = "/tmp/smash-uploader.log"
+        shared_log = f"{self.root}/diagnostics/logs/{sandbox.name}.log"
+        supervisor = (
+            f"mkdir -p {shlex.quote(str(Path(shared_log).parent))}; : >{local_log}; "
+            f"while true; do {command} >>{local_log} 2>&1; s=$?; "
+            f"cp -- {local_log} {shlex.quote(shared_log)} 2>/dev/null || true; "
+            "[ $s -eq 0 ] && exit 0; sleep 5; done"
+        )
+        self._exec(sandbox, ["bash", "-lc", f"nohup bash -lc {shlex.quote(supervisor)} >/dev/null 2>&1 & "
+                             "echo $! >/tmp/smash-uploader.pid"], timeout=30)
         return sandbox
 
     def _launch_workers(self, count: int) -> list[tuple[int, int, Sandbox]]:
@@ -457,6 +562,13 @@ class DaytonaConnector:
                             "workers": count, "processesPerWorker": self.processes,
                             "target": _remote(self.remote, self.target)}
                 if time.monotonic() - last_check >= 120:
+                    snapshot_errors = self._snapshot_logs(
+                        [(coordinator, "/home/daytona/smash-coordinator/run.log"),
+                         *[(sandbox, "/tmp/smash-uploader.log") for _, _, sandbox in uploaders]]
+                    )
+                    if snapshot_errors:
+                        print(json.dumps({"event": "diagnostic_snapshot_failed",
+                                          "errors": snapshot_errors}), flush=True)
                     coordinator_alive = self._exec(
                         coordinator,
                         ["bash", "-lc", "kill -0 $(cat /home/daytona/smash-coordinator/run.pid)"],
@@ -498,6 +610,16 @@ class DaytonaConnector:
                 if coordinator is not None:
                     with contextlib.suppress(Exception):
                         self._exec(coordinator, ["touch", f"{self.root}/stop"], timeout=30)
+                if primary_error is not None and coordinator is not None:
+                    try:
+                        self._write_supervisor_diagnostic(coordinator, primary_error)
+                    except Exception as error:
+                        cleanup_errors.append(f"supervisor diagnostic: {error}")
+                    log_rows = [(coordinator, "/home/daytona/smash-coordinator/run.log")]
+                    log_rows += [(sandbox, "/tmp/smash-worker.log") for _, _, sandbox in workers]
+                    log_rows += [(sandbox, "/tmp/smash-uploader.log") for _, _, sandbox in uploaders]
+                    cleanup_errors += [f"diagnostic log: {error}"
+                                       for error in self._snapshot_logs(log_rows, processes=True)]
                 worker_names = [name for name in self.owned if coordinator is None or name != coordinator.name]
                 with ThreadPoolExecutor(max_workers=min(12, max(1, len(worker_names)))) as pool:
                     futures = {pool.submit(self._delete, name): name for name in worker_names}
@@ -607,8 +729,19 @@ def _jobs(drive: Drive, source: str, target: str, limit: int) -> tuple[list[dict
 
 def _stream_sources(drive: Drive, source_root: str, root: Path, jobs: list[dict], errors: list[str]) -> None:
     try:
+        result_markers = {int(path.stem): path for path in (root / "results").glob("*.json")
+                          if path.stem.isdigit()}
+        ready_markers = {int(path.stem): path for path in (root / "ready").glob("*.json")
+                         if path.stem.isdigit()}
         by_archive: dict[str, dict[str, dict]] = {}
         for job in jobs:
+            job_id = int(job["id"])
+            result_marker = result_markers.get(job_id)
+            if result_marker and _matching_result(result_marker, job):
+                continue
+            ready_marker = ready_markers.get(job_id)
+            if ready_marker and _matching_shared_marker(ready_marker, job, "sourcePath", "sourceBytes"):
+                continue
             by_archive.setdefault(job["archive"], {})[job["member"].removeprefix("./")] = job
         for archive, wanted in sorted(by_archive.items()):
             for attempt in range(5):
@@ -807,6 +940,94 @@ def _publish_json(path: Path, value: dict | list) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _remove_job_files(root: Path, job_id: int, *, keep_source: bool = False) -> None:
+    paths = [root / "results" / f"{job_id:06d}.json",
+             root / "results" / f"{job_id:06d}.tar",
+             root / "ready" / f"{job_id:06d}.json",
+             root / "done" / f"{job_id:06d}.json"]
+    if not keep_source:
+        paths.append(root / "sources" / f"{job_id:06d}.slp")
+    for path in paths:
+        path.unlink(missing_ok=True)
+
+
+def _prepare_resume(root: Path, all_jobs: list[dict], uploaded: set[str]) -> dict:
+    """Reconcile a preserved run root against manifest-backed Drive commits."""
+    jobs_by_id = {int(job["id"]): job for job in all_jobs}
+    previous_failures = []
+    for path in sorted((root / "failures").glob("*.json")):
+        previous_failures.append({"file": path.name, "detail": _published_json(path) or path.read_text(errors="replace")})
+
+    preserved_results: set[int] = set()
+    invalid_results = 0
+    for marker in sorted((root / "results").glob("*.json")):
+        try:
+            job_id = int(marker.stem)
+        except ValueError:
+            marker.unlink(missing_ok=True)
+            invalid_results += 1
+            continue
+        job = jobs_by_id.get(job_id)
+        if job and job["reference"] not in uploaded and _matching_result(marker, job):
+            preserved_results.add(job_id)
+            continue
+        _remove_job_files(root, job_id)
+        invalid_results += 1
+
+    preserved_ready: set[int] = set()
+    invalid_ready = 0
+    for marker in sorted((root / "ready").glob("*.json")):
+        try:
+            job_id = int(marker.stem)
+        except ValueError:
+            marker.unlink(missing_ok=True)
+            invalid_ready += 1
+            continue
+        job = jobs_by_id.get(job_id)
+        if job_id in preserved_results:
+            marker.unlink(missing_ok=True)
+            continue
+        if (job and job["reference"] not in uploaded
+                and _matching_shared_marker(marker, job, "sourcePath", "sourceBytes")):
+            preserved_ready.add(job_id)
+            continue
+        _remove_job_files(root, job_id)
+        invalid_ready += 1
+
+    keep_sources = preserved_results | preserved_ready
+    for source in (root / "sources").glob("*.slp"):
+        try:
+            keep = int(source.stem) in keep_sources
+        except ValueError:
+            keep = False
+        if not keep:
+            source.unlink(missing_ok=True)
+
+    cleared = {}
+    for name in ("done", "failures", "workers", "upload-queue", "upload-acks"):
+        paths = list((root / name).glob("*"))
+        cleared[name] = len(paths)
+        for path in paths:
+            if path.is_file():
+                path.unlink(missing_ok=True)
+    for name in ("stop", "producer.done", "fleet.json"):
+        (root / name).unlink(missing_ok=True)
+
+    summary = {
+        "event": "run_root_reconciled",
+        "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "uploaded": len(uploaded),
+        "preservedResults": len(preserved_results),
+        "preservedReady": len(preserved_ready),
+        "invalidResultsRemoved": invalid_results,
+        "invalidReadyRemoved": invalid_ready,
+        "cleared": cleared,
+        "previousFailures": previous_failures,
+    }
+    _publish_json(root / "diagnostics" / "recoveries" / f"{time.time_ns()}.json", summary)
+    return summary
+
+
 def _choose_batch(markers: list[Path], limit: int) -> tuple[list[Path], int, list[dict]]:
     chosen: list[Path] = []
     rows: list[dict] = []
@@ -865,8 +1086,12 @@ def uploader(args: argparse.Namespace) -> None:
             _event("upload_cleanup_completed", lane=lane, count=len(job.get("records", [])),
                    seconds=round(time.monotonic() - cleanup_started, 3))
     except BaseException as error:
-        _publish_json(root / "failures" / f"uploader-{lane:03d}.json",
-                      {"error": f"uploader lane {lane}: {type(error).__name__}: {error}"})
+        detail = {"error": f"uploader lane {lane}: {type(error).__name__}: {error}",
+                  "lane": lane, "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                  "traceback": traceback.format_exc()}
+        _publish_json(root / "failures" / f"uploader-{lane:03d}.json", detail)
+        _publish_json(root / "diagnostics" / "uploader-failures" /
+                      f"lane-{lane:03d}-{time.time_ns()}.json", detail)
         (root / "stop").touch()
 
 
@@ -878,6 +1103,9 @@ def coordinator(args: argparse.Namespace) -> None:
     drive = Drive(args.remote, Path(args.config))
     try:
         all_jobs, uploaded = _jobs(drive, args.source, args.target, args.sample_limit)
+        recovery = _prepare_resume(root, all_jobs, uploaded)
+        _event("run_root_reconciled", **{key: value for key, value in recovery.items()
+                                         if key not in {"event", "time", "previousFailures"}})
         jobs = [job for job in all_jobs if job["reference"] not in uploaded]
         _json(root / "jobs.json", jobs)
         state = {"state": "complete" if not jobs else "ready", "total": len(all_jobs),
@@ -960,7 +1188,12 @@ def coordinator(args: argparse.Namespace) -> None:
             else:
                 time.sleep(1)
     except BaseException as error:
-        _json(state_path, {"state": "failed", "error": f"{type(error).__name__}: {error}"}, atomic=True)
+        detail = {"state": "failed", "error": f"{type(error).__name__}: {error}"}
+        _json(state_path, detail, atomic=True)
+        with contextlib.suppress(Exception):
+            _publish_json(root / "diagnostics" / "coordinator-failure.json",
+                          {**detail, "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                           "traceback": traceback.format_exc()})
         (root / "stop").touch()
 
 
@@ -988,6 +1221,13 @@ def worker(args: argparse.Namespace) -> None:
         work = Path("/tmp/smash-worker") / str(slot_id)
         work.mkdir(parents=True, exist_ok=True)
         pending = {job["id"]: job for job in jobs if job["id"] % slots == slot_id}
+        failure_cycles: dict[int, int] = {}
+        deferred_until: dict[int, float] = {}
+        render_attempts = int(os.environ.get("SMASH_RENDER_ATTEMPTS", "3"))
+        max_failure_cycles = int(os.environ.get("SMASH_RENDER_FAILURE_CYCLES", "3"))
+        retry_cooldown = int(os.environ.get("SMASH_RENDER_RETRY_COOLDOWN_SECONDS", "60"))
+        if render_attempts < 1 or max_failure_cycles < 1 or retry_cooldown < 0:
+            raise ValueError("render retry settings must be positive")
         producer_finished_at = None
         while pending:
             if (root / "stop").exists():
@@ -1003,9 +1243,20 @@ def worker(args: argparse.Namespace) -> None:
                         marker.unlink(missing_ok=True)
                 if committed:
                     pending.pop(job_id)
-            ready = next((path for path in (root / "ready").glob("*.json")
-                          if int(path.stem) in pending), None)
+            now = time.monotonic()
+            ready = None
+            has_assigned_ready = False
+            for path in (root / "ready").glob("*.json"):
+                if not path.stem.isdigit() or int(path.stem) not in pending:
+                    continue
+                has_assigned_ready = True
+                if deferred_until.get(int(path.stem), 0) <= now:
+                    ready = path
+                    break
             if ready is None:
+                if has_assigned_ready:
+                    time.sleep(.25)
+                    continue
                 if (root / "producer.done").exists():
                     producer_finished_at = producer_finished_at or time.monotonic()
                     if time.monotonic() - producer_finished_at > 30:
@@ -1017,17 +1268,49 @@ def worker(args: argparse.Namespace) -> None:
             source = work / "input.slp"
             _copy_verified(Path(job["sourcePath"]), source, job["sourceBytes"], job["sourceSha256"])
             result = work / "result.tar"
-            for attempt in range(3):
+            render_error: Exception | None = None
+            for attempt in range(render_attempts):
                 try:
                     result = replay_renderer.render(job, source, work, max(1, cpu // args.processes))
                     skip = None
                     break
                 except replay_renderer.NoPlayableFrames:
                     _skip_result(result); skip = "no_playable_frames"; break
-                except Exception:
-                    if attempt == 2:
-                        raise
+                except Exception as error:
+                    disk = shutil.disk_usage(work)
+                    detail = {
+                        "event": "render_attempt_failed",
+                        "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "workerIndex": args.index,
+                        "slotId": slot_id,
+                        "localSlot": local_slot,
+                        "jobId": int(job["id"]),
+                        "reference": job["reference"],
+                        "attempt": attempt + 1,
+                        "error": f"{type(error).__name__}: {error}",
+                        "traceback": traceback.format_exc(),
+                        "disk": {"total": disk.total, "used": disk.used, "free": disk.free},
+                    }
+                    _publish_json(root / "diagnostics" / "render-failures" /
+                                  f"{int(job['id']):06d}-{time.time_ns()}-attempt-{attempt + 1}.json", detail)
+                    _event("render_attempt_failed", workerIndex=args.index, slotId=slot_id,
+                           jobId=int(job["id"]), attempt=attempt + 1,
+                           diskFree=disk.free, error=detail["error"][-2000:])
+                    if attempt == render_attempts - 1:
+                        render_error = error
+                        break
                     time.sleep(2**attempt)
+            if render_error is not None:
+                job_id = int(job["id"])
+                cycle = failure_cycles.get(job_id, 0) + 1
+                failure_cycles[job_id] = cycle
+                if cycle >= max_failure_cycles:
+                    raise render_error
+                deferred_until[job_id] = time.monotonic() + retry_cooldown
+                _event("render_job_deferred", workerIndex=args.index, slotId=slot_id,
+                       jobId=job_id, failureCycle=cycle, maxFailureCycles=max_failure_cycles,
+                       retryAfterSeconds=retry_cooldown)
+                continue
             shared = root / "results" / f"{job['id']:06d}.tar"
             result_bytes, result_sha256 = result.stat().st_size, _sha256(result)
             _publish_visible(result, shared, result_bytes)
@@ -1046,7 +1329,9 @@ def worker(args: argparse.Namespace) -> None:
         except BaseException as error:
             message = f"slot {local_slot}: {type(error).__name__}: {error}"
             errors.append(message)
-            _json(root / "failures" / f"{args.index:03d}-{local_slot}.json", {"error": message})
+            _publish_json(root / "failures" / f"{args.index:03d}-{local_slot}.json",
+                          {"error": message, "workerIndex": args.index, "localSlot": local_slot,
+                           "traceback": traceback.format_exc()})
             (root / "stop").touch()
 
     threads = [threading.Thread(target=guarded, args=(index,)) for index in range(args.processes)]
