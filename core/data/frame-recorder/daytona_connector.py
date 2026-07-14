@@ -54,6 +54,7 @@ UPLOAD_IDLE_TIMEOUT = "10m"
 STATE_MISS_LIMIT = 6
 HEALTH_MISS_LIMIT = 2
 COORDINATOR_INIT_TIMEOUT = 1800
+RECONCILE_WORKERS = 32
 
 
 def _event(event: str, **fields: object) -> None:
@@ -1002,44 +1003,49 @@ def _prepare_resume(root: Path, all_jobs: list[dict], uploaded: set[str]) -> dic
     for path in sorted((root / "failures").glob("*.json")):
         previous_failures.append({"file": path.name, "detail": _published_json(path) or path.read_text(errors="replace")})
 
-    preserved_results: set[int] = set()
-    invalid_results = 0
-    for marker in sorted((root / "results").glob("*.json")):
+    def reconcile_result(marker: Path) -> tuple[int | None, int]:
         try:
             job_id = int(marker.stem)
         except ValueError:
             marker.unlink(missing_ok=True)
-            invalid_results += 1
-            continue
+            return None, 1
         job = jobs_by_id.get(job_id)
         if job and job["reference"] not in uploaded and _matching_result(marker, job):
-            preserved_results.add(job_id)
-            continue
+            return job_id, 0
         _remove_job_files(root, job_id)
-        invalid_results += 1
+        return None, 1
 
-    preserved_ready: set[int] = set()
-    invalid_ready = 0
-    for marker in sorted((root / "ready").glob("*.json")):
+    result_markers = sorted((root / "results").glob("*.json"))
+    with ThreadPoolExecutor(max_workers=min(RECONCILE_WORKERS, max(1, len(result_markers)))) as pool:
+        result_rows = list(pool.map(reconcile_result, result_markers))
+    preserved_results = {job_id for job_id, _ in result_rows if job_id is not None}
+    invalid_results = sum(invalid for _, invalid in result_rows)
+
+    def reconcile_ready(marker: Path) -> tuple[int | None, int]:
         try:
             job_id = int(marker.stem)
         except ValueError:
             marker.unlink(missing_ok=True)
-            invalid_ready += 1
-            continue
+            return None, 1
         job = jobs_by_id.get(job_id)
         if job_id in preserved_results:
             marker.unlink(missing_ok=True)
-            continue
+            return None, 0
         if (job and job["reference"] not in uploaded
                 and _matching_shared_marker(marker, job, "sourcePath", "sourceBytes")):
-            preserved_ready.add(job_id)
-            continue
+            return job_id, 0
         _remove_job_files(root, job_id)
-        invalid_ready += 1
+        return None, 1
+
+    ready_markers = sorted((root / "ready").glob("*.json"))
+    with ThreadPoolExecutor(max_workers=min(RECONCILE_WORKERS, max(1, len(ready_markers)))) as pool:
+        ready_rows = list(pool.map(reconcile_ready, ready_markers))
+    preserved_ready = {job_id for job_id, _ in ready_rows if job_id is not None}
+    invalid_ready = sum(invalid for _, invalid in ready_rows)
 
     keep_sources = preserved_results | preserved_ready
-    for source in (root / "sources").glob("*.slp"):
+
+    def clean_source(source: Path) -> None:
         try:
             keep = int(source.stem) in keep_sources
         except ValueError:
@@ -1047,13 +1053,18 @@ def _prepare_resume(root: Path, all_jobs: list[dict], uploaded: set[str]) -> dic
         if not keep:
             source.unlink(missing_ok=True)
 
+    sources = list((root / "sources").glob("*.slp"))
+    with ThreadPoolExecutor(max_workers=min(RECONCILE_WORKERS, max(1, len(sources)))) as pool:
+        list(pool.map(clean_source, sources))
+
     cleared = {}
+    stale: list[Path] = []
     for name in ("done", "failures", "workers", "upload-queue", "upload-acks"):
         paths = list((root / name).glob("*"))
         cleared[name] = len(paths)
-        for path in paths:
-            if path.is_file():
-                path.unlink(missing_ok=True)
+        stale.extend(path for path in paths if path.is_file())
+    with ThreadPoolExecutor(max_workers=min(RECONCILE_WORKERS, max(1, len(stale)))) as pool:
+        list(pool.map(lambda path: path.unlink(missing_ok=True), stale))
     for name in ("stop", "producer.done", "fleet.json"):
         (root / name).unlink(missing_ok=True)
 
