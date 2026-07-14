@@ -14,9 +14,6 @@ from core.training.codec.codec import _apply_rope, _rope, _spatial_rope
 class FlowTimeEmbedding(nn.Module):
     def __init__(self, width: int, frequency_dim: int = 256):
         super().__init__()
-        if frequency_dim % 2:
-            raise ValueError("Flow-time frequency dimension must be even")
-
         half = frequency_dim // 2
         frequencies = torch.exp(-math.log(10_000) * torch.arange(half).float() / half)
         self.register_buffer("frequencies", frequencies, persistent=False)
@@ -163,21 +160,6 @@ class DiffusionTransformer(nn.Module):
         activation_checkpointing: bool = False,
     ):
         super().__init__()
-        if depth < 1:
-            raise ValueError("Transformer depth must be positive")
-        if time_attention_every < 1:
-            raise ValueError("Temporal attention frequency must be positive")
-        if heads < 1 or kv_heads < 1:
-            raise ValueError("Attention head counts must be positive")
-        if width % heads:
-            raise ValueError(
-                "Transformer width must be divisible by its attention heads"
-            )
-        if width // heads % 4:
-            raise ValueError(
-                "Attention head width must be divisible by four for spatial RoPE"
-            )
-
         self.latent_dim = latent_dim
         self.head_width = width // heads
         self.activation_checkpointing = activation_checkpointing
