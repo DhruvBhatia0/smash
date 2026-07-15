@@ -5,13 +5,11 @@ from __future__ import annotations
 import argparse
 import math
 import os
-import queue
-import threading
 import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import av
 import torch
@@ -21,7 +19,7 @@ from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 
-from .data import TarZstdClipDataset, committed_archives, split_archives
+from .data import TarZstdClipDataset, committed_archives, holdout_archive
 
 
 @dataclass(frozen=True)
@@ -38,17 +36,17 @@ class TrainConfig:
     min_learning_rate: float = 1e-6
     model_ema_decay: float = 0.9999
     latent_ema_decay: float = 0.99
-    train_fraction: float = 0.95
-    split_seed: int = 28
-    eval_samples: int = 1_024
+    seed: int = 28
+    eval_samples: int | None = None
+    eval_archive: str | None = None
+    eval_every: int | None = None
+    save_every: int | None = None
     frames: int = 40
     stride_frames: int = 10
     height: int = 208
     width: int = 252
     fps: int = 20
     prefetch_factor: int = 4
-    video_prefetch: int = 4
-    batch_prefetch: int = 4
     spool_mb: int = 64
     decoder_threads: int = 1
     loader_benchmark_batches: int = 0
@@ -84,13 +82,17 @@ class TrainConfig:
         parser.add_argument(
             "--latent-ema-decay", type=float, default=cls.latent_ema_decay
         )
-        parser.add_argument("--train-fraction", type=float, default=cls.train_fraction)
-        parser.add_argument("--split-seed", type=int, default=cls.split_seed)
+        parser.add_argument("--seed", type=int, default=cls.seed)
         parser.add_argument("--eval-samples", type=int, default=cls.eval_samples)
+        parser.add_argument("--eval-archive")
+        parser.add_argument("--eval-every", type=int)
+        parser.add_argument("--save-every", type=int)
+        parser.add_argument("--frames", type=int, default=cls.frames)
         parser.add_argument("--stride-frames", type=int, default=cls.stride_frames)
+        parser.add_argument("--height", type=int, default=cls.height)
+        parser.add_argument("--width", type=int, default=cls.width)
+        parser.add_argument("--fps", type=int, default=cls.fps)
         parser.add_argument("--prefetch-factor", type=int, default=cls.prefetch_factor)
-        parser.add_argument("--video-prefetch", type=int, default=cls.video_prefetch)
-        parser.add_argument("--batch-prefetch", type=int, default=cls.batch_prefetch)
         parser.add_argument("--spool-mb", type=int, default=cls.spool_mb)
         parser.add_argument("--decoder-threads", type=int, default=cls.decoder_threads)
         parser.add_argument(
@@ -117,15 +119,24 @@ class TrainConfig:
             arguments.epochs,
             arguments.log_every,
             arguments.batch_size,
-            arguments.eval_samples,
+            arguments.frames,
             arguments.stride_frames,
+            arguments.height,
+            arguments.width,
+            arguments.fps,
             arguments.prefetch_factor,
-            arguments.video_prefetch,
-            arguments.batch_prefetch,
             arguments.spool_mb,
             arguments.decoder_threads,
         )
-        if min(positive) < 1 or (arguments.steps is not None and arguments.steps < 1):
+        optional_positive = (
+            arguments.steps,
+            arguments.eval_samples,
+            arguments.eval_every,
+            arguments.save_every,
+        )
+        if min(positive) < 1 or any(
+            value is not None and value < 1 for value in optional_positive
+        ):
             parser.error("epochs, steps, sizes, and prefetch values must be positive")
         if (
             arguments.workers < 0
@@ -135,8 +146,6 @@ class TrainConfig:
             parser.error(
                 "workers, benchmark batches, and warmup steps cannot be negative"
             )
-        if not 0 < arguments.train_fraction < 1:
-            parser.error("train fraction must be strictly between zero and one")
         if (
             not 0 <= arguments.model_ema_decay < 1
             or not 0 <= arguments.latent_ema_decay < 1
@@ -320,8 +329,6 @@ class CodecTrainer:
             samples += len(video)
             if sample is None:
                 sample = (prediction[0].float().cpu(), target[0].cpu())
-            if samples >= self.config.eval_samples:
-                break
         self.raw_model.train()
         self.raw_model.encoder.dinov3.eval()
         assert sample is not None and samples
@@ -526,8 +533,19 @@ class CodecTrainer:
 
                 epoch_finished = step % self.steps_per_epoch == 0
                 training_finished = step == self.total_steps
-                if epoch_finished or training_finished:
+                evaluate = training_finished or (
+                    step % self.config.eval_every == 0
+                    if self.config.eval_every
+                    else epoch_finished
+                )
+                save = training_finished or (
+                    step % self.config.save_every == 0
+                    if self.config.save_every
+                    else epoch_finished
+                )
+                if evaluate:
                     self._evaluate_and_log(step)
+                if save:
                     self._save(step)
         finally:
             if not self.rank:
@@ -540,7 +558,7 @@ class CodecTrainer:
 
 def _loaders(
     config: TrainConfig, *, rank: int, world_size: int
-) -> tuple[_BatchLoader, _BatchLoader | None, int]:
+) -> tuple[DataLoader[Tensor], list[Tensor] | None, int]:
     if dist.is_initialized():
         payload = [
             committed_archives(
@@ -562,11 +580,9 @@ def _loaders(
             stride_frames=config.stride_frames,
             require_index=True,
         )
-    train_archives, eval_archives = split_archives(
-        archives, config.train_fraction, config.split_seed
-    )
+    train_archives, eval_archive = holdout_archive(archives, config.eval_archive)
     train_clips = sum(archive.clips or 0 for archive in train_archives)
-    eval_clips = sum(archive.clips or 0 for archive in eval_archives)
+    eval_clips = eval_archive.clips or 0
     global_batch = config.batch_size * world_size
     steps_per_epoch = train_clips // global_batch
     if steps_per_epoch < 1:
@@ -583,29 +599,27 @@ def _loaders(
         training=True,
         rank=rank,
         world_size=world_size,
-        seed=config.split_seed,
+        seed=config.seed,
         spool_bytes=config.spool_mb * 1024**2,
         decoder_threads=config.decoder_threads,
-        video_prefetch=config.video_prefetch,
     )
     eval_loader = None
     if not rank:
         eval_dataset = TarZstdClipDataset(
-            eval_archives,
+            [eval_archive],
             frames=config.frames,
             stride_frames=config.stride_frames,
             fps=config.fps,
             size=(config.height, config.width),
             training=False,
-            seed=config.split_seed,
+            seed=config.seed,
             spool_bytes=config.spool_mb * 1024**2,
             decoder_threads=config.decoder_threads,
-            video_prefetch=config.video_prefetch,
         )
-        eval_loader = _data_loader(config, eval_dataset, training=False)
+        eval_loader = _cache_evaluation(config, eval_dataset)
         print(
             f"{len(train_archives)} train archives / {train_clips:,} clips; "
-            f"{len(eval_archives)} eval archives / {eval_clips:,} clips; "
+            f"eval={eval_archive.path.name} / {eval_clips:,} clips; "
             f"{steps_per_epoch:,} steps/epoch at global batch {global_batch}; "
             f"clips are {config.frames / config.fps:g}s with "
             f"{config.stride_frames / config.fps:g}s stride",
@@ -618,9 +632,34 @@ def _loaders(
     )
 
 
+def _cache_evaluation(
+    config: TrainConfig, dataset: TarZstdClipDataset
+) -> list[Tensor]:
+    """Decode the fixed evaluation set once and retain its ready-to-use batches."""
+
+    cached: list[Tensor] = []
+    samples = 0
+    for batch in _data_loader(config, dataset, training=False):
+        if config.eval_samples is not None:
+            batch = batch[: config.eval_samples - samples]
+        cached.append(batch)
+        samples += len(batch)
+        if samples == config.eval_samples:
+            break
+    if not cached:
+        raise ValueError("The eval archive did not produce a complete clip")
+    size = sum(batch.numel() * batch.element_size() for batch in cached)
+    print(
+        f"cached {samples:,} eval clips in {size / 1024**3:.2f} GiB of RAM",
+        flush=True,
+    )
+    return cached
+
+
 def _data_loader(
     config: TrainConfig, dataset: TarZstdClipDataset, *, training: bool
-) -> _BatchLoader:
+) -> DataLoader[Tensor]:
+    # PyTorch keeps workers * prefetch_factor ready batches in a bounded queue.
     worker_options = (
         {
             "persistent_workers": True,
@@ -629,113 +668,14 @@ def _data_loader(
         if config.workers
         else {}
     )
-    samples = DataLoader(
+    return DataLoader(
         dataset,
-        batch_size=None,
-        num_workers=config.workers,
-        **worker_options,
-    )
-    return _BatchLoader(
-        samples,
         batch_size=config.batch_size,
+        num_workers=config.workers,
         drop_last=training,
         pin_memory=torch.cuda.is_available(),
-        batches_ahead=config.batch_prefetch,
+        **worker_options,
     )
-
-
-@dataclass(frozen=True)
-class _LoaderFailure:
-    error: BaseException
-
-
-_LOADER_END = object()
-
-
-class _BatchLoader:
-    """Collate in the rank process and keep complete pinned batches ahead of the GPU."""
-
-    def __init__(
-        self,
-        samples: DataLoader[Tensor],
-        *,
-        batch_size: int,
-        drop_last: bool,
-        pin_memory: bool,
-        batches_ahead: int,
-    ) -> None:
-        self.samples = samples
-        self.batch_size = batch_size
-        self.drop_last = drop_last
-        self.pin_memory = pin_memory
-        self.batches_ahead = batches_ahead
-
-    def __iter__(self) -> Iterator[Tensor]:
-        sample_iterator = iter(self.samples)
-        if self.batches_ahead == 1:
-            yield from self._batches(sample_iterator)
-            return
-
-        ready: queue.Queue[Tensor | _LoaderFailure | object] = queue.Queue(
-            maxsize=self.batches_ahead
-        )
-        stop = threading.Event()
-
-        def put(item: Tensor | _LoaderFailure | object) -> bool:
-            while not stop.is_set():
-                try:
-                    ready.put(item, timeout=0.1)
-                    return True
-                except queue.Full:
-                    pass
-            return False
-
-        def produce() -> None:
-            try:
-                for batch in self._batches(sample_iterator):
-                    if not put(batch):
-                        return
-            except BaseException as error:
-                put(_LoaderFailure(error))
-            finally:
-                put(_LOADER_END)
-
-        producer = threading.Thread(
-            target=produce, name="codec-batch-producer", daemon=True
-        )
-        producer.start()
-        try:
-            while True:
-                item = ready.get()
-                if item is _LOADER_END:
-                    return
-                if isinstance(item, _LoaderFailure):
-                    raise item.error
-                assert isinstance(item, Tensor)
-                yield item
-        finally:
-            stop.set()
-            producer.join(timeout=5)
-
-    def _batches(self, samples: Iterator[Tensor]) -> Iterator[Tensor]:
-        batch: list[Tensor] = []
-        for sample in samples:
-            batch.append(sample)
-            if len(batch) == self.batch_size:
-                yield self._stack(batch)
-                batch.clear()
-        if batch and not self.drop_last:
-            yield self._stack(batch)
-
-    def _stack(self, samples: list[Tensor]) -> Tensor:
-        if not self.pin_memory:
-            return torch.stack(samples)
-        output = torch.empty(
-            (len(samples), *samples[0].shape),
-            dtype=samples[0].dtype,
-            pin_memory=True,
-        )
-        return torch.stack(samples, out=output)
 
 
 def _benchmark_loader(config: TrainConfig) -> None:
@@ -747,10 +687,9 @@ def _benchmark_loader(config: TrainConfig) -> None:
         fps=config.fps,
         size=(config.height, config.width),
         training=True,
-        seed=config.split_seed,
+        seed=config.seed,
         spool_bytes=config.spool_mb * 1024**2,
         decoder_threads=config.decoder_threads,
-        video_prefetch=config.video_prefetch,
     )
     train_loader = _data_loader(config, dataset, training=True)
     print(
