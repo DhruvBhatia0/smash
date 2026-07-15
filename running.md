@@ -1,6 +1,6 @@
 # Native Battlefield conversion runbook
 
-Last updated: 2026-07-14T21:03:06Z
+Last updated: 2026-07-15T20:18:30Z
 
 ## Goal and non-negotiable output contract
 
@@ -18,16 +18,33 @@ Convert all 10,327 Falcon-versus-Fox Battlefield Slippi matches and commit them 
 
 - Drive source root: `smash-drive:hal-fox-captain-falcon-battlefield`
 - Drive output root: `smash-drive:hal-fox-captain-falcon-battlefield/recordings-642x528-20fps-slippi-pts-v4`
-- Live run ID: `native-642x528-20260714-195112`
-- Local supervisor log: `/tmp/smash-native-642x528-20260714-195112-recovery-2.log`
-- Local Screen supervisor: `smash-native-642x528-v10`
-- Live coordinator: `smash-coord-native-642x528-20260714-195112`
-- Fleet: 23 worker sandboxes, 4 render processes each, 92 render slots, one 2-CPU coordinator, two 1-CPU upload relays, 96 run CPUs, zero GPUs.
+- Completed run ID: `native-642x528-20260715-091900`
+- Final local supervisor log: `/tmp/smash-native-642x528-20260715-091900-recovery-7.log`
+- Fleet at peak: 23 worker sandboxes, 4 render processes each, 92 render slots, one 2-CPU coordinator, two 1-CPU upload relays, 96 run CPUs, zero GPUs. All run sandboxes were deleted after completion.
 - Renderer: `core/data/frame-recorder/replay_renderer.py`
 - Fleet/coordinator: `core/data/frame-recorder/daytona_connector.py`
-- Monitoring: detached local Screen supervisor plus the coordinator state and shared run root above.
+- Completion evidence: the final local supervisor log plus the manifest-backed Drive audit below. No
+  fleet monitor remains active after successful teardown.
 
-## Current checkpoint
+## Final completion
+
+- The final manifest committed at 2026-07-15T14:58:30Z. A fresh post-run Drive audit downloaded
+  every manifest and found exactly 10,327 rows, 10,327 unique source references, and zero duplicate
+  references.
+- Drive contains 448 non-empty `.tar.zst` archives and 448 non-empty matching manifests: 896 batch
+  objects total, zero zero-byte objects, zero archive-only keys, and zero manifest-only keys.
+- A production result was independently probed as H.264, 642x528, and exactly 20/1 fps. Its metadata
+  records `spatialTransform: "none"` and audio disabled, satisfying the native output contract.
+- The isolated node supervisor recovered one lane-two uploader after the shared object-store removed
+  its empty `upload-acks` directory between publication steps. The committed Drive batch remained
+  idempotent, the replacement resumed it without duplication, and later batches continued normally.
+  Shared publication now recreates and retries a vanished target parent with an explicit structured
+  event instead of requiring a node replacement.
+- The local runner exited nonzero only after successful completion: its best-effort shared-root
+  removal command timed out while deleting the coordinator. The authoritative Drive audit above is
+  complete, and `daytona list` reported zero remaining run sandboxes.
+
+## Historical checkpoint log
 
 - At 19:51Z, branch `codex/native-dataset-rerun` restarted production from a fresh shared run root.
   A direct Drive/source reconciliation found 10,327 unique curated references, 495 unique committed

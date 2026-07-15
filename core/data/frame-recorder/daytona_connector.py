@@ -129,10 +129,23 @@ def _copy_verified(source: Path, target: Path, size: int, digest: str) -> None:
 
 def _publish_visible(source: Path, target: Path, size: int) -> None:
     """Close one object-store write, then wait for that object to become visible."""
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.unlink(missing_ok=True)
-    shutil.copyfile(source, target)
     deadline = time.monotonic() + 300
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.unlink(missing_ok=True)
+            shutil.copyfile(source, target)
+            break
+        except FileNotFoundError as error:
+            if not source.is_file() or time.monotonic() >= deadline:
+                raise
+            backoff = min(2.0, .1 * 2 ** min(attempt - 1, 4))
+            _event("shared_publish_retry", path=str(target), attempt=attempt,
+                   nextAttempt=attempt + 1, retryAfterSeconds=backoff,
+                   error=f"{type(error).__name__}: {error}"[-2000:])
+            time.sleep(backoff)
     while True:
         try:
             if target.stat().st_size == size:
