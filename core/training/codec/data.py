@@ -16,6 +16,7 @@ from typing import BinaryIO, IO, Iterator
 import av
 import torch
 import zstandard
+from av.video.reformatter import Interpolation, VideoReformatter
 from torch import Tensor
 from torch.utils.data import IterableDataset, get_worker_info
 
@@ -227,17 +228,19 @@ class TarZstdClipDataset(IterableDataset[Tensor]):
                     f"Expected {self.fps} FPS, got {stream.average_rate or 'unknown'}"
                 )
             stream.thread_count = self.decoder_threads
+            reformatter = VideoReformatter()
             clip: deque[Tensor] = deque(maxlen=self.frames)
             decoded = 0
             for frame in container.decode(stream):
                 decoded += 1
-                if frame.width != self.width or frame.height != self.height:
-                    frame = frame.reformat(
-                        width=self.width, height=self.height, format="rgb24"
-                    )
-                    array = frame.to_ndarray()
-                else:
-                    array = frame.to_ndarray(format="rgb24")
+                # AREA averages the full source frame into the target; it never crops.
+                array = reformatter.reformat(
+                    frame,
+                    width=self.width,
+                    height=self.height,
+                    format="rgb24",
+                    interpolation=Interpolation.AREA,
+                ).to_ndarray()
                 clip.append(torch.from_numpy(array).permute(2, 0, 1))
                 if (
                     len(clip) == self.frames

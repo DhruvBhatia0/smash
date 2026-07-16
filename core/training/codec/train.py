@@ -43,8 +43,8 @@ class TrainConfig:
     save_every: int | None = None
     frames: int = 40
     stride_frames: int = 10
-    height: int = 288
-    width: int = 512
+    height: int = 208
+    width: int = 252
     fps: int = 20
     prefetch_factor: int = 4
     spool_mb: int = 64
