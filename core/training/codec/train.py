@@ -42,7 +42,7 @@ class TrainConfig:
     eval_every: int | None = None
     save_every: int | None = None
     frames: int = 40
-    stride_frames: int = 10
+    stride_frames: int = 40
     height: int = 208
     width: int = 252
     fps: int = 20
