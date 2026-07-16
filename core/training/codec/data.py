@@ -4,12 +4,10 @@ from __future__ import annotations
 
 import json
 import os
-import queue
 import random
 import shutil
 import tarfile
 import tempfile
-import threading
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +16,7 @@ from typing import BinaryIO, IO, Iterator
 import av
 import torch
 import zstandard
+from av.video.reformatter import Interpolation, VideoReformatter
 from torch import Tensor
 from torch.utils.data import IterableDataset, get_worker_info
 
@@ -26,6 +25,7 @@ from torch.utils.data import IterableDataset, get_worker_info
 class ArchiveInfo:
     path: Path
     samples: int
+    last_sample: int
     clips: int | None = None
 
 
@@ -81,7 +81,17 @@ def committed_archives(
                 raise FileNotFoundError(
                     f"Missing {index_path}; run python -m core.training.codec.index {folder}"
                 )
-            archives.append(ArchiveInfo(path=path, samples=samples, clips=clips))
+            sample_ids = [row.get("sample") for row in rows]
+            if not all(isinstance(sample, int) for sample in sample_ids):
+                raise ValueError(f"Manifest has invalid sample IDs: {manifest}")
+            archives.append(
+                ArchiveInfo(
+                    path=path,
+                    samples=samples,
+                    clips=clips,
+                    last_sample=max(sample_ids),
+                )
+            )
     if not archives:
         raise ValueError(
             f"No committed .tar.zst/.manifest.jsonl batch pairs found in {folder}"
@@ -89,22 +99,21 @@ def committed_archives(
     return archives
 
 
-def split_archives(
-    archives: list[ArchiveInfo], train_fraction: float, seed: int, minimum: int = 1
-) -> tuple[list[ArchiveInfo], list[ArchiveInfo]]:
-    """Deterministically split whole archives so a replay cannot leak across splits."""
+def holdout_archive(
+    archives: list[ArchiveInfo], name: str | None = None
+) -> tuple[list[ArchiveInfo], ArchiveInfo]:
+    """Reserve one explicit archive, or the archive containing the final sample."""
 
-    if not 0 < train_fraction < 1:
-        raise ValueError("train_fraction must be strictly between zero and one")
-    if len(archives) < 2 * minimum:
-        raise ValueError(
-            f"Need at least {2 * minimum} archives for {minimum} per train/eval split"
-        )
-    shuffled = archives.copy()
-    random.Random(seed).shuffle(shuffled)
-    split = round(len(shuffled) * train_fraction)
-    split = min(len(shuffled) - minimum, max(minimum, split))
-    return shuffled[:split], shuffled[split:]
+    if len(archives) < 2:
+        raise ValueError("Need at least one training archive and one eval archive")
+    if name is None:
+        evaluation = max(archives, key=lambda archive: archive.last_sample)
+    else:
+        matches = [archive for archive in archives if archive.path.name == name]
+        if len(matches) != 1:
+            raise ValueError(f"Eval archive {name!r} was not found exactly once")
+        evaluation = matches[0]
+    return [archive for archive in archives if archive != evaluation], evaluation
 
 
 class TarZstdClipDataset(IterableDataset[Tensor]):
@@ -131,7 +140,6 @@ class TarZstdClipDataset(IterableDataset[Tensor]):
         seed: int = 28,
         spool_bytes: int = 64 * 1024**2,
         decoder_threads: int = 1,
-        video_prefetch: int = 4,
     ) -> None:
         super().__init__()
         if not 0 <= rank < world_size:
@@ -151,11 +159,8 @@ class TarZstdClipDataset(IterableDataset[Tensor]):
         self.seed = seed
         self.spool_bytes = spool_bytes
         self.decoder_threads = decoder_threads
-        self.video_prefetch = video_prefetch
         if self.frames < 1 or self.stride_frames < 1:
             raise ValueError("frames and stride_frames must be positive")
-        if self.video_prefetch < 1:
-            raise ValueError("video_prefetch must be positive")
 
     def __iter__(self) -> Iterator[Tensor]:
         worker = get_worker_info()
@@ -180,75 +185,24 @@ class TarZstdClipDataset(IterableDataset[Tensor]):
             cycle += 1
 
     def _read_archive(self, path: Path) -> Iterator[Tensor]:
-        videos: queue.Queue[_Video | _ProducerFailure | object] = queue.Queue(
-            maxsize=self.video_prefetch
-        )
-        stop = threading.Event()
-
-        def put(item: _Video | _ProducerFailure | object) -> bool:
-            while not stop.is_set():
-                try:
-                    videos.put(item, timeout=0.1)
-                    return True
-                except queue.Full:
-                    pass
-            return False
-
-        def produce() -> None:
-            try:
-                with (
-                    path.open("rb", buffering=0) as compressed,
-                    zstandard.ZstdDecompressor().stream_reader(compressed) as stream,
-                    tarfile.open(fileobj=stream, mode="r|") as archive,
-                ):
-                    for member in archive:
-                        if stop.is_set():
-                            break
-                        if not member.isfile() or not member.name.endswith(
-                            self.VIDEO_SUFFIX
-                        ):
-                            continue
-                        source = archive.extractfile(member)
-                        if source is None:
-                            raise RuntimeError(f"Could not read {member.name}")
-                        with source:
-                            video = self._spool_video(source)
-                        if not put(_Video(member.name, video)):
-                            video.close()
-                            return
-            except BaseException as error:
-                put(_ProducerFailure(error))
-            finally:
-                put(_END)
-
-        producer = threading.Thread(
-            target=produce,
-            name=f"codec-video-producer-{path.name}",
-            daemon=True,
-        )
-        producer.start()
         try:
-            while True:
-                item = videos.get()
-                if item is _END:
-                    break
-                if isinstance(item, _ProducerFailure):
-                    raise item.error
-                assert isinstance(item, _Video)
-                with item.file:
-                    yield from self._read_video(item.file)
+            with (
+                path.open("rb", buffering=0) as compressed,
+                zstandard.ZstdDecompressor().stream_reader(compressed) as stream,
+                tarfile.open(fileobj=stream, mode="r|") as archive,
+            ):
+                for member in archive:
+                    if not member.isfile() or not member.name.endswith(
+                        self.VIDEO_SUFFIX
+                    ):
+                        continue
+                    source = archive.extractfile(member)
+                    if source is None:
+                        raise RuntimeError(f"Could not read {member.name}")
+                    with source, self._spool_video(source) as video:
+                        yield from self._read_video(video)
         except Exception as error:
             raise RuntimeError(f"Failed while streaming {path}") from error
-        finally:
-            stop.set()
-            while True:
-                try:
-                    item = videos.get_nowait()
-                except queue.Empty:
-                    break
-                if isinstance(item, _Video):
-                    item.file.close()
-            producer.join()
 
     def _spool_video(self, source: BinaryIO) -> IO[bytes]:
         spool_dir = os.environ.get("SMASH_CODEC_SPOOL_DIR")
@@ -274,17 +228,19 @@ class TarZstdClipDataset(IterableDataset[Tensor]):
                     f"Expected {self.fps} FPS, got {stream.average_rate or 'unknown'}"
                 )
             stream.thread_count = self.decoder_threads
+            reformatter = VideoReformatter()
             clip: deque[Tensor] = deque(maxlen=self.frames)
             decoded = 0
             for frame in container.decode(stream):
                 decoded += 1
-                if frame.width != self.width or frame.height != self.height:
-                    frame = frame.reformat(
-                        width=self.width, height=self.height, format="rgb24"
-                    )
-                    array = frame.to_ndarray()
-                else:
-                    array = frame.to_ndarray(format="rgb24")
+                # AREA averages the full source frame into the target; it never crops.
+                array = reformatter.reformat(
+                    frame,
+                    width=self.width,
+                    height=self.height,
+                    format="rgb24",
+                    interpolation=Interpolation.AREA,
+                ).to_ndarray()
                 clip.append(torch.from_numpy(array).permute(2, 0, 1))
                 if (
                     len(clip) == self.frames
@@ -295,17 +251,3 @@ class TarZstdClipDataset(IterableDataset[Tensor]):
                 raise ValueError(
                     f"Video contains {decoded} frames; expected at least {self.frames}"
                 )
-
-
-@dataclass
-class _Video:
-    name: str
-    file: IO[bytes]
-
-
-@dataclass
-class _ProducerFailure:
-    error: BaseException
-
-
-_END = object()
