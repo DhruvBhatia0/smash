@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import time
 from dataclasses import asdict, dataclass
@@ -33,16 +32,17 @@ class Config:
     prefetch_factor: int = 4
     learning_rate: float = 1e-4
     warmup_steps: int = 1_000
-    log_every: int = 100
+    log_every: int = 20
     eval_every: int = 5_000
     eval_samples: int = 64
     seed: int = 28
     ema_decay: float = 0.9999
+    max_grad_norm: float = 100.0
     activation_checkpointing: bool = False
     resume: Path | None = None
     wandb_entity: str = "dhruvbhatia0"
     wandb_project: str = "smash-d-transformer-full"
-    wandb_name: str = "mira-1b-full-4epochs"
+    wandb_name: str = "mira-1b-full-4epochs-clip100"
     wandb_mode: str = "online"
 
     @classmethod
@@ -66,6 +66,7 @@ class Config:
             )
         parser.add_argument("--learning-rate", type=float, default=cls.learning_rate)
         parser.add_argument("--ema-decay", type=float, default=cls.ema_decay)
+        parser.add_argument("--max-grad-norm", type=float, default=cls.max_grad_norm)
         parser.add_argument(
             "--activation-checkpointing",
             action=argparse.BooleanOptionalAction,
@@ -92,6 +93,8 @@ class Config:
             config.eval_samples,
         ) < 1:
             raise ValueError("Batch, worker, logging, and evaluation counts must be positive")
+        if config.max_grad_norm <= 0:
+            raise ValueError("Gradient norm ceiling must be positive")
         return config
 
 
@@ -192,6 +195,8 @@ class Trainer:
             {
                 "model_parameters": sum(p.numel() for p in self.raw_model.parameters()),
                 "train_unique_clips": self.manifest["train_samples"],
+                "train_archives": len({item["archive"] for item in self.train_shards}),
+                "train_shards": len(self.train_shards),
                 "eval_archive": self.manifest["eval_archive"],
                 "global_batch_size": self.config.batch_size * self.world_size,
                 "action_representation": "three_ordered_60hz_states_per_20hz_transition",
@@ -293,23 +298,30 @@ class Trainer:
         if self.rank:
             return {}
         assert self.eval_actions is not None and self.eval_latents is not None
+        raw_loss = self._eval_loss()
         with self.ema.average_parameters():
-            metrics = {"eval/loss": self._eval_loss()}
+            ema_loss = self._eval_loss()
+            zero_action_loss = self._eval_loss(zero_actions=True)
+            metrics = {
+                "eval/loss": ema_loss,
+                "eval/raw_loss": raw_loss,
+                "eval/ema_loss": ema_loss,
+                "eval/zero_action_loss": zero_action_loss,
+                "eval/action_zero_loss_delta": zero_action_loss - ema_loss,
+            }
             if rollout:
                 correct = self._rollout(self.eval_actions[:2])
                 zero = self._rollout(torch.zeros_like(self.eval_actions[:2]))
                 target = self.eval_latents[:2, 1:7].float()
                 correct_error = (correct - target).square().mean((0, 2, 3, 4))
                 zero_error = (zero - target).square().mean((0, 2, 3, 4))
-                metrics.update(
-                    {
-                        "eval/rollout_mse_h01": correct_error[0].item(),
-                        "eval/rollout_mse_h06": correct_error[-1].item(),
-                        "eval/action_zero_delta_h06": (
-                            zero_error[-1] - correct_error[-1]
-                        ).item(),
-                    }
-                )
+                for index, (correct_value, zero_value) in enumerate(
+                    zip(correct_error, zero_error, strict=True), 1
+                ):
+                    metrics[f"eval/rollout_mse_h{index:02d}"] = correct_value.item()
+                    metrics[f"eval/action_zero_delta_h{index:02d}"] = (
+                        zero_value - correct_value
+                    ).item()
         self.raw_model.train()
         self._log(metrics)
         return metrics
@@ -340,9 +352,14 @@ class Trainer:
             for epoch in range(self.start_epoch, self.config.epochs):
                 loader, dataset = self._loader(epoch)
                 steps_per_epoch = len(dataset) // self.config.batch_size
-                interval_loss = 0.0
                 interval_wait = 0.0
-                interval_count = 0
+                interval = torch.zeros(10, device=self.device, dtype=torch.float64)
+                loss_min = torch.full((), torch.inf, device=self.device)
+                loss_max = torch.full((), -torch.inf, device=self.device)
+                grad_max = torch.zeros((), device=self.device)
+                tau_edges = torch.tensor((0.2, 0.4, 0.6, 0.8), device=self.device)
+                tau_loss = torch.zeros(5, device=self.device, dtype=torch.float64)
+                tau_count = torch.zeros(5, device=self.device, dtype=torch.float64)
                 interval_started = time.monotonic()
                 iterator = iter(loader)
                 for epoch_step in range(1, steps_per_epoch + 1):
@@ -353,55 +370,138 @@ class Trainer:
                     actions = actions.to(self.device, non_blocking=True)
                     self.optimizer.zero_grad(set_to_none=True)
                     with self._autocast():
-                        prediction, target, _ = flow_matching_prediction(
+                        prediction, target, flow_time = flow_matching_prediction(
                             self.model, latents, actions
                         )
-                        loss = (prediction.float() - target.float()).square().mean()
+                        frame_error = (
+                            (prediction.float() - target.float())
+                            .square()
+                            .mean((2, 3, 4))
+                        )
+                        loss = frame_error.mean()
                     loss.backward()
                     self.step += 1
                     should_log = self.step == 1 or self.step % self.config.log_every == 0
-                    grad_norm = (
-                        nn.utils.clip_grad_norm_(self.model.parameters(), math.inf)
-                        if should_log
-                        else None
+                    grad_norm = nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.config.max_grad_norm,
+                        error_if_nonfinite=True,
                     )
+                    action_grad_norm = None
+                    if should_log:
+                        action_grad_norm = torch.stack(
+                            [
+                                parameter.grad.norm()
+                                for parameter in self.raw_model.actions.parameters()
+                                if parameter.grad is not None
+                            ]
+                        ).norm()
                     self.optimizer.step()
                     self.scheduler.step()
                     self.ema.step()
-                    interval_loss += loss.item() * len(latents)
-                    interval_count += len(latents)
                     global_examples += len(latents) * self.world_size
+
+                    with torch.no_grad():
+                        prediction_flat = prediction.float().flatten(2)
+                        target_flat = target.float().flatten(2)
+                        prediction_norm = prediction_flat.norm(dim=2)
+                        target_norm = target_flat.norm(dim=2)
+                        cosine = (
+                            (prediction_flat * target_flat).sum(2)
+                            / (prediction_norm * target_norm).clamp_min(1e-8)
+                        ).mean()
+                        interval += torch.stack(
+                            (
+                                loss.detach().double(),
+                                loss.detach().double().square(),
+                                loss.new_ones((), dtype=torch.float64),
+                                grad_norm.double(),
+                                (grad_norm > self.config.max_grad_norm).double(),
+                                prediction_norm.mean().double(),
+                                target_norm.mean().double(),
+                                cosine.double(),
+                                loss.new_tensor(len(latents), dtype=torch.float64),
+                                loss.new_zeros((), dtype=torch.float64),
+                            )
+                        )
+                        loss_min = torch.minimum(loss_min, loss.detach())
+                        loss_max = torch.maximum(loss_max, loss.detach())
+                        grad_max = torch.maximum(grad_max, grad_norm.detach())
+                        bins = torch.bucketize(flow_time.detach(), tau_edges).flatten()
+                        tau_loss.scatter_add_(0, bins, frame_error.detach().double().flatten())
+                        tau_count.scatter_add_(
+                            0, bins, torch.ones_like(bins, dtype=torch.float64)
+                        )
 
                     if should_log:
                         elapsed = time.monotonic() - interval_started
-                        values = torch.tensor(
-                            [interval_loss, interval_wait, interval_count],
-                            device=self.device,
-                            dtype=torch.float64,
-                        )
+                        interval[9] = interval_wait
                         elapsed_value = torch.tensor(elapsed, device=self.device)
-                        norm_value = grad_norm.detach().float()  # type: ignore[union-attr]
+                        assert action_grad_norm is not None
                         if dist.is_initialized():
-                            dist.all_reduce(values)
+                            dist.all_reduce(interval)
+                            dist.all_reduce(loss_min, op=dist.ReduceOp.MIN)
+                            dist.all_reduce(loss_max, op=dist.ReduceOp.MAX)
+                            dist.all_reduce(grad_max, op=dist.ReduceOp.MAX)
+                            dist.all_reduce(tau_loss)
+                            dist.all_reduce(tau_count)
                             dist.all_reduce(elapsed_value, op=dist.ReduceOp.MAX)
-                            dist.all_reduce(norm_value)
-                            norm_value /= self.world_size
+                            dist.all_reduce(action_grad_norm)
+                            action_grad_norm /= self.world_size
+                        observations = interval[2]
+                        loss_mean = interval[0] / observations
+                        grad_mean = interval[3] / observations
                         metrics = {
-                            "train/loss": (values[0] / values[2]).item(),
+                            "train/loss": loss_mean.item(),
+                            "train/loss_std": (
+                                interval[1] / observations - loss_mean.square()
+                            )
+                            .clamp_min(0)
+                            .sqrt()
+                            .item(),
+                            "train/loss_min": loss_min.item(),
+                            "train/loss_max": loss_max.item(),
+                            "train/prediction_velocity_norm": (
+                                interval[5] / observations
+                            ).item(),
+                            "train/target_velocity_norm": (
+                                interval[6] / observations
+                            ).item(),
+                            "train/velocity_cosine": (interval[7] / observations).item(),
                             "optimization/learning_rate": self.optimizer.param_groups[0]["lr"],
-                            "optimization/grad_norm": norm_value.item(),
+                            "optimization/grad_norm": grad_mean.item(),
+                            "optimization/grad_norm_max": grad_max.item(),
+                            "optimization/action_encoder_grad_norm": action_grad_norm.item(),
+                            "optimization/clipped_fraction": (
+                                interval[4] / observations
+                            ).item(),
+                            "optimization/clip_scale_min": min(
+                                1.0,
+                                self.config.max_grad_norm / (grad_max.item() + 1e-6),
+                            ),
                             "progress/epoch": epoch + epoch_step / steps_per_epoch,
                             "progress/examples": float(global_examples),
                             "performance/clips_per_second": (
-                                values[2] / elapsed_value
+                                interval[8] / elapsed_value
                             ).item(),
                             "performance/data_wait_ms": (
-                                1_000 * values[1] / values[2]
+                                1_000 * interval[9] / interval[8]
                             ).item(),
                         }
+                        for index, (low, high) in enumerate(
+                            zip((0.0, 0.2, 0.4, 0.6, 0.8), (0.2, 0.4, 0.6, 0.8, 1.0), strict=True)
+                        ):
+                            metrics[f"train/loss_tau_{low:.1f}_{high:.1f}"] = (
+                                tau_loss[index] / tau_count[index]
+                            ).item()
                         self._log(metrics)
-                        interval_loss = interval_wait = 0.0
-                        interval_count = 0
+                        interval.zero_()
+                        interval_wait = 0.0
+                        loss_min.fill_(torch.inf)
+                        loss_max.fill_(-torch.inf)
+                        grad_max.zero_()
+                        tau_loss.zero_()
+                        tau_count.zero_()
                         interval_started = time.monotonic()
 
                     if self.step % self.config.eval_every == 0:

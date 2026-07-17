@@ -98,3 +98,19 @@ recipe before committing the expensive run.
   norm `54.59`, throughput `279.35 clips/s`, data wait `0.011 ms`, and all eight GPUs are at
   99–100% utilization. Four epochs are 24,456 steps at the observed epoch plan, implying about
   3.1 hours of pure training and roughly 3.25–3.5 hours including evaluation/checkpoints.
+- Aborted that run at the user's request after a transient instability: the 100-step mean loss rose
+  to `2.73` at step 700 and `8.91` at step 800 after the pre-clip gradient norm reached `1,127`.
+  It recovered to loss `0.802` / norm `22.97` by step 1,200. A deterministic loader-plan audit
+  ruled out unshuffled archive blocks: the affected 100-step windows covered 88–90 archives and no
+  archive exceeded 3.1% of rank-batches. The earlier step-zero rollout exception was a hard process
+  exit followed by a fresh restart, not a silent fallback.
+- Reviewed the original production trainer commits and the richer ablation logger. Added a global
+  gradient-norm ceiling of `100` on every update with non-finite errors enabled. Restored the useful
+  diagnostics at 20-step cadence: loss mean/std/min/max and five diffusion-time bins; pre-clip
+  gradient mean/max, clip fraction/minimum scale, and action-encoder gradient; prediction/target
+  velocity norms and cosine; raw/EMA/zero-action fixed eval; and correct/zero-action rollout deltas
+  at every horizon. Per-replay tables, parameter scans, histograms, and redundant GPU metrics remain
+  omitted because they are noisy or too expensive for the 1.2B model.
+- Fresh clipped run: `https://wandb.ai/dhruvbhatia0/smash-d-transformer-full/runs/lmyej81l`, launcher
+  PID `173285`, output `/workspace/full-run-clipped`. At step 120 loss was `1.148`, pre-clip norm mean
+  `53.7` / max `76.3`, clip fraction `0`, throughput `275.4 clips/s`, and data wait `0.012 ms`.
