@@ -114,3 +114,14 @@ recipe before committing the expensive run.
 - Fresh clipped run: `https://wandb.ai/dhruvbhatia0/smash-d-transformer-full/runs/lmyej81l`, launcher
   PID `173285`, output `/workspace/full-run-clipped`. At step 120 loss was `1.148`, pre-clip norm mean
   `53.7` / max `76.3`, clip fraction `0`, throughput `275.4 clips/s`, and data wait `0.012 ms`.
+- The clipped run saved a valid epoch-1 checkpoint at optimizer step 6,114, then continued to step
+  12,220 (almost two epochs) before the finite loader exhausted and raised `StopIteration`. Epoch 2
+  was not checkpointed. The durable epoch-1 model and EMA tensors were checked finite.
+- Uploaded the resumable 19,311,263,845-byte epoch-1 checkpoint, SHA-256 manifest, final status,
+  complete log, W&B run ID, and failure/resume metadata to the private Hugging Face repository
+  `https://huggingface.co/DhruvBhatia0/smash-d-transformer`. Checkpoint SHA-256:
+  `7deb8b548739f992327880a131be469e390704fe47ca38108d1ddf6c2785472a`.
+- Terminated RunPod pod `lu5b5srnu3rnrm` after verifying the Hugging Face checkpoint commit. The
+  RunPod API returned HTTP 204 for deletion and HTTP 404 on the subsequent identity lookup.
+- Before any future restart, fix the per-rank RNG seed and resolve the intended forcing recipe:
+  this checkpoint used independent per-frame flow times plus an explicit clean-past side channel.
