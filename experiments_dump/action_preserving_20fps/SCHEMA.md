@@ -64,7 +64,7 @@ Each micro-action has one entry per present leader/follower:
     "isFollower": false,
     "joystickX": 0,
     "joystickY": 0,
-    "rawJoystickX": 128,
+    "rawJoystickX": 0,
     "cStickX": 0,
     "cStickY": 0,
     "trigger": 0,

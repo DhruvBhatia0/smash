@@ -184,11 +184,13 @@ class CodecEncoder(torch.nn.Module):
         self,
         desired_hidden_states: list[int],
         dino_version: DinoV3_versions = DEFAULT_DINO_VERSION,
+        pretrained_dino: bool = True,
     ):
         super().__init__()
         self.dinov3 = DinoV3(
             desired_hidden_states=desired_hidden_states,
             dino_version=dino_version,
+            pretrained=pretrained_dino,
         )
         self.compressor = torch.nn.Sequential(
             Rearrange(
