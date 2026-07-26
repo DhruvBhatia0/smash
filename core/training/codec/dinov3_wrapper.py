@@ -22,17 +22,19 @@ class DinoV3(torch.nn.Module):
         self,
         desired_hidden_states: list,
         dino_version: DinoV3_versions = DinoV3_versions.VIT_SP,
+        pretrained: bool = True,
     ):
         super().__init__()
         self.desired_hidden_states = desired_hidden_states
         self.dino_version = dino_version
-        weights_path = self._weights_path(dino_version)
+        load_options = {"pretrained": pretrained}
+        if pretrained:
+            load_options["weights"] = str(self._weights_path(dino_version))
         self.model = torch.hub.load(
             repo_or_dir="facebookresearch/dinov3",
             model=dino_version.value,
             source="github",
-            pretrained=True,
-            weights=str(weights_path),
+            **load_options,
         )
 
         self.model.eval()
